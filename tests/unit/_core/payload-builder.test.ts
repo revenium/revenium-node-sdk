@@ -1,4 +1,18 @@
-import { buildPayload, PayloadParams } from "../../../src/_core/metering/payload-builder";
+import {
+  buildPayload,
+  buildImagePayload,
+  buildAudioPayload,
+  buildVideoPayload,
+  PayloadParams,
+} from "../../../src/_core/metering/payload-builder";
+import {
+  AUDIO_OPERATION_SUBTYPES,
+  IMAGE_OPERATION_SUBTYPES,
+  VIDEO_OPERATION_SUBTYPES,
+  type ImageOperationSubtype,
+  type VideoOperationSubtype,
+} from "../../../src/_core/metering/operation-subtype";
+import { ReveniumPayload, UsageMetadata } from "../../../src/_core/types/index";
 
 const ENV_KEYS = [
   "REVENIUM_ENVIRONMENT",
@@ -144,5 +158,158 @@ describe("buildPayload precedence", () => {
     expect(payload.operationSubtype).toBe("function_call");
     expect(payload.environment).toBeUndefined();
     expect(payload.region).toBeUndefined();
+  });
+});
+
+describe("multimodal operationSubtype", () => {
+  const buildImage = (subtype: ImageOperationSubtype, usageMetadata?: UsageMetadata) =>
+    buildImagePayload(
+      subtype,
+      { data: [{ url: "https://example.com/1.png" }] },
+      { n: 1, model: "dall-e-3", size: "1024x1024" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+      usageMetadata,
+    );
+
+  const buildAudio = (
+    subtype: Parameters<typeof buildAudioPayload>[0],
+    usageMetadata?: UsageMetadata,
+  ) =>
+    buildAudioPayload(
+      subtype,
+      { duration: 42 },
+      { model: "whisper-1", input: "hello", voice: "alloy" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+      usageMetadata,
+    );
+
+  const buildVideo = (subtype: VideoOperationSubtype, usageMetadata?: UsageMetadata) =>
+    buildVideoPayload(
+      subtype,
+      { model: "veo-001" },
+      Date.now() - 1000,
+      1000,
+      "Google",
+      "GOOGLE_VERTEX_AI",
+      "revenium-google-node",
+      usageMetadata,
+      { videoDurationSeconds: 8 },
+    );
+
+  function subtypeCases<T extends string>(
+    operationType: string,
+    accepted: readonly T[],
+    build: (subtype: T, usageMetadata?: UsageMetadata) => ReveniumPayload,
+  ) {
+    return accepted.map((subtype, index) => ({
+      operationType,
+      subtype,
+      override: accepted[(index + 1) % accepted.length],
+      build: (usageMetadata?: UsageMetadata) => build(subtype, usageMetadata),
+    }));
+  }
+
+  const cases = [
+    ...subtypeCases("IMAGE", IMAGE_OPERATION_SUBTYPES, buildImage),
+    ...subtypeCases("AUDIO", AUDIO_OPERATION_SUBTYPES, buildAudio),
+    ...subtypeCases("VIDEO", VIDEO_OPERATION_SUBTYPES, buildVideo),
+  ];
+
+  it.each(cases)(
+    "promotes the detected $subtype subtype to the top level of the $operationType payload",
+    ({ subtype, build }) => {
+      const payload = build();
+
+      expect(payload.operationSubtype).toBe(subtype);
+      expect(payload.attributes?.operationSubtype).toBeUndefined();
+    },
+  );
+
+  it.each(cases)(
+    "lets caller metadata override the detected $subtype subtype on $operationType",
+    ({ build, override }) => {
+      expect(build({ operationSubtype: override }).operationSubtype).toBe(override);
+    },
+  );
+
+  it.each(cases)(
+    "normalizes a caller override on $operationType for $subtype",
+    ({ build, override }) => {
+      expect(build({ operationSubtype: `  ${override.toUpperCase()} ` }).operationSubtype).toBe(
+        override,
+      );
+    },
+  );
+
+  it.each(cases)(
+    "keeps the detected $subtype subtype on $operationType when the override is not accepted",
+    ({ subtype, build }) => {
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      expect(build({ operationSubtype: "" }).operationSubtype).toBe(subtype);
+      expect(build({ operationSubtype: "   " }).operationSubtype).toBe(subtype);
+      expect(build({ operationSubtype: "speach" }).operationSubtype).toBe(subtype);
+      expect(build({ operationSubtype: 123 as unknown as string }).operationSubtype).toBe(subtype);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("operationSubtype");
+      warn.mockRestore();
+    },
+  );
+
+  it("maps the legacy audio literals to the vocabulary the metering API accepts", () => {
+    expect(buildAudio("speech_synthesis").operationSubtype).toBe("tts");
+    expect(buildAudio("audio_generation").operationSubtype).toBe("synthesis");
+  });
+
+  it("maps a legacy caller override the same way", () => {
+    const payload = buildAudio("transcription", { operationSubtype: "speech_synthesis" });
+
+    expect(payload.operationSubtype).toBe("tts");
+    expect(payload.attributes?.billing_unit).toBe("per_character");
+  });
+
+  it("bills a caller-corrected audio subtype by the unit that subtype implies", () => {
+    const payload = buildAudio("transcription", { operationSubtype: "tts" });
+
+    expect(payload.operationSubtype).toBe("tts");
+    expect(payload.characterCount).toBe(5);
+    expect(payload.durationSeconds).toBeUndefined();
+    expect(payload.attributes?.billing_unit).toBe("per_character");
+  });
+
+  it("bills a synthesis subtype per second instead of inheriting transcription billing", () => {
+    const payload = buildAudio("synthesis");
+
+    expect(payload.attributes?.billing_unit).toBe("per_second");
+    expect(payload.durationSeconds).toBe(42);
+    expect(payload.characterCount).toBeUndefined();
+  });
+
+  it("keeps duration billing when a caller overrides an audio call without text to tts", () => {
+    const payload = buildAudioPayload(
+      "transcription",
+      { duration: 42 },
+      { model: "whisper-1" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+      { operationSubtype: "tts" },
+    );
+
+    expect(payload.operationSubtype).toBe("tts");
+    expect(payload.attributes?.billing_unit).toBe("per_second");
+    expect(payload.durationSeconds).toBe(42);
+    expect(payload.characterCount).toBeUndefined();
   });
 });

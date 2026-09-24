@@ -26,6 +26,13 @@ describe("mapGoogleUsageMetadata", () => {
     expect(result?.agenticJobVersion).toBeUndefined();
   });
 
+  it("maps operationSubtype so callers can override the detected value", () => {
+    expect(mapGoogleUsageMetadata({ operationSubtype: "inpainting" })?.operationSubtype).toBe(
+      "inpainting",
+    );
+    expect(mapGoogleUsageMetadata({ traceId: "t" })?.operationSubtype).toBeUndefined();
+  });
+
   it("returns undefined when no metadata provided", () => {
     expect(mapGoogleUsageMetadata(undefined)).toBeUndefined();
   });

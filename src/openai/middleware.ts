@@ -8,6 +8,11 @@ import {
   buildImagePayload,
   buildAudioPayload,
 } from "../_core/metering/payload-builder.js";
+import type {
+  AudioOperationSubtype,
+  ImageOperationSubtype,
+  LegacyAudioOperationSubtype,
+} from "../_core/metering/operation-subtype.js";
 import { mapStopReason } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import {
@@ -160,7 +165,7 @@ export function trackEmbeddingsUsageAsync(trackingData: {
 }
 
 export function trackImageUsageAsync(
-  operationSubtype: "generation" | "edit" | "variation",
+  operationSubtype: ImageOperationSubtype,
   response: any,
   request: any,
   startTime: number,
@@ -199,7 +204,7 @@ export function trackImageUsageAsync(
 }
 
 export function trackAudioUsageAsync(
-  operationSubtype: "transcription" | "translation" | "speech_synthesis",
+  operationSubtype: AudioOperationSubtype | LegacyAudioOperationSubtype,
   response: any,
   request: any,
   startTime: number,
@@ -512,7 +517,7 @@ export class AudioSpeechInterface {
     const response = await this.originalSpeech.create(cleanParams);
     const duration = Date.now() - startTime;
     trackAudioUsageAsync(
-      "speech_synthesis",
+      "tts",
       response,
       params,
       startTime,

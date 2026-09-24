@@ -143,6 +143,7 @@ export function mapGoogleUsageMetadata(meta?: GoogleUsageMetadata): UsageMetadat
   if (meta.agenticJobName) result.agenticJobName = meta.agenticJobName;
   if (meta.agenticJobType) result.agenticJobType = meta.agenticJobType;
   if (meta.agenticJobVersion) result.agenticJobVersion = meta.agenticJobVersion;
+  if (meta.operationSubtype) result.operationSubtype = meta.operationSubtype;
 
   if (meta.subscriberId || meta.subscriberEmail || meta.subscriberCredential) {
     result.subscriber = {

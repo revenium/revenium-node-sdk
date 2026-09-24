@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.2.1] - 2026-09-24
+
+### Fixed
+
+- Top-level `operationSubtype` on the seven multimodal paths — OpenAI images and audio, fal images, audio and video, Google Vertex images and video. These payloads previously carried the subtype only inside `attributes`, so the metering API received none and logged a `*_MISSING_OPERATION_SUBTYPE` warning for each call; audio also priced without a resolved direction (FRONT-2790)
+- Google Vertex image upscale was metered as `variation`; it now ships `upscale`
+- A caller-supplied `usageMetadata.operationSubtype` was silently dropped on every Google Vertex path; it is now forwarded and takes precedence over the detected value
+- fal endpoints that are neither transcription nor text-to-speech (`speech-to-text`, `voice-clone`, `audio-to-audio`, `stable-audio`) were classified as `tts` and metered at zero chargeable characters; they now ship `synthesis` and meter by duration. `speech-to-text` and `stt` endpoints are classified as `transcription`
+- fal speech endpoints such as `fal-ai/minimax/speech-02-hd` were classified as `synthesis` and billed per second, recording zero billable seconds when no duration was available; they now classify as `tts` and bill by input characters
+- An OpenAI audio call metered as `synthesis` inherited the transcription `per_minute` billing unit; the audio billing unit is now derived from the effective subtype (`per_character` for `tts` and `speech`, `per_minute` for `transcription` and `translation`, `per_second` for `synthesis` and `realtime`)
+- A caller override to `tts` or `speech` on a request that carries no text no longer discards the available duration; billing falls back to the measure the request actually provides
+- A fal transcription or translation call whose result carries no duration no longer reports the caller-supplied `input.duration` as the transcribed audio measure; the request duration is only used for generated audio
+
+### Changed
+
+- Detected audio subtypes now use the vocabulary the metering API accepts: `speech_synthesis` ships as `tts`, and fal's `audio_generation` ships as `synthesis`. `transcription`, `translation` and every image and video subtype are unchanged
+- `operationSubtype` removed from `attributes` on all multimodal payloads — it is now sent once, at the top level
+- A caller-supplied `operationSubtype` is trimmed, lowercased and checked against the accepted vocabulary for its operation type. Values outside it are logged as a warning and ignored in favour of the detected subtype, instead of being sent and rejected by the metering API with a 400 that drops the event
+- The earlier literals `speech_synthesis` and `audio_generation` remain accepted, both as `trackAudioUsageAsync` arguments and as caller overrides, and are sent as `tts` and `synthesis`
+- Billing attributes (`billing_unit`, `characterCount`, `durationSeconds`) are derived from the effective subtype, so a caller override no longer leaves the payload describing two different operations
+- Audio calls now resolve a pricing direction on the backend. A tenant whose only AUDIO pricing row for a model and billing unit is explicitly `INPUT` will stop matching on `tts` calls and report no cost, where it previously matched at the wrong rate
+
 ## [1.2.0] - 2026-08-27
 
 ### Added
@@ -168,6 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Azure OpenAI automatic detection and configuration
 - 130 unit and integration tests
 
+[1.2.1]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.2.1
 [1.2.0]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.2.0
 [1.1.10]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.1.10
 [1.1.9]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.1.9
