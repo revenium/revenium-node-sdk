@@ -13,6 +13,17 @@ import {
   getRetryNumber,
   detectOperationSubtype,
 } from "../metadata/trace-fields.js";
+import {
+  IMAGE_OPERATION_SUBTYPES,
+  VIDEO_OPERATION_SUBTYPES,
+  resolveAudioBillingUnit,
+  resolveAudioOperationSubtype,
+  resolveOperationSubtype,
+  type AudioOperationSubtype,
+  type ImageOperationSubtype,
+  type LegacyAudioOperationSubtype,
+  type VideoOperationSubtype,
+} from "./operation-subtype.js";
 
 export interface PayloadParams {
   operationType: "CHAT" | "EMBED";
@@ -106,7 +117,7 @@ export async function buildPayload(params: PayloadParams): Promise<ReveniumPaylo
 }
 
 export function buildImagePayload(
-  operationSubtype: "generation" | "edit" | "variation",
+  detectedSubtype: ImageOperationSubtype,
   response: any,
   request: any,
   startTime: number,
@@ -119,10 +130,14 @@ export function buildImagePayload(
   const now = new Date().toISOString();
   const requestTime = new Date(startTime).toISOString();
   const metadataFields = buildMetadataFields(usageMetadata);
+  const operationSubtype = resolveOperationSubtype(
+    IMAGE_OPERATION_SUBTYPES,
+    metadataFields.operationSubtype,
+    detectedSubtype,
+  );
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_image",
-    operationSubtype,
     actual_image_count: response.data?.length || 0,
   };
 
@@ -166,6 +181,7 @@ export function buildImagePayload(
     isStreamed: false,
     timeToFirstToken: undefined,
     ...metadataFields,
+    operationSubtype,
     requestedImageCount: request.n || 1,
     actualImageCount: response.data?.length || 0,
     attributes,
@@ -173,7 +189,7 @@ export function buildImagePayload(
 }
 
 export function buildAudioPayload(
-  operationSubtype: "transcription" | "translation" | "speech_synthesis",
+  detectedSubtype: AudioOperationSubtype | LegacyAudioOperationSubtype,
   response: any,
   request: any,
   startTime: number,
@@ -186,31 +202,48 @@ export function buildAudioPayload(
   const now = new Date().toISOString();
   const requestTime = new Date(startTime).toISOString();
   const metadataFields = buildMetadataFields(usageMetadata);
+  const operationSubtype = resolveAudioOperationSubtype(
+    metadataFields.operationSubtype,
+    detectedSubtype,
+  );
 
-  const attributes: Record<string, unknown> = { operationSubtype };
+  const attributes: Record<string, unknown> = {};
   let durationSeconds: number | undefined;
   let characterCount: number | undefined;
 
-  if (operationSubtype === "speech_synthesis") {
-    attributes.billing_unit = "per_character";
-    attributes.requested_character_count = request.input?.length || 0;
+  const requestedCharacterCount = typeof request.input === "string" ? request.input.length : 0;
+  const actualDurationSeconds = typeof response.duration === "number" ? response.duration : 0;
+  const billingUnit = resolveAudioBillingUnit(
+    operationSubtype,
+    requestedCharacterCount,
+    actualDurationSeconds,
+  );
+  const producesAudio =
+    operationSubtype === "tts" || operationSubtype === "speech" || operationSubtype === "synthesis";
+
+  if (producesAudio) {
     attributes.voice = request.voice;
     attributes.speed = request.speed;
     attributes.response_format = request.response_format || "mp3";
-    characterCount = request.input?.length || 0;
   } else {
-    attributes.billing_unit = "per_minute";
-    attributes.actual_duration_seconds = response.duration || 0;
     attributes.language = request.language || response.language;
     attributes.response_format = request.response_format || "json";
     attributes.temperature = request.temperature;
-    durationSeconds = response.duration || 0;
     if (operationSubtype === "translation") {
       attributes.target_language = "en";
     }
     if (request.timestamp_granularities) {
       attributes.timestamp_granularities = request.timestamp_granularities;
     }
+  }
+
+  attributes.billing_unit = billingUnit;
+  if (billingUnit === "per_character") {
+    attributes.requested_character_count = requestedCharacterCount;
+    characterCount = requestedCharacterCount;
+  } else {
+    attributes.actual_duration_seconds = actualDurationSeconds;
+    durationSeconds = actualDurationSeconds;
   }
 
   return {
@@ -235,6 +268,7 @@ export function buildAudioPayload(
     isStreamed: false,
     timeToFirstToken: undefined,
     ...metadataFields,
+    operationSubtype,
     durationSeconds,
     characterCount,
     attributes,
@@ -242,7 +276,7 @@ export function buildAudioPayload(
 }
 
 export function buildVideoPayload(
-  operationSubtype: "generation" | "extend" | "upscale",
+  detectedSubtype: VideoOperationSubtype,
   request: any,
   startTime: number,
   duration: number,
@@ -265,10 +299,14 @@ export function buildVideoPayload(
   const now = new Date().toISOString();
   const requestTime = new Date(startTime).toISOString();
   const metadataFields = buildMetadataFields(usageMetadata);
+  const operationSubtype = resolveOperationSubtype(
+    VIDEO_OPERATION_SUBTYPES,
+    metadataFields.operationSubtype,
+    detectedSubtype,
+  );
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_second",
-    operationSubtype,
     video_duration_seconds: extra?.videoDurationSeconds || 0,
     resolution: extra?.resolution,
     aspect_ratio: extra?.aspectRatio,
@@ -301,6 +339,7 @@ export function buildVideoPayload(
     isStreamed: false,
     timeToFirstToken: undefined,
     ...metadataFields,
+    operationSubtype,
     durationSeconds: extra?.videoDurationSeconds,
     attributes,
   };

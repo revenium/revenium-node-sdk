@@ -287,7 +287,7 @@ The `metadata` parameter is optional on all methods and enables cost attribution
 | ---------- | ----------------- | ------------------------------------- | ----------------------------------- |
 | IMAGE      | `/ai/images`      | flux, stable-diffusion, recraft, sdxl | Per image (+ resolution)            |
 | VIDEO      | `/ai/video`       | kling-video, veo, sora, runway, luma  | Seconds of video                    |
-| AUDIO      | `/ai/audio`       | kokoro, chatterbox, whisper, f5-tts   | Characters (TTS) / minutes (transcription) / seconds (generation) |
+| AUDIO      | `/ai/audio`       | kokoro, chatterbox, whisper, f5-tts   | Characters (`tts`) / minutes (`transcription`) / seconds (`synthesis`) |
 | CHAT       | `/ai/completions` | openrouter                            | Token usage (input/output/total)    |
 
 Media type is detected via a two-phase approach: first by regex matching on the endpoint ID, then corrected by inspecting the response structure (e.g., presence of `images`, `video`, `audio_url`, or `usage` fields).
@@ -380,6 +380,15 @@ All fields are optional and can be set per-request via `usageMetadata`:
 | `skillPluginName`        | string | Plugin that provides the skill                         |
 | `skillMarketplaceName`   | string | Marketplace the skill plugin came from                 |
 | `skillInvocationTrigger` | string | How the skill was invoked (e.g., "user-slash")         |
+| `operationSubtype`       | string | Overrides the detected image/audio/video subtype       |
+
+Accepted `operationSubtype` values, by operation type. Any other value is logged as a warning and ignored, and the detected subtype is sent instead. The earlier literals `speech_synthesis` and `audio_generation` are still accepted and sent as `tts` and `synthesis`:
+
+| Operation type | Accepted values                                                          |
+| -------------- | ------------------------------------------------------------------------ |
+| IMAGE          | `generation`, `edit`, `variation`, `upscale`, `inpainting`               |
+| AUDIO          | `transcription`, `translation`, `synthesis`, `speech`, `tts`, `realtime` |
+| VIDEO          | `generation`, `upscale`, `extend`, `edit`                                |
 
 ## Trace Visualization Fields
 

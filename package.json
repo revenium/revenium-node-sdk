@@ -1,6 +1,6 @@
 {
   "name": "@revenium/middleware",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Unified Revenium middleware for AI provider usage tracking - OpenAI, Anthropic, Google, Perplexity, LiteLLM, fal.ai",
   "main": "dist/cjs/index.js",
   "module": "dist/esm/index.js",

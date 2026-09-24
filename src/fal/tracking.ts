@@ -13,6 +13,14 @@ import {
   getRetryNumber,
   getTicketId,
 } from "../_core/metadata/trace-fields.js";
+import {
+  IMAGE_OPERATION_SUBTYPES,
+  VIDEO_OPERATION_SUBTYPES,
+  resolveAudioBillingUnit,
+  resolveAudioOperationSubtype,
+  resolveOperationSubtype,
+  type AudioOperationSubtype,
+} from "../_core/metering/operation-subtype.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import type { ReveniumPayload } from "../_core/types/index.js";
 import type {
@@ -36,6 +44,7 @@ function extractModelName(endpointId: string, input?: Record<string, unknown>): 
 function buildCommonFields(
   data: FalTrackingData,
   metadata: FalUsageMetadata | undefined,
+  operationSubtype?: string,
 ): Omit<ReveniumPayload, "inputTokenCount" | "outputTokenCount" | "totalTokenCount"> {
   const now = new Date().toISOString();
   const requestTime = new Date(data.startTime).toISOString();
@@ -66,9 +75,17 @@ function buildCommonFields(
     parentTransactionId: metadata?.parentTransactionId || getParentTransactionId() || undefined,
     transactionName: metadata?.transactionName || getTransactionName() || undefined,
     retryNumber: metadata?.retryNumber ?? getRetryNumber() ?? undefined,
-    operationSubtype: metadata?.operationSubtype || undefined,
+    operationSubtype: operationSubtype || metadata?.operationSubtype || undefined,
     ticketId: metadata?.ticketId || getTicketId() || undefined,
   };
+}
+
+function subtypeFor<T extends string>(
+  data: FalTrackingData,
+  accepted: readonly T[],
+  detected: T,
+): T {
+  return resolveOperationSubtype(accepted, data.usageMetadata?.operationSubtype, detected);
 }
 
 function buildImageTrackingPayload(data: FalTrackingData): ReveniumPayload {
@@ -83,7 +100,6 @@ function buildImageTrackingPayload(data: FalTrackingData): ReveniumPayload {
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_image",
-    operationSubtype: "generation",
     actual_image_count: images.length,
     requested_image_count: requestedCount,
     resolution,
@@ -93,7 +109,11 @@ function buildImageTrackingPayload(data: FalTrackingData): ReveniumPayload {
   if (result?.has_nsfw_concepts) attributes.has_nsfw_concepts = result.has_nsfw_concepts;
 
   return {
-    ...buildCommonFields(data, data.usageMetadata),
+    ...buildCommonFields(
+      data,
+      data.usageMetadata,
+      subtypeFor(data, IMAGE_OPERATION_SUBTYPES, "generation"),
+    ),
     inputTokenCount: null,
     outputTokenCount: null,
     totalTokenCount: null,
@@ -111,7 +131,6 @@ function buildVideoTrackingPayload(data: FalTrackingData): ReveniumPayload {
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_second",
-    operationSubtype: "generation",
     video_duration_seconds: videoDuration,
   };
 
@@ -119,7 +138,11 @@ function buildVideoTrackingPayload(data: FalTrackingData): ReveniumPayload {
   if (result?.video?.url || result?.file_url) attributes.has_output = true;
 
   return {
-    ...buildCommonFields(data, data.usageMetadata),
+    ...buildCommonFields(
+      data,
+      data.usageMetadata,
+      subtypeFor(data, VIDEO_OPERATION_SUBTYPES, "generation"),
+    ),
     inputTokenCount: null,
     outputTokenCount: null,
     totalTokenCount: null,
@@ -128,49 +151,65 @@ function buildVideoTrackingPayload(data: FalTrackingData): ReveniumPayload {
   };
 }
 
-function classifyAudioSubtype(
-  endpointId: string,
-): "transcription" | "speech_synthesis" | "audio_generation" {
+const TRANSCRIPTION_ENDPOINTS = /whisper|lava-sr|transcri|speech-to-text|speech_to_text|\bstt\b/;
+const TEXT_TO_SPEECH_ENDPOINTS =
+  /tts|text-to-speech|text_to_speech|speech|kokoro|chatterbox|parler/;
+
+function classifyAudioSubtype(endpointId: string): AudioOperationSubtype {
   const endpoint = endpointId.toLowerCase();
-  if (endpoint.includes("whisper") || endpoint.includes("lava-sr") || endpoint.includes("transcri"))
-    return "transcription";
-  if (endpoint.includes("music") || endpoint.includes("sfx") || endpoint.includes("sound"))
-    return "audio_generation";
-  return "speech_synthesis";
+  if (TRANSCRIPTION_ENDPOINTS.test(endpoint)) return "transcription";
+  if (TEXT_TO_SPEECH_ENDPOINTS.test(endpoint)) return "tts";
+  return "synthesis";
+}
+
+const MEASURED_DURATION_SUBTYPES: readonly AudioOperationSubtype[] = [
+  "transcription",
+  "translation",
+];
+
+function resolveAudioDurationSeconds(
+  data: FalTrackingData,
+  result: FalAudioResult,
+  subtype: AudioOperationSubtype,
+): number {
+  const measuredDurationSeconds = result?.duration || 0;
+  if (measuredDurationSeconds > 0 || MEASURED_DURATION_SUBTYPES.includes(subtype)) {
+    return measuredDurationSeconds;
+  }
+  return (data.input?.duration as number) || 0;
 }
 
 function buildAudioTrackingPayload(data: FalTrackingData): ReveniumPayload {
   const result = data.result as FalAudioResult;
-  const subtype = classifyAudioSubtype(data.endpointId);
+  const subtype = resolveAudioOperationSubtype(
+    data.usageMetadata?.operationSubtype,
+    classifyAudioSubtype(data.endpointId),
+  );
 
   const attributes: Record<string, unknown> = {};
   let durationSeconds: number | undefined;
   let characterCount: number | undefined;
 
-  if (subtype === "speech_synthesis") {
-    const inputText =
-      (data.input?.text as string) ||
-      (data.input?.prompt as string) ||
-      (data.input?.input as string) ||
-      "";
-    characterCount = inputText.length;
-    attributes.billing_unit = "per_character";
-    attributes.operationSubtype = "speech_synthesis";
+  const inputText =
+    (data.input?.text as string) ||
+    (data.input?.prompt as string) ||
+    (data.input?.input as string) ||
+    "";
+  const inputCharacterCount = inputText.length;
+  const audioDurationSeconds = resolveAudioDurationSeconds(data, result, subtype);
+  const billingUnit = resolveAudioBillingUnit(subtype, inputCharacterCount, audioDurationSeconds);
+
+  attributes.billing_unit = billingUnit;
+  if (billingUnit === "per_character") {
+    characterCount = inputCharacterCount;
     attributes.character_count = characterCount;
-  } else if (subtype === "transcription") {
-    durationSeconds = result?.duration || 0;
-    attributes.billing_unit = "per_minute";
-    attributes.operationSubtype = "transcription";
-    attributes.duration_seconds = durationSeconds;
   } else {
-    durationSeconds = result?.duration || (data.input?.duration as number) || 0;
-    attributes.billing_unit = "per_second";
-    attributes.operationSubtype = "audio_generation";
+    durationSeconds = audioDurationSeconds;
     attributes.duration_seconds = durationSeconds;
   }
 
   return {
-    ...buildCommonFields(data, data.usageMetadata),
+    ...buildCommonFields(data, data.usageMetadata, subtype),
     inputTokenCount: null,
     outputTokenCount: null,
     totalTokenCount: null,

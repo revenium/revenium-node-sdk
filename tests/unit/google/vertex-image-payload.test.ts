@@ -1,5 +1,5 @@
 import { buildImagePayload } from "../../../src/_core/metering/payload-builder";
-import { mapAspectRatioToResolution } from "../../../src/google/utils";
+import { mapAspectRatioToResolution, mapGoogleUsageMetadata } from "../../../src/google/utils";
 
 describe("Vertex image metering payload", () => {
   const baseArgs = {
@@ -100,9 +100,9 @@ describe("Vertex image metering payload", () => {
   });
 
   describe("upscaleImage", () => {
-    it("sends default resolution 1024x1024", () => {
+    it("sends default resolution 1024x1024 and the upscale subtype", () => {
       const payload = buildImagePayload(
-        "variation",
+        "upscale",
         { data: [{ bytesBase64Encoded: "abc" }] },
         { n: 1, model: "imagen-3.0-generate-002", quality: "standard" },
         baseArgs.startTime,
@@ -114,6 +114,23 @@ describe("Vertex image metering payload", () => {
 
       expect(payload.attributes!.resolution).toBe("1024x1024");
       expect(payload.model).toBe("imagen-3.0-generate-002");
+      expect(payload.operationSubtype).toBe("upscale");
+    });
+
+    it("lets Google usage metadata override the detected subtype", () => {
+      const payload = buildImagePayload(
+        "upscale",
+        { data: [{ bytesBase64Encoded: "abc" }] },
+        { n: 1, model: "imagen-3.0-generate-002", quality: "standard" },
+        baseArgs.startTime,
+        baseArgs.duration,
+        baseArgs.provider,
+        baseArgs.modelSource,
+        baseArgs.middlewareSource,
+        mapGoogleUsageMetadata({ operationSubtype: "inpainting" }),
+      );
+
+      expect(payload.operationSubtype).toBe("inpainting");
     });
   });
 });

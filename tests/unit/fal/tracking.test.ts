@@ -59,6 +59,27 @@ describe("sendFalMetrics IMAGE tracking", () => {
     expect(body.actualImageCount).toBe(2);
     expect(body.requestedImageCount).toBe(2);
     expect(body.attributes.resolution).toBe("1024x1024");
+    expect(body.operationSubtype).toBe("generation");
+    expect(body.attributes.operationSubtype).toBeUndefined();
+  });
+
+  it("lets caller metadata override the detected IMAGE subtype", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendFalMetrics({
+      endpointId: "fal-ai/clarity-upscaler",
+      operationType: "IMAGE",
+      startTime: Date.now() - 2000,
+      duration: 2000,
+      input: { image_url: "https://example.com/in.png" },
+      result: { images: [{ url: "https://example.com/out.png", width: 2048, height: 2048 }] },
+      isStreamed: false,
+      usageMetadata: { operationSubtype: "upscale" },
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.operationSubtype).toBe("upscale");
   });
 });
 
@@ -84,6 +105,8 @@ describe("sendFalMetrics VIDEO tracking", () => {
     expect(body.durationSeconds).toBe(10);
     expect(body.attributes.video_duration_seconds).toBe(10);
     expect(body.attributes.aspect_ratio).toBe("16:9");
+    expect(body.operationSubtype).toBe("generation");
+    expect(body.attributes.operationSubtype).toBeUndefined();
   });
 });
 
@@ -107,7 +130,8 @@ describe("sendFalMetrics AUDIO tracking", () => {
     expect(body.provider).toBe("fal_ai");
     expect(body.inputTokenCount).toBeNull();
     expect(body.characterCount).toBe(23);
-    expect(body.attributes.operationSubtype).toBe("speech_synthesis");
+    expect(body.operationSubtype).toBe("tts");
+    expect(body.attributes.operationSubtype).toBeUndefined();
   });
 
   it("sends AUDIO payload for TTS via prompt field (kokoro)", async () => {
@@ -127,7 +151,7 @@ describe("sendFalMetrics AUDIO tracking", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.operationType).toBe("AUDIO");
     expect(body.characterCount).toBe(20);
-    expect(body.attributes.operationSubtype).toBe("speech_synthesis");
+    expect(body.operationSubtype).toBe("tts");
     expect(body.attributes.billing_unit).toBe("per_character");
   });
 
@@ -136,7 +160,7 @@ describe("sendFalMetrics AUDIO tracking", () => {
     global.fetch = mockFetch;
 
     await sendFalMetrics({
-      endpointId: "fal-ai/stable-audio/music-gen",
+      endpointId: "fal-ai/stable-audio",
       operationType: "AUDIO",
       startTime: Date.now() - 2000,
       duration: 2000,
@@ -148,7 +172,7 @@ describe("sendFalMetrics AUDIO tracking", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.operationType).toBe("AUDIO");
     expect(body.durationSeconds).toBe(30);
-    expect(body.attributes.operationSubtype).toBe("audio_generation");
+    expect(body.operationSubtype).toBe("synthesis");
     expect(body.attributes.billing_unit).toBe("per_second");
     expect(body.characterCount).toBeUndefined();
   });
@@ -170,7 +194,112 @@ describe("sendFalMetrics AUDIO tracking", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.operationType).toBe("AUDIO");
     expect(body.durationSeconds).toBe(45.5);
-    expect(body.attributes.operationSubtype).toBe("transcription");
+    expect(body.operationSubtype).toBe("transcription");
+  });
+
+  it("ignores the requested duration when a transcription result has none", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendFalMetrics({
+      endpointId: "fal-ai/whisper",
+      operationType: "AUDIO",
+      startTime: Date.now() - 3000,
+      duration: 3000,
+      input: { audio_url: "https://example.com/input.mp3", duration: 120 },
+      result: { text: "Transcribed text" },
+      isStreamed: false,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.operationSubtype).toBe("transcription");
+    expect(body.attributes.billing_unit).toBe("per_minute");
+    expect(body.durationSeconds).toBe(0);
+  });
+
+  it("bills a speech endpoint by input characters", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendFalMetrics({
+      endpointId: "fal-ai/minimax/speech-02-hd",
+      operationType: "AUDIO",
+      startTime: Date.now() - 1000,
+      duration: 1000,
+      input: { text: "Hello world from fal.ai" },
+      result: { audio: { url: "https://example.com/audio.mp3" } },
+      isStreamed: false,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.operationSubtype).toBe("tts");
+    expect(body.attributes.billing_unit).toBe("per_character");
+    expect(body.characterCount).toBe(23);
+  });
+
+  it.each([
+    ["fal-ai/elevenlabs/speech-to-text", "transcription"],
+    ["fal-ai/minimax/voice-clone", "synthesis"],
+    ["fal-ai/dia/v1/voice-clone", "synthesis"],
+    ["fal-ai/ace-step/audio-to-audio", "synthesis"],
+  ])("classifies %s as %s", async (endpointId, expectedSubtype) => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendFalMetrics({
+      endpointId,
+      operationType: "AUDIO",
+      startTime: Date.now() - 3000,
+      duration: 3000,
+      input: { audio_url: "https://example.com/input.mp3" },
+      result: { text: "some text", duration: 300 },
+      isStreamed: false,
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.operationSubtype).toBe(expectedSubtype);
+    expect(body.durationSeconds).toBe(300);
+    expect(body.characterCount).toBeUndefined();
+  });
+
+  it("keeps the detected subtype when the caller override is blank", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendFalMetrics({
+      endpointId: "fal-ai/kokoro/american-english",
+      operationType: "AUDIO",
+      startTime: Date.now() - 1000,
+      duration: 1000,
+      input: { prompt: "Hello" },
+      result: { audio: { url: "https://example.com/audio.wav" } },
+      isStreamed: false,
+      usageMetadata: { operationSubtype: "" },
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.operationSubtype).toBe("tts");
+  });
+
+  it("maps a legacy audio_generation override to synthesis", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendFalMetrics({
+      endpointId: "fal-ai/kokoro/american-english",
+      operationType: "AUDIO",
+      startTime: Date.now() - 1000,
+      duration: 1000,
+      input: { prompt: "Hello", duration: 3 },
+      result: { audio: { url: "https://example.com/audio.wav" } },
+      isStreamed: false,
+      usageMetadata: { operationSubtype: "audio_generation" },
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.operationSubtype).toBe("synthesis");
+    expect(body.attributes.billing_unit).toBe("per_second");
+    expect(body.durationSeconds).toBe(3);
   });
 });
 
@@ -198,6 +327,7 @@ describe("sendFalMetrics CHAT tracking", () => {
     expect(body.inputTokenCount).toBe(40);
     expect(body.outputTokenCount).toBe(227);
     expect(body.totalTokenCount).toBe(267);
+    expect(body.operationSubtype).toBeUndefined();
   });
 });
 

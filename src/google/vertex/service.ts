@@ -458,7 +458,7 @@ export class VertexAIService {
     const usageMeta = mapGoogleUsageMetadata(usageMetadata);
 
     const imagePayload = buildImagePayload(
-      "variation",
+      "upscale",
       { data: data.predictions || [] },
       { n: 1, model: request.model, quality: "standard" },
       startTime,
