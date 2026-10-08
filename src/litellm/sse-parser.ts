@@ -1,4 +1,5 @@
 import { shouldCapturePrompts, getMaxPromptSize } from "../_core/prompt/extraction.js";
+import { extractCacheTokenCounts } from "../_core/metering/cache-tokens.js";
 import type {
   RequestContext,
   LiteLLMChatCompletionRequest,
@@ -17,6 +18,7 @@ export class StreamingResponseParser {
   private completionTokens: number = 0;
   private totalTokens: number = 0;
   private cachedTokens?: number;
+  private cacheCreationTokens?: number;
   private finishReason: string | null = null;
   private responseFormat?: any;
   private requestBody?: LiteLLMChatCompletionRequest;
@@ -142,8 +144,17 @@ export class StreamingResponseParser {
       this.promptTokens = chunk.usage.prompt_tokens || 0;
       this.completionTokens = chunk.usage.completion_tokens || 0;
       this.totalTokens = chunk.usage.total_tokens || 0;
-      if (chunk.usage.prompt_tokens_details?.cached_tokens !== undefined) {
-        this.cachedTokens = chunk.usage.prompt_tokens_details.cached_tokens;
+
+      // Handles both the OpenAI-normalized shape (prompt_tokens_details.cached_tokens)
+      // and the Anthropic-native shape (cache_read_input_tokens/cache_creation_input_tokens),
+      // which LiteLLM may surface directly when it doesn't fully normalize Anthropic usage.
+      const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(chunk.usage);
+      // A later chunk that omits cache details shouldn't erase a value an earlier chunk reported.
+      if (cacheReadTokens !== undefined) {
+        this.cachedTokens = cacheReadTokens;
+      }
+      if (cacheCreationTokens !== undefined) {
+        this.cacheCreationTokens = cacheCreationTokens;
       }
     }
 
@@ -195,6 +206,7 @@ export class StreamingResponseParser {
           total_tokens: this.totalTokens,
           prompt_tokens_details:
             this.cachedTokens === undefined ? undefined : { cached_tokens: this.cachedTokens },
+          cache_creation_input_tokens: this.cacheCreationTokens,
         },
       };
     }
@@ -206,6 +218,7 @@ export class StreamingResponseParser {
       completionTokens: this.completionTokens,
       totalTokens: this.totalTokens,
       cachedTokens: this.cachedTokens,
+      cacheCreationTokens: this.cacheCreationTokens,
       duration: this.requestDuration,
       finishReason: this.finishReason || "stop",
       usageMetadata: this.requestContext.metadata,

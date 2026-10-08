@@ -28,6 +28,7 @@ A professional-grade Node.js middleware that integrates with OpenAI, Azure OpenA
 | OpenAI           | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()`                            |
 | Azure OpenAI     | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()` (auto-detected)            |
 | Anthropic        | `@revenium/middleware/anthropic`     | `initialize()` / `configure()` / auto-init on import      |
+| Foundry          | `@revenium/middleware/anthropic`     | Same as Anthropic (auto-detected from the base URL)       |
 | Google GenAI     | `@revenium/middleware/google/genai`  | `GoogleGenAIController` / `GoogleGenAIService`            |
 | Google Vertex AI | `@revenium/middleware/google/vertex` | `VertexAIController` / `VertexAIService`                  |
 | Perplexity       | `@revenium/middleware/perplexity`    | `Initialize()` / `GetClient()`                            |
@@ -52,6 +53,8 @@ npm install @google/genai             # For Google GenAI
 npm install google-auth-library       # For Google Vertex AI
 npm install @fal-ai/client            # For fal.ai
 ```
+
+CI runs the unit suite on Node 22 against `openai` 7.x, `@anthropic-ai/sdk` 0.129.x, `@google/genai` 2.x and `@fal-ai/client` 1.10.x, on Node 20 against `openai` 6.x, and on Node 18 against `openai` 6.x and `@google/genai` 1.x, which are the newest majors those runtimes support.
 
 ### Configuration
 
@@ -231,6 +234,12 @@ Auto-initializes on import. Manual control available:
 | `isInitialized()`    | Check initialization status                         |
 | `getStatus()`        | Get detailed status including circuit breaker state |
 | `reset()`            | Reset middleware and circuit breaker                |
+
+Claude served through Microsoft Foundry is detected from the Anthropic client's `baseURL`: the
+`services.ai.azure.com` host, or any subdomain of it, meters as `provider: "Foundry"`, every other
+host as `"Anthropic"`. A Foundry endpoint reached through a proxy or gateway hostname meters as
+`"Anthropic"`, since only the configured `baseURL` is visible to the client. `modelSource` is
+`ANTHROPIC` either way, and no other payload field changes.
 
 ### Google GenAI / Vertex AI
 

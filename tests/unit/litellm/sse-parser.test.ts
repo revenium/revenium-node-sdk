@@ -106,4 +106,111 @@ describe("StreamingResponseParser cache token metering", () => {
       }),
     );
   });
+
+  it("captures Anthropic-native cache fields when LiteLLM surfaces them unnormalized in a streamed chunk", async () => {
+    const requestContext: RequestContext = {
+      url: "http://localhost:4000/v1/chat/completions",
+      method: "POST",
+      headers: {},
+      body: null,
+      startTime: Date.now(),
+      metadata: {},
+    };
+    const parser = new StreamingResponseParser(
+      "req-stream-003",
+      "anthropic/claude-sonnet-4-5",
+      requestContext,
+      125,
+    );
+
+    const stream = streamFromText(
+      [
+        'data: {"choices":[{"delta":{"content":"hello"}}]}',
+        'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cache_read_input_tokens":21808,"cache_creation_input_tokens":7880}}',
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+    );
+
+    await parser.parseStream(stream);
+
+    expect(trackUsageAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: "req-stream-003",
+        cachedTokens: 21808,
+        cacheCreationTokens: 7880,
+      }),
+    );
+  });
+
+  it("does not erase cache creation tokens when a later usage chunk omits them", async () => {
+    const requestContext: RequestContext = {
+      url: "http://localhost:4000/v1/chat/completions",
+      method: "POST",
+      headers: {},
+      body: null,
+      startTime: Date.now(),
+      metadata: {},
+    };
+    const parser = new StreamingResponseParser(
+      "req-stream-004",
+      "anthropic/claude-sonnet-4-5",
+      requestContext,
+      125,
+    );
+
+    const stream = streamFromText(
+      [
+        'data: {"choices":[{"delta":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":10,"total_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}',
+        'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}',
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+    );
+
+    await parser.parseStream(stream);
+
+    expect(trackUsageAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestId: "req-stream-004",
+        cachedTokens: 100,
+        cacheCreationTokens: 50,
+      }),
+    );
+  });
+
+  it("leaves cache fields undefined when no chunk reports them", async () => {
+    const requestContext: RequestContext = {
+      url: "http://localhost:4000/v1/chat/completions",
+      method: "POST",
+      headers: {},
+      body: null,
+      startTime: Date.now(),
+      metadata: {},
+    };
+    const parser = new StreamingResponseParser(
+      "req-stream-005",
+      "openai/gpt-4o-mini",
+      requestContext,
+      125,
+    );
+
+    const stream = streamFromText(
+      [
+        'data: {"choices":[{"delta":{"content":"hello"}}]}',
+        'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}',
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+    );
+
+    await parser.parseStream(stream);
+
+    const call = jest
+      .mocked(trackUsageAsync)
+      .mock.calls.find(([arg]) => arg.requestId === "req-stream-005");
+    expect(call).toBeDefined();
+    expect(call![0].cachedTokens).toBeUndefined();
+    expect(call![0].cacheCreationTokens).toBeUndefined();
+  });
 });

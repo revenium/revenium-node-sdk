@@ -1,0 +1,125 @@
+name: Provider Drift
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  surface-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Compare the consumed provider surface against the latest published types
+        run: npm run surface-check
+
+  latest-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [openai, "@anthropic-ai/sdk", "@google/genai", "@fal-ai/client"]
+    env:
+      PACKAGE: ${{ matrix.package }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Resolve installed and latest versions
+        id: versions
+        run: |
+          INSTALLED=$(node -p "require('./node_modules/$PACKAGE/package.json').version")
+          LATEST=$(npm view "$PACKAGE" version)
+          echo "installed=$INSTALLED" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when already on latest
+        if: steps.versions.outputs.installed == steps.versions.outputs.latest
+        env:
+          LATEST: ${{ steps.versions.outputs.latest }}
+        run: echo "$PACKAGE is already at $LATEST"
+
+      - name: Install latest and run the suite
+        id: suite
+        if: steps.versions.outputs.installed != steps.versions.outputs.latest
+        continue-on-error: true
+        env:
+          LATEST: ${{ steps.versions.outputs.latest }}
+        run: |
+          npm install --no-save --ignore-scripts "$PACKAGE@$LATEST"
+          npm run build
+          npm test
+
+      - name: Check whether an issue already tracks this version
+        id: existing
+        if: steps.versions.outputs.installed != steps.versions.outputs.latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+        run: |
+          TITLE="Provider drift: $PACKAGE $LATEST"
+          COUNT=$(gh issue list --repo "$REPO" --label "provider-drift" --state all --limit 200 --json title \
+            | jq --arg t "$TITLE" '[.[] | select(.title == $t)] | length')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure label exists
+        if: steps.versions.outputs.installed != steps.versions.outputs.latest && steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: gh label create "provider-drift" --repo "$REPO" --color "D93F0B" --description "Upstream provider SDK release to review" 2>/dev/null || true
+
+      - name: Open the tracking issue
+        if: steps.versions.outputs.installed != steps.versions.outputs.latest && steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INSTALLED: ${{ steps.versions.outputs.installed }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          SUITE_OUTCOME: ${{ steps.suite.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create --repo "$REPO" \
+            --title "Provider drift: $PACKAGE $LATEST" \
+            --label "provider-drift" \
+            --body "**Package**: \`$PACKAGE\`
+          **Installed**: $INSTALLED
+          **Latest**: $LATEST
+          **Unit suite against latest**: $SUITE_OUTCOME
+          **Run** (surface-check output is in the surface-check job): $RUN_URL
+
+          - [ ] Read the surface-check job: removed fields or unmapped stop reasons block a bump
+          - [ ] Bump the devDependency and run \`npm test\`
+          - [ ] Meter any new usage field the metering API accepts
+          - [ ] Add a CHANGELOG entry and publish"
+
+      - name: Fail the job when the suite failed against latest
+        if: steps.suite.outcome == 'failure'
+        run: exit 1

@@ -21,6 +21,9 @@ describe("mapStopReason", () => {
     ["error", "ERROR"],
     ["cancelled", "CANCELLED"],
     ["canceled", "CANCELLED"],
+    ["pause_turn", "END"],
+    ["refusal", "ERROR"],
+    ["model_context_window_exceeded", "TOKEN_LIMIT"],
   ])("maps '%s' to '%s'", (input, expected) => {
     expect(mapStopReason(input)).toBe(expected);
   });
@@ -49,6 +52,9 @@ describe("getSupportedStopReasons", () => {
     expect(supported).toContain("stop");
     expect(supported).toContain("tool_calls");
     expect(supported).toContain("max_tokens");
+    expect(supported).toContain("model_context_window_exceeded");
+    expect(supported).toContain("pause_turn");
+    expect(supported).toContain("refusal");
     expect(supported.length).toBeGreaterThan(10);
   });
 });

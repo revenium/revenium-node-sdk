@@ -25,6 +25,8 @@ export { trackUsageAsync, extractUsageFromResponse, extractUsageFromStream } fro
 
 export type { AnthropicTrackingData } from "./middleware.js";
 
+export type { AnthropicProvider } from "./provider-detection.js";
+
 export {
   meterTool,
   reportToolCall,

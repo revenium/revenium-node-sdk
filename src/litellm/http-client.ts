@@ -115,6 +115,7 @@ async function handleNonStreamingResponse(
       completionTokens: usage.completionTokens,
       totalTokens: usage.totalTokens,
       cachedTokens: usage.cachedTokens,
+      cacheCreationTokens: usage.cacheCreationTokens,
       duration,
       finishReason: usage.finishReason,
       usageMetadata: requestContext.metadata,

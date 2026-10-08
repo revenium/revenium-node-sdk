@@ -9,9 +9,16 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        include:
+          - node-version: 18
+            provider-pins: openai@6 @google/genai@1
+          - node-version: 20
+            provider-pins: openai@6
+          - node-version: 22
+            provider-pins: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +31,12 @@ jobs:
 
       - run: npm ci
 
+      - name: Install the provider majors supported on this Node version
+        if: matrix.provider-pins != ''
+        env:
+          PROVIDER_PINS: ${{ matrix.provider-pins }}
+        run: npm install --no-save --ignore-scripts $PROVIDER_PINS
+
       - run: npm run lint
 
       - run: npm run format:check
@@ -31,3 +44,5 @@ jobs:
       - run: npm run build
 
       - run: npm test
+
+      - run: npm run surface-check:selftest

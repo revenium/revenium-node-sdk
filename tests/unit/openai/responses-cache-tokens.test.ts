@@ -82,13 +82,13 @@ describe("ResponsesInterface cache token metering", () => {
         response: {
           id: "resp-stream-001",
           model: "gpt-4o-mini",
+          status: "completed",
           usage: {
             input_tokens: 120,
             output_tokens: 30,
             total_tokens: 150,
             cached_tokens: 55,
           },
-          finish_reason: "completed",
         },
       };
     }
