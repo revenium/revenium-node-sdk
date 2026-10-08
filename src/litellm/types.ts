@@ -81,6 +81,15 @@ export interface TokenUsage {
   total_tokens: number;
   prompt_tokens_details?: { cached_tokens?: number };
   completion_tokens_details?: { reasoning_tokens?: number };
+  /**
+   * Anthropic-native cache fields. LiteLLM does not consistently normalize every
+   * provider into the OpenAI-compatible shape above -- when proxying Anthropic
+   * models it can surface these directly on the usage object instead of (or in
+   * addition to) `prompt_tokens_details.cached_tokens`. These are ADDITIONAL to
+   * `prompt_tokens`, not a subset of it (see extractCacheTokenCounts).
+   */
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 export interface LiteLLMChatCompletionResponse {

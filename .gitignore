@@ -180,3 +180,11 @@ gitleaks*.json
 # Provider credentials (local testing only)
 google-vertex-credentials.json
 test-providers.ts
+
+# Drift engine (BACK-2524): materialized locally by /node-api-drift-local from
+# revvie-sdlc/drift-engine, the single source. Never commit the materialized
+# command or its scripts; the launcher and the exclusions file are the only
+# tracked drift files.
+.claude/commands/node-api-drift.md
+.claude/commands/node-api-drift/
+docs/node-drift-*.md

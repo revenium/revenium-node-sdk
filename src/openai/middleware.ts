@@ -19,8 +19,14 @@ import {
   shouldCapturePrompts,
   sanitizeCredentials,
   extractPrompts,
+  getMaxPromptSize,
 } from "../_core/prompt/extraction.js";
 import { ProviderInfo, getProviderMetadata } from "./provider-detection.js";
+import {
+  isTerminalResponseStatus,
+  mapResponsesStatusToStopReason,
+  TERMINAL_RESPONSE_EVENTS,
+} from "./responses-stop-reason.js";
 import { StreamingWrapper } from "./streaming.js";
 import { enforcePreCallRules } from "../_core/enforcement/evaluator.js";
 
@@ -36,8 +42,8 @@ interface ResponsesAPIResult {
     output_tokens_details?: { reasoning_tokens?: number };
     input_tokens_details?: { cached_tokens?: number };
   };
-  finish_reason?: string;
   status?: string;
+  incomplete_details?: { reason?: string } | null;
   [key: string]: unknown;
 }
 
@@ -67,43 +73,47 @@ export function trackUsageAsync(trackingData: {
   responseContent?: string;
 }): void {
   const logger = getLogger();
-  const providerMeta = trackingData.providerInfo
-    ? getProviderMetadata(trackingData.providerInfo)
-    : { provider: "OpenAI", modelSource: "OPENAI" };
 
-  const promptData = trackingData.messages
-    ? extractPrompts(
-        trackingData.messages,
-        trackingData.responseContent,
-        trackingData.usageMetadata,
-      )
-    : null;
+  Promise.resolve()
+    .then(() => {
+      const providerMeta = trackingData.providerInfo
+        ? getProviderMetadata(trackingData.providerInfo)
+        : { provider: "OpenAI", modelSource: "OPENAI" };
 
-  const startTime = Date.now() - trackingData.duration;
+      const promptData = trackingData.messages
+        ? extractPrompts(
+            trackingData.messages,
+            trackingData.responseContent,
+            trackingData.usageMetadata,
+          )
+        : null;
 
-  buildPayload({
-    operationType: "CHAT",
-    model: trackingData.model,
-    requestId: trackingData.requestId,
-    startTime,
-    duration: trackingData.duration,
-    provider: providerMeta.provider,
-    modelSource: providerMeta.modelSource,
-    middlewareSource: MIDDLEWARE_SOURCE,
-    usageMetadata: trackingData.usageMetadata,
-    usage: {
-      prompt_tokens: trackingData.promptTokens,
-      completion_tokens: trackingData.completionTokens,
-      total_tokens: trackingData.totalTokens,
-      reasoning_tokens: trackingData.reasoningTokens,
-      cached_tokens: trackingData.cachedTokens,
-    },
-    stopReason: mapStopReason(trackingData.finishReason, logger),
-    isStreamed: trackingData.isStreamed || false,
-    timeToFirstToken: trackingData.timeToFirstToken,
-    request: trackingData.messages ? { messages: trackingData.messages } : undefined,
-    promptData,
-  })
+      const startTime = Date.now() - trackingData.duration;
+
+      return buildPayload({
+        operationType: "CHAT",
+        model: trackingData.model,
+        requestId: trackingData.requestId,
+        startTime,
+        duration: trackingData.duration,
+        provider: providerMeta.provider,
+        modelSource: providerMeta.modelSource,
+        middlewareSource: MIDDLEWARE_SOURCE,
+        usageMetadata: trackingData.usageMetadata,
+        usage: {
+          prompt_tokens: trackingData.promptTokens,
+          completion_tokens: trackingData.completionTokens,
+          total_tokens: trackingData.totalTokens,
+          reasoning_tokens: trackingData.reasoningTokens,
+          cached_tokens: trackingData.cachedTokens,
+        },
+        stopReason: mapStopReason(trackingData.finishReason, logger),
+        isStreamed: trackingData.isStreamed || false,
+        timeToFirstToken: trackingData.timeToFirstToken,
+        request: trackingData.messages ? { messages: trackingData.messages } : undefined,
+        promptData,
+      });
+    })
     .then(async (payload) => {
       try {
         await sendToRevenium(payload);
@@ -537,28 +547,28 @@ export class ResponsesInterface {
     private providerInfo: ProviderInfo,
   ) {}
 
+  private inputMessages(params: Record<string, unknown>): unknown[] {
+    return Array.isArray(params.input)
+      ? params.input
+      : [{ role: "user" as const, content: params.input }];
+  }
+
   async create(
     params: Record<string, unknown>,
     metadata?: UsageMetadata,
   ): Promise<ResponsesAPIResult> {
     const startTime = Date.now();
     const requestId = randomUUID();
+    const responsesAPI = (this.client as unknown as OpenAIClientWithResponses).responses;
+    if (!responsesAPI?.create) {
+      throw new Error("Responses API not available in this OpenAI SDK version");
+    }
 
     try {
-      const responsesAPI = (this.client as unknown as OpenAIClientWithResponses).responses;
-      if (!responsesAPI?.create) {
-        throw new Error("Responses API not available in this OpenAI SDK version");
-      }
-
       const response = await responsesAPI.create(params);
-      const duration = Date.now() - startTime;
-      const usage = response.usage;
+      const usage = response.usage ?? {};
 
-      if (usage) {
-        const inputMessages = Array.isArray(params.input)
-          ? params.input
-          : [{ role: "user" as const, content: params.input }];
-
+      if (isTerminalResponseStatus(response.status)) {
         trackUsageAsync({
           requestId: response.id || requestId,
           model: response.model || (params.model as string),
@@ -567,19 +577,46 @@ export class ResponsesInterface {
           totalTokens: usage.total_tokens || 0,
           reasoningTokens: usage.reasoning_tokens,
           cachedTokens: usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens,
-          duration,
-          finishReason: response.finish_reason || "completed",
+          duration: Date.now() - startTime,
+          finishReason: mapResponsesStatusToStopReason(
+            response.status,
+            response.incomplete_details?.reason,
+            getLogger(),
+          ),
           usageMetadata: metadata,
           isStreamed: false,
           providerInfo: this.providerInfo,
-          messages: inputMessages,
+          messages: this.inputMessages(params),
         });
       }
 
       return response;
     } catch (error) {
+      this.trackFailure(params, requestId, startTime, false, metadata);
       throw error;
     }
+  }
+
+  private trackFailure(
+    params: Record<string, unknown>,
+    requestId: string,
+    startTime: number,
+    isStreamed: boolean,
+    metadata?: UsageMetadata,
+  ): void {
+    trackUsageAsync({
+      requestId,
+      model: params.model as string,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      duration: Date.now() - startTime,
+      finishReason: "error",
+      usageMetadata: metadata,
+      isStreamed,
+      providerInfo: this.providerInfo,
+      messages: this.inputMessages(params),
+    });
   }
 
   async createStreaming(
@@ -596,45 +633,79 @@ export class ResponsesInterface {
       throw new Error("Responses API not available in this OpenAI SDK version");
     }
 
-    const stream = await responsesAPI.create({ ...params, stream: true });
+    let stream: unknown;
+    try {
+      stream = await responsesAPI.create({ ...params, stream: true });
+    } catch (error) {
+      this.trackFailure(params, requestId, startTime, true, metadata);
+      throw error;
+    }
 
     return (async function* () {
       let fullContent = "";
       let finalResponse: ResponsesAPIResult | null = null;
+      let metered = false;
+      let firstTokenTime: number | undefined;
+      const capturePrompts = shouldCapturePrompts(metadata);
 
-      for await (const chunk of stream as unknown as AsyncIterable<Record<string, unknown>>) {
-        if (chunk.type === "response.output_text.delta" && chunk.delta) {
-          fullContent += chunk.delta;
-        }
-        if (chunk.type === "response.completed" && chunk.response) {
-          finalResponse = chunk.response as ResponsesAPIResult;
-        }
-        yield chunk;
-      }
-
-      const duration = Date.now() - startTime;
-      if (finalResponse?.usage) {
-        const usage = finalResponse.usage;
-        const inputMessages = Array.isArray(params.input)
-          ? params.input
-          : [{ role: "user" as const, content: params.input }];
-
+      const track = (finishReason: string | null) => {
+        const usage = finalResponse?.usage ?? {};
         trackUsageAsync({
-          requestId: finalResponse.id || requestId,
-          model: finalResponse.model || (params.model as string),
+          timeToFirstToken: firstTokenTime ? firstTokenTime - startTime : undefined,
+          requestId: finalResponse?.id || requestId,
+          model: finalResponse?.model || (params.model as string),
           promptTokens: usage.input_tokens || 0,
           completionTokens: usage.output_tokens || 0,
           totalTokens: usage.total_tokens || 0,
           reasoningTokens: usage.output_tokens_details?.reasoning_tokens,
           cachedTokens: usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens,
-          duration,
-          finishReason: finalResponse.status || "completed",
+          duration: Date.now() - startTime,
+          finishReason,
           usageMetadata: metadata,
           isStreamed: true,
           providerInfo: self.providerInfo,
-          messages: inputMessages,
-          responseContent: fullContent,
+          messages: self.inputMessages(params),
+          responseContent: fullContent ? sanitizeCredentials(fullContent) : undefined,
         });
+      };
+
+      const appendOutput = (delta: string) => {
+        const maxSize = getMaxPromptSize();
+        if (fullContent.length >= maxSize) return;
+
+        fullContent += delta;
+        if (fullContent.length > maxSize) {
+          fullContent = sanitizeCredentials(fullContent).slice(0, maxSize);
+        }
+      };
+
+      const terminalStopReason = () =>
+        mapResponsesStatusToStopReason(
+          finalResponse?.status,
+          finalResponse?.incomplete_details?.reason,
+          getLogger(),
+        );
+
+      try {
+        for await (const chunk of stream as unknown as AsyncIterable<Record<string, unknown>>) {
+          if (chunk.type === "response.output_text.delta" && chunk.delta) {
+            firstTokenTime ??= Date.now();
+            if (capturePrompts) appendOutput(chunk.delta as string);
+          }
+          if (TERMINAL_RESPONSE_EVENTS.has(chunk.type as string) && chunk.response) {
+            finalResponse = chunk.response as ResponsesAPIResult;
+          }
+          yield chunk;
+        }
+
+        metered = true;
+        track(terminalStopReason());
+      } catch (error) {
+        metered = true;
+        track("error");
+        throw error;
+      } finally {
+        if (!metered) track(finalResponse ? terminalStopReason() : "cancelled");
       }
     })();
   }

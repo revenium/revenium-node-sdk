@@ -132,6 +132,26 @@ describe("extractUsageFromResponse", () => {
     expect(result.cacheCreation5mTokens).toBeUndefined();
     expect(result.cacheCreation1hTokens).toBeUndefined();
   });
+
+  it("reads thinking tokens from output_tokens_details as reasoning tokens", () => {
+    const result = extractUsageFromResponse({
+      usage: {
+        input_tokens: 100,
+        output_tokens: 50,
+        output_tokens_details: { thinking_tokens: 40 },
+      },
+    });
+
+    expect(result.reasoningTokens).toBe(40);
+  });
+
+  it("leaves reasoning tokens undefined when output_tokens_details is null", () => {
+    const result = extractUsageFromResponse({
+      usage: { input_tokens: 100, output_tokens: 50, output_tokens_details: null },
+    });
+
+    expect(result.reasoningTokens).toBeUndefined();
+  });
 });
 
 describe("extractUsageFromStream", () => {
@@ -251,6 +271,23 @@ describe("extractUsageFromStream", () => {
     expect(result.cacheCreationTokens).toBe(16781);
     expect(result.cacheCreation5mTokens).toBe(16781);
     expect(result.cacheCreation1hTokens).toBe(0);
+  });
+
+  it("reads thinking tokens from the message_delta usage", () => {
+    const chunks = [
+      { type: "message_start", message: { usage: { input_tokens: 100 } } },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 50, output_tokens_details: { thinking_tokens: 30 } },
+      },
+    ];
+
+    const result = extractUsageFromStream(chunks);
+
+    expect(result.outputTokens).toBe(50);
+    expect(result.reasoningTokens).toBe(30);
+    expect(result.stopReason).toBe("end_turn");
   });
 });
 
@@ -433,5 +470,29 @@ describe("trackUsageAsync propagation", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body).not.toHaveProperty("cacheCreation5mTokenCount");
     expect(body).not.toHaveProperty("cacheCreation1hTokenCount");
+  });
+
+  it("forwards reasoning tokens as reasoningTokenCount", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    trackUsageAsync({
+      requestId: "req-anthropic-005",
+      model: "claude-sonnet-4-5",
+      inputTokens: 100,
+      outputTokens: 50,
+      reasoningTokens: 40,
+      duration: 1500,
+      isStreamed: false,
+      stopReason: "end_turn",
+      requestTime: new Date(),
+      responseTime: new Date(),
+    });
+
+    await flushPromises();
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body).toHaveProperty("reasoningTokenCount", 40);
   });
 });

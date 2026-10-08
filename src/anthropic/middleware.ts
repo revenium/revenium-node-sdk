@@ -2,6 +2,7 @@ import { UsageMetadata, ReveniumPayload } from "../_core/types/index.js";
 import { getConfig, getLogger } from "../_core/config/manager.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import { buildPayload } from "../_core/metering/payload-builder.js";
+import { extractCacheTokenCounts } from "../_core/metering/cache-tokens.js";
 import { mapStopReason } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import {
@@ -10,6 +11,7 @@ import {
   truncateString,
 } from "../_core/prompt/extraction.js";
 import { DEFAULT_CONFIG } from "../_core/constants.js";
+import { AnthropicProvider, DIRECT_ANTHROPIC_PROVIDER } from "./provider-detection.js";
 
 const MIDDLEWARE_SOURCE = "revenium-anthropic-node";
 
@@ -22,6 +24,7 @@ export interface AnthropicTrackingData {
   cacheReadTokens?: number;
   cacheCreation5mTokens?: number;
   cacheCreation1hTokens?: number;
+  reasoningTokens?: number;
   duration: number;
   isStreamed: boolean;
   stopReason?: string;
@@ -32,6 +35,7 @@ export interface AnthropicTrackingData {
   hasVisionContent?: boolean;
   requestBody?: any;
   response?: any;
+  provider?: AnthropicProvider;
 }
 
 export function detectVisionContent(params?: any): boolean {
@@ -156,6 +160,10 @@ function extractCacheCreationSplit(usage: any): {
   };
 }
 
+function extractReasoningTokens(usage: any): number | undefined {
+  return usage?.output_tokens_details?.thinking_tokens ?? undefined;
+}
+
 export function extractUsageFromResponse(response: any): {
   inputTokens: number;
   outputTokens: number;
@@ -163,15 +171,18 @@ export function extractUsageFromResponse(response: any): {
   cacheReadTokens?: number;
   cacheCreation5mTokens?: number;
   cacheCreation1hTokens?: number;
+  reasoningTokens?: number;
   stopReason?: string;
 } {
   const usage = response?.usage || {};
+  const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(usage);
   return {
     inputTokens: usage.input_tokens || 0,
     outputTokens: usage.output_tokens || 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens,
-    cacheReadTokens: usage.cache_read_input_tokens,
+    cacheCreationTokens,
+    cacheReadTokens,
     ...extractCacheCreationSplit(usage),
+    reasoningTokens: extractReasoningTokens(usage),
     stopReason: response?.stop_reason,
   };
 }
@@ -183,6 +194,7 @@ export function extractUsageFromStream(chunks: any[]): {
   cacheReadTokens?: number;
   cacheCreation5mTokens?: number;
   cacheCreation1hTokens?: number;
+  reasoningTokens?: number;
   stopReason?: string;
 } {
   let inputTokens = 0;
@@ -191,6 +203,7 @@ export function extractUsageFromStream(chunks: any[]): {
   let cacheReadTokens: number | undefined;
   let cacheCreation5mTokens: number | undefined;
   let cacheCreation1hTokens: number | undefined;
+  let reasoningTokens: number | undefined;
   let stopReason: string | undefined;
 
   for (const chunk of chunks) {
@@ -210,16 +223,22 @@ export function extractUsageFromStream(chunks: any[]): {
     if (usage?.output_tokens) {
       outputTokens = Math.max(outputTokens, usage.output_tokens);
     }
-    if (usage?.cache_creation_input_tokens) {
-      cacheCreationTokens = usage.cache_creation_input_tokens;
+
+    const cacheTokens = extractCacheTokenCounts(usage);
+    if (cacheTokens.cacheCreationTokens !== undefined) {
+      cacheCreationTokens = cacheTokens.cacheCreationTokens;
     }
-    if (usage?.cache_read_input_tokens) {
-      cacheReadTokens = usage.cache_read_input_tokens;
+    if (cacheTokens.cacheReadTokens !== undefined) {
+      cacheReadTokens = cacheTokens.cacheReadTokens;
     }
     if (usage?.cache_creation) {
       const split = extractCacheCreationSplit(usage);
       cacheCreation5mTokens = split.cacheCreation5mTokens;
       cacheCreation1hTokens = split.cacheCreation1hTokens;
+    }
+    const chunkReasoningTokens = extractReasoningTokens(usage);
+    if (chunkReasoningTokens !== undefined) {
+      reasoningTokens = chunkReasoningTokens;
     }
     if (chunk?.delta?.stop_reason) {
       stopReason = chunk.delta.stop_reason;
@@ -233,6 +252,7 @@ export function extractUsageFromStream(chunks: any[]): {
     cacheReadTokens,
     cacheCreation5mTokens,
     cacheCreation1hTokens,
+    reasoningTokens,
     stopReason,
   };
 }
@@ -312,7 +332,7 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
         requestId: data.requestId,
         startTime: data.requestTime.getTime(),
         duration: data.duration,
-        provider: "Anthropic",
+        provider: data.provider ?? DIRECT_ANTHROPIC_PROVIDER,
         modelSource: "ANTHROPIC",
         middlewareSource: MIDDLEWARE_SOURCE,
         usageMetadata: data.metadata,
@@ -320,10 +340,18 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
           prompt_tokens: data.inputTokens,
           completion_tokens: data.outputTokens,
           total_tokens: data.inputTokens + data.outputTokens,
+          // NOTE: unlike the LiteLLM emitter, this intentionally defaults to 0 rather than
+          // undefined -- see tests/unit/anthropic/cache-tokens.test.ts "sends zero cache
+          // tokens when none provided". Direct Anthropic API responses always report these
+          // fields explicitly (0 or a positive count), so an absent value here reflects a
+          // malformed/incomplete response rather than "this SDK path can't observe caching,"
+          // which is the ambiguity BACK-2409 is about. Left as-is to avoid changing tested,
+          // intentional behavior outside this ticket's scope.
           cache_creation_tokens: data.cacheCreationTokens || 0,
           cached_tokens: data.cacheReadTokens || 0,
           cache_creation_5m_tokens: data.cacheCreation5mTokens,
           cache_creation_1h_tokens: data.cacheCreation1hTokens,
+          reasoning_tokens: data.reasoningTokens,
         },
         stopReason: mapStopReason(data.stopReason, logger),
         isStreamed: data.isStreamed,

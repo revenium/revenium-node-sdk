@@ -39,7 +39,10 @@ export function mapGoogleFinishReason(finishReason: any, defaultReason: string =
         return "END";
       case "MAX_TOKENS":
         return "TOKEN_LIMIT";
+      case "TOO_MANY_TOOL_CALLS":
+        return "COMPLETION_LIMIT";
       case "SAFETY":
+      case "LANGUAGE":
       case "RECITATION":
       case "BLOCKLIST":
       case "PROHIBITED_CONTENT":
@@ -60,6 +63,10 @@ export function mapGoogleFinishReason(finishReason: any, defaultReason: string =
       case "IMAGE_OTHER":
         return defaultReason;
       default:
+        getLogger().warn("Unknown Google finish reason, mapping to default", {
+          finishReason,
+          defaultReason,
+        });
         return defaultReason;
     }
   } catch {

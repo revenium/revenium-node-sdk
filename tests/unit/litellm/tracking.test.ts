@@ -137,15 +137,38 @@ describe("sendReveniumMetrics token field names", () => {
     expect(body).toHaveProperty("operationType", "EMBED");
   });
 
-  it("sends cached prompt tokens as cache read tokens", async () => {
+  it("sends cached prompt tokens as cache read tokens, and omits cache creation when unknown", async () => {
     const mockFetch = createMockFetch();
     global.fetch = mockFetch;
 
     await sendReveniumMetrics({ ...baseMetrics, cachedTokens: 42 });
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body).toHaveProperty("cacheCreationTokenCount", 0);
+    // cacheCreationTokens wasn't provided -- must stay unknown (undefined), not assert 0.
+    expect(body).not.toHaveProperty("cacheCreationTokenCount");
     expect(body).toHaveProperty("cacheReadTokenCount", 42);
+  });
+
+  it("sends cache creation tokens when provided", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendReveniumMetrics({ ...baseMetrics, cachedTokens: 15, cacheCreationTokens: 7880 });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body).toHaveProperty("cacheCreationTokenCount", 7880);
+    expect(body).toHaveProperty("cacheReadTokenCount", 15);
+  });
+
+  it("omits both cache fields when neither is known", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendReveniumMetrics({ ...baseMetrics });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("cacheCreationTokenCount");
+    expect(body).not.toHaveProperty("cacheReadTokenCount");
   });
 
   it("extracts OpenAI-compatible cached prompt tokens from response usage", () => {
@@ -176,6 +199,73 @@ describe("sendReveniumMetrics token field names", () => {
       cachedTokens: 33,
       finishReason: "stop",
     });
+    expect(usage.cacheCreationTokens).toBeUndefined();
+  });
+
+  it("extracts Anthropic-native cache fields when LiteLLM surfaces them unnormalized", () => {
+    const usage = extractUsageFromResponse({
+      id: "chatcmpl-002",
+      object: "chat.completion",
+      created: 1,
+      model: "anthropic/claude-sonnet-4-5",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "hello" },
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        cache_read_input_tokens: 21808,
+        cache_creation_input_tokens: 7880,
+      } as any,
+    });
+
+    expect(usage).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 20,
+      totalTokens: 30,
+      cachedTokens: 21808,
+      cacheCreationTokens: 7880,
+      finishReason: "stop",
+    });
+  });
+
+  it("returns undefined cache fields when usage is missing entirely", () => {
+    const usage = extractUsageFromResponse({
+      id: "chatcmpl-003",
+      object: "chat.completion",
+      created: 1,
+      model: "openai/gpt-4o-mini",
+      choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+    });
+
+    expect(usage.cachedTokens).toBeUndefined();
+    expect(usage.cacheCreationTokens).toBeUndefined();
+  });
+
+  it("tolerates null cache fields on the usage object", () => {
+    const usage = extractUsageFromResponse({
+      id: "chatcmpl-004",
+      object: "chat.completion",
+      created: 1,
+      model: "anthropic/claude-sonnet-4-5",
+      choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        total_tokens: 15,
+        cache_read_input_tokens: null as any,
+        cache_creation_input_tokens: null as any,
+        prompt_tokens_details: null as any,
+      },
+    });
+
+    expect(usage.cachedTokens).toBeUndefined();
+    expect(usage.cacheCreationTokens).toBeUndefined();
   });
 });
 

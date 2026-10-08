@@ -14,6 +14,9 @@ const STOP_REASON_MAP: Record<string, string> = {
   end_turn: "END",
   stop_sequence: "END_SEQUENCE",
   tool_use: "END_SEQUENCE",
+  pause_turn: "END",
+  refusal: "ERROR",
+  model_context_window_exceeded: "TOKEN_LIMIT",
 };
 
 const DEFAULT_STOP_REASON = "END";

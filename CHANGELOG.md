@@ -5,7 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-08
+
+### Fixed
+
+- LiteLLM calls that proxy Anthropic models were metered with zero cache tokens: the emitter hardcoded `cacheCreationTokenCount` to `0` and read cache reads only from the OpenAI-shaped `prompt_tokens_details.cached_tokens`, so the Anthropic-native `cache_read_input_tokens` and `cache_creation_input_tokens` LiteLLM surfaces were dropped on both the non-streaming and the SSE path. A shared extractor now reads both shapes, reports `undefined` rather than `0` for a field the usage object does not carry, and the Anthropic middleware reuses it (BACK-2409)
+- Anthropic extended-thinking output was metered with no `reasoningTokenCount`; the `usage.output_tokens_details.thinking_tokens` field shipped in `@anthropic-ai/sdk` 0.129 is now forwarded for both non-streaming and streaming calls (FRONT-2939)
+- Anthropic `model_context_window_exceeded`, `refusal` and `pause_turn` stop reasons fell through to `END` with a warning; they now map to `TOKEN_LIMIT`, `ERROR` and `END`
+- Google `TOO_MANY_TOOL_CALLS` and `LANGUAGE` finish reasons fell through to the default; they now map to `COMPLETION_LIMIT` and `ERROR`, and any unknown Google finish reason logs a warning like the other providers
+- Every OpenAI Responses API call was metered as `END` and logged an `Unknown stop reason: completed` warning, because the middleware read a `finish_reason` field the SDK `Response` does not have; the response `status` and `incomplete_details.reason` are now resolved, so a truncated call meters `TOKEN_LIMIT` and a content-filtered call `ERROR`, on both the non-streaming and the streaming path (FRONT-2961)
+- OpenAI Responses calls that failed were not metered at all: the non-streaming path rethrew the provider error without a record, and both paths skipped metering whenever the response carried no `usage`. A failure now meters as `ERROR`, and a stream abandoned before it ends meters as `CANCELLED`, matching the Chat Completions surface. A `background: true` call that returns while still `queued` is not metered; retrieving its terminal result is not yet intercepted, so that call stays unmetered (FRONT-2961)
+- OpenAI Responses streams ending in `response.incomplete` or `response.failed` produced no metering record at all, so transaction counts and metered token volume will rise on upgrade for traffic that was previously invisible (FRONT-2961)
+- Streamed OpenAI Responses output was forwarded to Revenium without the credential sanitizing already applied on the Chat Completions streaming path (FRONT-2961)
+- `client.messages.stream()` threw `messages.create(...).withResponse is not a function` once the middleware was loaded, because the SDK helper re-entered the patched `create`; it now runs against the original method. The call also returns the SDK `MessageStream` again instead of a bare async generator, so `.on()`, `.finalMessage()`, `.finalText()` and `.withResponse()` work under the middleware as they do without it, and the call meters exactly once (BACK-2737)
+
+### Changed
+
+- Claude served through Microsoft Foundry is now metered as `provider: "Foundry"` instead of direct `Anthropic`, so an administrator can reconcile that spend against a Microsoft invoice. Detection reads the Anthropic client's `baseURL` and matches the `services.ai.azure.com` host; every other base URL, including Azure OpenAI's `openai.azure.com`, keeps the `Anthropic` label and a byte-identical payload. `modelSource` stays `ANTHROPIC` on both, and no resource name, host or URL fragment is added to the payload. Release sequencing: BACK-2689 (the `FOUNDRY` enforcement alias) and BACK-2921 (the `foundry → azure` billing-coverage bucket) must be deployed before a release carrying this change reaches customers, otherwise Anthropic-scoped budget rules stop counting Foundry spend and `/billing/coverage` drops it (BACK-2737)
+- Development dependencies raised to the current provider SDK majors: `openai` 7.23, `@anthropic-ai/sdk` 0.129, `@google/genai` 2.24, `@fal-ai/client` 1.10; the unit suite passes against all of them. Peer dependency floors are unchanged
+- `scripts/provider-surface-check.mjs` compares the provider response fields and stop reasons this middleware reads against the latest published SDK types and fails when a consumed field disappears or a stop reason is unmapped; a weekly workflow runs it and the unit suite against the latest provider versions. It now also tracks the OpenAI `ResponseStatus` and `incomplete_details.reason` tables, so a new Responses status or incomplete reason fails the check instead of silently metering as `END` (FRONT-2961)
 
 ## [1.2.1] - 2026-09-24
 
@@ -192,6 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Azure OpenAI automatic detection and configuration
 - 130 unit and integration tests
 
+[1.3.0]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.3.0
 [1.2.1]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.2.1
 [1.2.0]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.2.0
 [1.1.10]: https://github.com/revenium/revenium-node-sdk/releases/tag/v1.1.10

@@ -17,6 +17,7 @@ import {
 } from "../_core/metadata/trace-fields.js";
 import { resolveSkillFields } from "../_core/metadata/metadata-builder.js";
 import { extractModelSource, extractProvider, extractModelName } from "./provider-mapper.js";
+import { extractCacheTokenCounts } from "../_core/metering/cache-tokens.js";
 import type { ReveniumPayload } from "../_core/types/index.js";
 import type {
   LiteLLMUsageMetadata,
@@ -54,6 +55,7 @@ export async function sendReveniumMetrics(data: {
   totalTokens: number;
   reasoningTokens?: number;
   cachedTokens?: number;
+  cacheCreationTokens?: number;
   duration: number;
   finishReason: string | null;
   usageMetadata?: LiteLLMUsageMetadata;
@@ -115,8 +117,8 @@ export async function sendReveniumMetrics(data: {
     inputTokenCount: data.promptTokens,
     outputTokenCount: isEmbedding ? 0 : data.completionTokens,
     reasoningTokenCount: data.reasoningTokens || 0,
-    cacheCreationTokenCount: 0,
-    cacheReadTokenCount: data.cachedTokens || 0,
+    cacheCreationTokenCount: data.cacheCreationTokens,
+    cacheReadTokenCount: data.cachedTokens,
     totalTokenCount: data.totalTokens,
     model: extractModelName(data.model),
     modelSource: extractModelSource(data.model),
@@ -255,14 +257,17 @@ export function extractUsageFromResponse(response: LiteLLMChatCompletionResponse
   completionTokens: number;
   totalTokens: number;
   cachedTokens?: number;
+  cacheCreationTokens?: number;
   finishReason: string | null;
 } {
   const usage = response.usage;
+  const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(usage);
   return {
     promptTokens: usage?.prompt_tokens || 0,
     completionTokens: usage?.completion_tokens || 0,
     totalTokens: usage?.total_tokens || 0,
-    cachedTokens: usage?.prompt_tokens_details?.cached_tokens,
+    cachedTokens: cacheReadTokens,
+    cacheCreationTokens,
     finishReason: response.choices?.[0]?.finish_reason || null,
   };
 }

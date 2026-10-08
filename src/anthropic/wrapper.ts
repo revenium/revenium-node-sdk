@@ -11,6 +11,7 @@ import {
   reconstructResponseFromChunks,
   AnthropicTrackingData,
 } from "./middleware.js";
+import { AnthropicProvider, detectAnthropicProvider } from "./provider-detection.js";
 
 type AnthropicConfigExtras = Config & { anthropicApiKey?: string };
 
@@ -124,9 +125,11 @@ async function handleStreamingResponse(
     requestTime: Date;
     startTime: number;
     requestBody: any;
+    provider: AnthropicProvider;
   },
 ) {
-  const { requestId, requestModel, metadata, requestTime, startTime, requestBody } = context;
+  const { requestId, requestModel, metadata, requestTime, startTime, requestBody, provider } =
+    context;
 
   async function* trackingStream() {
     const chunks: any[] = [];
@@ -165,6 +168,7 @@ async function handleStreamingResponse(
         cacheReadTokens: usage.cacheReadTokens,
         cacheCreation5mTokens: usage.cacheCreation5mTokens,
         cacheCreation1hTokens: usage.cacheCreation1hTokens,
+        reasoningTokens: usage.reasoningTokens,
         duration,
         isStreamed: true,
         stopReason: usage.stopReason,
@@ -175,6 +179,7 @@ async function handleStreamingResponse(
         requestBody,
         response: reconstructedResponse,
         hasVisionContent: detectVisionContent(requestBody),
+        provider,
       };
 
       trackUsageAsync(trackingData);
@@ -190,6 +195,7 @@ async function patchedCreateMethod(this: any, params: any, options?: any): Promi
   const requestId = randomUUID();
   const startTime = Date.now();
   const requestTime = new Date();
+  const provider = detectAnthropicProvider(this._client?.baseURL);
 
   const metadata = params.usageMetadata || {};
   const { usageMetadata: _, ...cleanParams } = params;
@@ -214,6 +220,7 @@ async function patchedCreateMethod(this: any, params: any, options?: any): Promi
         cacheReadTokens: usage.cacheReadTokens,
         cacheCreation5mTokens: usage.cacheCreation5mTokens,
         cacheCreation1hTokens: usage.cacheCreation1hTokens,
+        reasoningTokens: usage.reasoningTokens,
         duration,
         isStreamed: false,
         stopReason: usage.stopReason,
@@ -223,6 +230,7 @@ async function patchedCreateMethod(this: any, params: any, options?: any): Promi
         hasVisionContent: detectVisionContent(params),
         requestBody: params,
         response,
+        provider,
       };
 
       trackUsageAsync(trackingData);
@@ -236,49 +244,34 @@ async function patchedCreateMethod(this: any, params: any, options?: any): Promi
       requestTime,
       startTime,
       requestBody: params,
+      provider,
     }) as any;
   } catch (error) {
     throw error;
   }
 }
 
-async function* patchedStreamMethod(this: any, params: any, options?: any): AsyncIterable<any> {
+function meterStreamHelper(
+  stream: any,
+  context: { params: any; metadata: any; provider: AnthropicProvider },
+): void {
+  const { params, metadata, provider } = context;
   const requestId = randomUUID();
   const startTime = Date.now();
   const requestTime = new Date();
   const chunks: any[] = [];
   let firstTokenTime: number | undefined;
-  let resolvedModel: string | undefined;
 
-  const metadata = params.usageMetadata || {};
-  const { usageMetadata: _, ...cleanParams } = params;
-
-  try {
-    const originalStream = patchingContext.originalMethods.stream;
-    if (!originalStream) throw new Error("Original stream method not available");
-
-    const stream = originalStream.call(this, cleanParams, options);
-    for await (const chunk of stream) {
-      if (!firstTokenTime && chunk.type === "content_block_delta") {
-        firstTokenTime = Date.now();
-      }
-      if (!resolvedModel && chunk.type === "message_start" && chunk.message?.model) {
-        resolvedModel = chunk.message.model;
-      }
-      chunks.push(chunk);
-      yield chunk;
+  stream.on("streamEvent", (event: any) => {
+    if (!firstTokenTime && event.type === "content_block_delta") {
+      firstTokenTime = Date.now();
     }
+    chunks.push(event);
+  });
 
-    const duration = Date.now() - startTime;
-    const timeToFirstToken = firstTokenTime ? firstTokenTime - startTime : undefined;
-    const model = resolvedModel ?? params.model;
-
+  stream.on("finalMessage", (message: any) => {
+    const model = message?.model ?? params.model;
     const usage = extractUsageFromStream(chunks);
-
-    let reconstructedResponse = undefined;
-    if (shouldCapturePrompts(metadata)) {
-      reconstructedResponse = reconstructResponseFromChunks(chunks, model);
-    }
 
     const trackingData: AnthropicTrackingData = {
       requestId,
@@ -289,20 +282,43 @@ async function* patchedStreamMethod(this: any, params: any, options?: any): Asyn
       cacheReadTokens: usage.cacheReadTokens,
       cacheCreation5mTokens: usage.cacheCreation5mTokens,
       cacheCreation1hTokens: usage.cacheCreation1hTokens,
-      duration,
+      reasoningTokens: usage.reasoningTokens,
+      duration: Date.now() - startTime,
       isStreamed: true,
       stopReason: usage.stopReason,
       metadata,
       requestTime,
       responseTime: new Date(),
-      timeToFirstToken,
+      timeToFirstToken: firstTokenTime ? firstTokenTime - startTime : undefined,
       hasVisionContent: detectVisionContent(params),
       requestBody: params,
-      response: reconstructedResponse,
+      response: shouldCapturePrompts(metadata)
+        ? reconstructResponseFromChunks(chunks, model)
+        : undefined,
+      provider,
     };
 
     trackUsageAsync(trackingData);
-  } catch (error) {
-    throw error;
-  }
+  });
+}
+
+function patchedStreamMethod(this: any, params: any, options?: any): any {
+  const originalStream = patchingContext.originalMethods.stream;
+  if (!originalStream) throw new Error("Original stream method not available");
+
+  const metadata = params.usageMetadata || {};
+  const { usageMetadata: _, ...cleanParams } = params;
+
+  const unpatchedResource = Object.create(this, {
+    create: { value: patchingContext.originalMethods.create },
+  });
+  const stream = originalStream.call(unpatchedResource, cleanParams, options);
+
+  meterStreamHelper(stream, {
+    params,
+    metadata,
+    provider: detectAnthropicProvider(this._client?.baseURL),
+  });
+
+  return stream;
 }
