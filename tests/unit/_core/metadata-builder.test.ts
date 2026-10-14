@@ -1,4 +1,9 @@
-import { buildMetadataFields } from "../../../src/_core/metadata/metadata-builder";
+import {
+  buildMetadataFields,
+  resolveAgenticJobFields,
+  normalizeAgenticJobId,
+} from "../../../src/_core/metadata/metadata-builder";
+import { runWithJobContext } from "../../../src/_core/jobs/job-context";
 import type { UsageMetadata } from "../../../src/_core/types/index";
 
 describe("buildMetadataFields", () => {
@@ -74,5 +79,102 @@ describe("buildMetadataFields", () => {
     expect(result.agent).toBe("recommender");
     expect(result.retryNumber).toBe(1);
     expect(result.parentTransactionId).toBe("txn-parent-001");
+  });
+});
+
+describe("resolveAgenticJobFields", () => {
+  const JOB_ENV_VARS = [
+    "REVENIUM_AGENTIC_JOB_ID",
+    "REVENIUM_AGENTIC_JOB_NAME",
+    "REVENIUM_AGENTIC_JOB_TYPE",
+    "REVENIUM_AGENTIC_JOB_VERSION",
+  ];
+
+  afterEach(() => {
+    for (const name of JOB_ENV_VARS) delete process.env[name];
+  });
+
+  it("reads the job fields from the environment when nothing else is set", () => {
+    process.env.REVENIUM_AGENTIC_JOB_ID = "env-job";
+    process.env.REVENIUM_AGENTIC_JOB_NAME = "env-name";
+
+    expect(resolveAgenticJobFields()).toEqual({
+      agenticJobId: "env-job",
+      agenticJobName: "env-name",
+    });
+  });
+
+  it("prefers the job context over the environment", () => {
+    process.env.REVENIUM_AGENTIC_JOB_ID = "env-job";
+
+    const resolved = runWithJobContext({ agenticJobId: "context-job" }, () =>
+      resolveAgenticJobFields(),
+    );
+
+    expect(resolved).toEqual({ agenticJobId: "context-job" });
+  });
+
+  it("prefers per-call metadata over the job context", () => {
+    const resolved = runWithJobContext(
+      { agenticJobId: "context-job", agenticJobType: "batch" },
+      () => resolveAgenticJobFields({ agenticJobId: "call-job" }),
+    );
+
+    expect(resolved).toEqual({ agenticJobId: "call-job", agenticJobType: "batch" });
+  });
+
+  it("returns no fields when no source supplies one", () => {
+    expect(resolveAgenticJobFields({ traceId: "trace-001" })).toEqual({});
+  });
+
+  it("drops an environment job id the metering API would reject", () => {
+    process.env.REVENIUM_AGENTIC_JOB_ID = "run 77";
+    process.env.REVENIUM_AGENTIC_JOB_NAME = "env-name";
+
+    expect(resolveAgenticJobFields()).toEqual({});
+  });
+
+  it("drops a job context id the metering API would reject and falls back to the environment", () => {
+    process.env.REVENIUM_AGENTIC_JOB_ID = "env-job";
+
+    const resolved = runWithJobContext({ agenticJobId: "run 77", agenticJobType: "batch" }, () =>
+      resolveAgenticJobFields(),
+    );
+
+    expect(resolved).toEqual({ agenticJobId: "env-job" });
+  });
+
+  it("drops the per-call job descriptors alongside a rejected per-call id", () => {
+    const resolved = runWithJobContext(
+      { agenticJobId: "context-job", agenticJobType: "batch" },
+      () => resolveAgenticJobFields({ agenticJobId: "run 77", agenticJobName: "call-name" }),
+    );
+
+    expect(resolved).toEqual({ agenticJobId: "context-job", agenticJobType: "batch" });
+  });
+
+  it("keeps the job context when a call passes the field with no value", () => {
+    const fields = runWithJobContext({ agenticJobName: "context-name" }, () =>
+      buildMetadataFields({ agenticJobName: undefined }),
+    );
+
+    expect(fields).toMatchObject({ agenticJobName: "context-name" });
+  });
+});
+
+describe("normalizeAgenticJobId", () => {
+  it("accepts an id the metering API accepts", () => {
+    expect(normalizeAgenticJobId("loan-app_123.v2")).toBe("loan-app_123.v2");
+  });
+
+  it.each(["run 77", "job/123", "_run-1", "types", "conversion-funnel", "a".repeat(256)])(
+    "drops %p",
+    (jobId) => {
+      expect(normalizeAgenticJobId(jobId)).toBeUndefined();
+    },
+  );
+
+  it("returns undefined when no id is supplied", () => {
+    expect(normalizeAgenticJobId()).toBeUndefined();
   });
 });

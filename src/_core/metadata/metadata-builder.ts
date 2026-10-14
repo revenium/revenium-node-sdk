@@ -1,6 +1,7 @@
 import { UsageMetadata } from "../types/index.js";
 import { getJobContext } from "../jobs/job-context.js";
 import { ENV_VARS } from "../constants.js";
+import { getLogger } from "../config/manager.js";
 
 interface MetadataFieldConfig {
   source: keyof UsageMetadata;
@@ -69,19 +70,66 @@ function truncateToLimit(value: unknown, maxLength: number): unknown {
   return value;
 }
 
-function getJobFieldsFromEnv(): Partial<
-  Pick<UsageMetadata, "agenticJobId" | "agenticJobName" | "agenticJobType" | "agenticJobVersion">
-> {
-  const result: Record<string, string> = {};
-  const envId = process.env[ENV_VARS.AGENTIC_JOB_ID];
-  const envName = process.env[ENV_VARS.AGENTIC_JOB_NAME];
-  const envType = process.env[ENV_VARS.AGENTIC_JOB_TYPE];
-  const envVersion = process.env[ENV_VARS.AGENTIC_JOB_VERSION];
-  if (envId) result.agenticJobId = envId;
-  if (envName) result.agenticJobName = envName;
-  if (envType) result.agenticJobType = envType;
-  if (envVersion) result.agenticJobVersion = envVersion;
+const AGENTIC_JOB_ENV_VARS = {
+  agenticJobId: ENV_VARS.AGENTIC_JOB_ID,
+  agenticJobName: ENV_VARS.AGENTIC_JOB_NAME,
+  agenticJobType: ENV_VARS.AGENTIC_JOB_TYPE,
+  agenticJobVersion: ENV_VARS.AGENTIC_JOB_VERSION,
+} as const;
+
+type AgenticJobFields = Partial<Pick<UsageMetadata, keyof typeof AGENTIC_JOB_ENV_VARS>>;
+
+const AGENTIC_JOB_FIELDS = Object.keys(AGENTIC_JOB_ENV_VARS) as (keyof AgenticJobFields)[];
+
+const AGENTIC_JOB_ID_PATTERN = /^(?!types$|conversion-funnel$)[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/;
+
+function getJobFieldsFromEnv(): AgenticJobFields {
+  const result: AgenticJobFields = {};
+
+  for (const field of AGENTIC_JOB_FIELDS) {
+    const value = process.env[AGENTIC_JOB_ENV_VARS[field]];
+    if (value) result[field] = value;
+  }
+
   return result;
+}
+
+export function normalizeAgenticJobId(agenticJobId?: string): string | undefined {
+  if (!agenticJobId) return undefined;
+
+  if (!AGENTIC_JOB_ID_PATTERN.test(agenticJobId)) {
+    getLogger().warn("agentic_job_id is not in the accepted format. Dropping it.", {
+      length: agenticJobId.length,
+    });
+    return undefined;
+  }
+
+  return agenticJobId;
+}
+
+function pickAgenticJobFields(source: AgenticJobFields): AgenticJobFields {
+  const fields: AgenticJobFields = {};
+
+  for (const field of AGENTIC_JOB_FIELDS) {
+    const value = source[field];
+    if (value) fields[field] = value;
+  }
+
+  return fields;
+}
+
+export function resolveAgenticJobFields(usageMetadata?: UsageMetadata): AgenticJobFields {
+  const sources = [getJobFieldsFromEnv(), getJobContext(), usageMetadata ?? {}];
+  const resolved: AgenticJobFields = {};
+
+  for (const source of sources) {
+    const fields = pickAgenticJobFields(source);
+    if (fields.agenticJobId && !normalizeAgenticJobId(fields.agenticJobId)) continue;
+
+    Object.assign(resolved, fields);
+  }
+
+  return resolved;
 }
 
 export function resolveSkillFields(usageMetadata?: UsageMetadata): Record<string, unknown> {
@@ -102,11 +150,10 @@ export function resolveSkillFields(usageMetadata?: UsageMetadata): Record<string
 }
 
 export function buildMetadataFields(usageMetadata?: UsageMetadata): Record<string, unknown> {
-  const envJobFields = getJobFieldsFromEnv();
-  const jobContext = getJobContext();
-  const merged: UsageMetadata = { ...envJobFields, ...jobContext, ...usageMetadata };
+  const jobFields = resolveAgenticJobFields(usageMetadata);
+  const merged: UsageMetadata = { ...usageMetadata, ...jobFields };
 
-  if (!usageMetadata && !Object.keys(jobContext).length && !Object.keys(envJobFields).length) {
+  if (!usageMetadata && !Object.keys(jobFields).length) {
     return {};
   }
 

@@ -1,9 +1,10 @@
 import { shouldCapturePrompts, getMaxPromptSize } from "../_core/prompt/extraction.js";
-import { extractCacheTokenCounts } from "../_core/metering/cache-tokens.js";
+import { extractUsageTokens, mergeReportedUsage, resolveMeteredModel } from "./usage.js";
 import type {
   RequestContext,
   LiteLLMChatCompletionRequest,
   LiteLLMChatCompletionResponse,
+  TokenUsage,
 } from "./types.js";
 import { trackUsageAsync } from "./tracking.js";
 
@@ -14,11 +15,7 @@ export class StreamingResponseParser {
   private requestDuration: number;
   private startTime: number;
   private firstTokenTime: number | null = null;
-  private promptTokens: number = 0;
-  private completionTokens: number = 0;
-  private totalTokens: number = 0;
-  private cachedTokens?: number;
-  private cacheCreationTokens?: number;
+  private reportedUsage?: TokenUsage;
   private finishReason: string | null = null;
   private responseFormat?: any;
   private requestBody?: LiteLLMChatCompletionRequest;
@@ -28,6 +25,7 @@ export class StreamingResponseParser {
   private accumulatedToolCalls: Map<number, any> = new Map();
   private responseId?: string;
   private responseCreated?: number;
+  private responseModel?: string;
 
   constructor(
     requestId: string,
@@ -98,6 +96,7 @@ export class StreamingResponseParser {
 
     if (!this.responseId && chunk.id) this.responseId = chunk.id;
     if (!this.responseCreated && chunk.created) this.responseCreated = chunk.created;
+    if (!this.responseModel && chunk.model) this.responseModel = chunk.model;
 
     if (this.firstTokenTime === null && chunk.choices?.[0]?.delta?.content) {
       this.firstTokenTime = Date.now();
@@ -141,33 +140,22 @@ export class StreamingResponseParser {
     }
 
     if (chunk.usage) {
-      this.promptTokens = chunk.usage.prompt_tokens || 0;
-      this.completionTokens = chunk.usage.completion_tokens || 0;
-      this.totalTokens = chunk.usage.total_tokens || 0;
-
-      // Handles both the OpenAI-normalized shape (prompt_tokens_details.cached_tokens)
-      // and the Anthropic-native shape (cache_read_input_tokens/cache_creation_input_tokens),
-      // which LiteLLM may surface directly when it doesn't fully normalize Anthropic usage.
-      const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(chunk.usage);
-      // A later chunk that omits cache details shouldn't erase a value an earlier chunk reported.
-      if (cacheReadTokens !== undefined) {
-        this.cachedTokens = cacheReadTokens;
-      }
-      if (cacheCreationTokens !== undefined) {
-        this.cacheCreationTokens = cacheCreationTokens;
-      }
+      this.reportedUsage = mergeReportedUsage(this.reportedUsage, chunk.usage);
     }
 
     if (chunk.choices?.[0]?.finish_reason) this.finishReason = chunk.choices[0].finish_reason;
 
-    if (!this.totalTokens && chunk.x_groq?.usage) {
-      this.promptTokens = chunk.x_groq.usage.prompt_tokens || 0;
-      this.completionTokens = chunk.x_groq.usage.completion_tokens || 0;
-      this.totalTokens = chunk.x_groq.usage.total_tokens || 0;
+    if (!this.reportedUsage?.total_tokens && chunk.x_groq?.usage) {
+      this.reportedUsage = chunk.x_groq.usage;
     }
   }
 
   private finalizeTracking(): void {
+    const usage = extractUsageTokens(
+      this.reportedUsage,
+      resolveMeteredModel(this.model, this.responseModel),
+    );
+
     const timeToFirstToken = this.firstTokenTime
       ? this.firstTokenTime - this.startTime
       : this.requestDuration;
@@ -201,24 +189,17 @@ export class StreamingResponseParser {
           },
         ],
         usage: {
-          prompt_tokens: this.promptTokens,
-          completion_tokens: this.completionTokens,
-          total_tokens: this.totalTokens,
-          prompt_tokens_details:
-            this.cachedTokens === undefined ? undefined : { cached_tokens: this.cachedTokens },
-          cache_creation_input_tokens: this.cacheCreationTokens,
+          prompt_tokens: usage.promptTokens,
+          completion_tokens: usage.completionTokens,
+          total_tokens: usage.totalTokens,
         },
       };
     }
 
     trackUsageAsync({
+      ...usage,
       requestId: this.requestId,
       model: this.model,
-      promptTokens: this.promptTokens,
-      completionTokens: this.completionTokens,
-      totalTokens: this.totalTokens,
-      cachedTokens: this.cachedTokens,
-      cacheCreationTokens: this.cacheCreationTokens,
       duration: this.requestDuration,
       finishReason: this.finishReason || "stop",
       usageMetadata: this.requestContext.metadata,

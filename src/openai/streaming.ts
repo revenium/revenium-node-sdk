@@ -10,6 +10,9 @@ import {
 
 export type TrackUsageFn = (data: any) => void;
 
+const isPrimaryChoice = (choice: { index?: number | null }): boolean =>
+  choice.index === 0 || choice.index === undefined || choice.index === null;
+
 export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChunk> {
   private stream: AsyncIterable<OpenAI.ChatCompletionChunk>;
   private config: Config;
@@ -22,6 +25,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
   private usage: any = {};
   private messages: any[];
   private accumulatedContent: string = "";
+  private finishReason: string | null = null;
   private trackFn: TrackUsageFn;
 
   constructor(
@@ -71,17 +75,21 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
 
     try {
       for await (const chunk of this.stream) {
-        if (!this.firstTokenTime && chunk.choices[0]?.delta?.content) {
+        const primaryChoice = chunk.choices.find(isPrimaryChoice);
+        const deltaContent = primaryChoice?.delta?.content;
+
+        if (!this.firstTokenTime && deltaContent) {
           this.firstTokenTime = Date.now();
         }
 
-        if (chunk.choices[0]?.delta?.content && shouldCapturePrompts(this.metadata)) {
-          const maxSize = getMaxPromptSize();
-          const remaining = maxSize - this.accumulatedContent.length;
+        if (deltaContent && shouldCapturePrompts(this.metadata)) {
+          const remaining = getMaxPromptSize() - this.accumulatedContent.length;
           if (remaining > 0) {
-            this.accumulatedContent += chunk.choices[0].delta.content.slice(0, remaining);
+            this.accumulatedContent += deltaContent.slice(0, remaining);
           }
         }
+
+        if (primaryChoice?.finish_reason) this.finishReason = primaryChoice.finish_reason;
 
         if (chunk.usage) this.usage = chunk.usage;
         if (chunk.id) this.requestId = chunk.id;
@@ -94,7 +102,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
         ? this.firstTokenTime - this.startTime
         : undefined;
 
-      this.trackFn(this.buildTrackingPayload(null, timeToFirstToken));
+      this.trackFn(this.buildTrackingPayload(this.finishReason, timeToFirstToken));
     } catch (error) {
       completed = true;
       this.trackFn(this.buildTrackingPayload("error"));
@@ -104,7 +112,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
         const timeToFirstToken = this.firstTokenTime
           ? this.firstTokenTime - this.startTime
           : undefined;
-        this.trackFn(this.buildTrackingPayload("cancelled", timeToFirstToken));
+        this.trackFn(this.buildTrackingPayload(this.finishReason ?? "cancelled", timeToFirstToken));
       }
     }
   }

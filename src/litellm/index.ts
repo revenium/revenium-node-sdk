@@ -1,4 +1,9 @@
-import { getLogger } from "../_core/config/manager.js";
+import { clearConfig, getConfig, getLogger, setConfig } from "../_core/config/manager.js";
+import { loadConfigFromEnv as loadCoreConfigFromEnv } from "../_core/config/loader.js";
+import { validateConfig } from "../_core/config/validator.js";
+import { ENV_VARS } from "../_core/constants.js";
+import { getErrorMessage } from "../_core/resilience/error-handler.js";
+import type { Logger, ReveniumConfig } from "../_core/types/index.js";
 import {
   patchHttpClient,
   unpatchHttpClient,
@@ -10,97 +15,134 @@ import {
 import type { LiteLLMConfig, MiddlewareStatus } from "./types.js";
 
 let isInitialized = false;
+let sharedConfigBeforeInstall: ReveniumConfig | null = null;
+let installedSharedConfig: ReveniumConfig | null = null;
 
-function loadConfigFromEnv(): LiteLLMConfig | null {
-  const reveniumMeteringApiKey = process.env.REVENIUM_METERING_API_KEY;
-  const reveniumMeteringBaseUrl =
-    process.env.REVENIUM_METERING_BASE_URL || "https://api.revenium.ai";
-  const litellmProxyUrl = process.env.LITELLM_PROXY_URL;
-  const litellmApiKey = process.env.LITELLM_API_KEY;
-  const organizationName = process.env.REVENIUM_ORGANIZATION_NAME;
-  const apiTimeout = process.env.REVENIUM_API_TIMEOUT
-    ? parseInt(process.env.REVENIUM_API_TIMEOUT, 10)
-    : undefined;
-  const failSilent = process.env.REVENIUM_FAIL_SILENT !== "false";
-  const maxRetries = process.env.REVENIUM_MAX_RETRIES
-    ? parseInt(process.env.REVENIUM_MAX_RETRIES, 10)
-    : undefined;
+interface LoadedConfig {
+  litellm: LiteLLMConfig;
+  shared: ReveniumConfig;
+}
 
-  let printSummary: boolean | "human" | "json" | undefined;
-  const printSummaryEnv = process.env.REVENIUM_PRINT_SUMMARY;
-  if (printSummaryEnv) {
-    if (printSummaryEnv === "true") printSummary = true;
-    else if (printSummaryEnv === "false") printSummary = false;
-    else if (printSummaryEnv === "human" || printSummaryEnv === "json")
-      printSummary = printSummaryEnv;
+function readNonNegativeIntEnv(name: string, logger: Logger): number | undefined {
+  const rawValue = process.env[name]?.trim();
+  if (!rawValue) return undefined;
+
+  const parsed = Number(rawValue);
+  if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+
+  logger.warn(`Ignoring ${name}="${rawValue}" - expected a non-negative integer`);
+  return undefined;
+}
+
+function applyDefined(base: ReveniumConfig, overrides: Partial<ReveniumConfig>): ReveniumConfig {
+  const merged: ReveniumConfig = { ...base };
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) Reflect.set(merged, key, value);
   }
 
-  const teamId = process.env.REVENIUM_TEAM_ID;
-  const capturePrompts = process.env.REVENIUM_CAPTURE_PROMPTS?.toLowerCase() === "true";
+  return merged;
+}
 
-  if (!reveniumMeteringApiKey || !litellmProxyUrl) return null;
+function loadConfigFromEnv(): LoadedConfig | null {
+  const coreConfig = loadCoreConfigFromEnv();
+  const litellmProxyUrl = process.env[ENV_VARS.LITELLM_PROXY_URL];
+
+  if (!coreConfig || !litellmProxyUrl) return null;
+
+  const logger = getLogger();
+  const litellm: LiteLLMConfig = {
+    reveniumMeteringApiKey: coreConfig.reveniumApiKey,
+    reveniumMeteringBaseUrl: coreConfig.reveniumBaseUrl,
+    litellmProxyUrl,
+    litellmApiKey: process.env[ENV_VARS.LITELLM_API_KEY],
+    organizationName: process.env[ENV_VARS.ORGANIZATION_NAME],
+    apiTimeout: readNonNegativeIntEnv(ENV_VARS.API_TIMEOUT, logger),
+    failSilent: process.env[ENV_VARS.FAIL_SILENT] !== "false",
+    maxRetries: readNonNegativeIntEnv(ENV_VARS.MAX_RETRIES, logger),
+    printSummary: coreConfig.printSummary,
+    teamId: coreConfig.reveniumTeamId,
+    capturePrompts: coreConfig.capturePrompts,
+  };
 
   return {
-    reveniumMeteringApiKey,
-    reveniumMeteringBaseUrl,
-    litellmProxyUrl,
-    litellmApiKey,
-    organizationName,
-    apiTimeout,
-    failSilent,
-    maxRetries,
-    printSummary,
-    teamId,
-    capturePrompts,
+    litellm,
+    shared: applyDefined(toSharedConfig(litellm), {
+      reveniumEnforcementBaseUrl: coreConfig.reveniumEnforcementBaseUrl,
+    }),
   };
 }
 
-export function initialize(): boolean {
-  const logger = getLogger();
-  if (isInitialized) return true;
+function toSharedConfig(config: LiteLLMConfig): ReveniumConfig {
+  return applyDefined(getConfig() ?? ({} as ReveniumConfig), {
+    reveniumApiKey: config.reveniumMeteringApiKey,
+    reveniumBaseUrl: config.reveniumMeteringBaseUrl,
+    printSummary: config.printSummary,
+    reveniumTeamId: config.teamId,
+    capturePrompts: config.capturePrompts,
+    maxPromptSize: config.maxPromptSize,
+    failSilent: config.failSilent,
+    maxRetries: config.maxRetries,
+  });
+}
 
-  const config = loadConfigFromEnv();
-  if (!config) {
-    logger.warn(
-      "Revenium LiteLLM middleware not initialized - missing configuration. " +
-        "Required: REVENIUM_METERING_API_KEY, LITELLM_PROXY_URL",
-    );
+function install(litellm: LiteLLMConfig, shared: ReveniumConfig, logger: Logger): boolean {
+  try {
+    validateConfig(shared);
+  } catch (error) {
+    logger.error("Revenium LiteLLM middleware not initialized - invalid configuration", {
+      error: getErrorMessage(error),
+    });
     return false;
   }
 
-  setLiteLLMConfig(config);
-  const patchSuccess = patchHttpClient();
-
-  if (!patchSuccess) {
+  if (!patchHttpClient()) {
     logger.error("Failed to patch HTTP client - middleware disabled");
     return false;
   }
 
+  setLiteLLMConfig(litellm);
+  sharedConfigBeforeInstall = getConfig();
+  setConfig(shared);
+  installedSharedConfig = shared;
   isInitialized = true;
+  return true;
+}
+
+function restoreSharedConfig(): void {
+  if (!installedSharedConfig || getConfig() !== installedSharedConfig) return;
+
+  if (sharedConfigBeforeInstall) {
+    setConfig(sharedConfigBeforeInstall);
+  } else {
+    clearConfig();
+  }
+
+  installedSharedConfig = null;
+  sharedConfigBeforeInstall = null;
+}
+
+export function initialize(): boolean {
+  const logger = getLogger();
+  if (isInitialized && getConfig()) return true;
+
+  const loaded = loadConfigFromEnv();
+  if (!loaded) {
+    logger.warn(
+      "Revenium LiteLLM middleware not initialized - missing configuration. " +
+        "Required: REVENIUM_METERING_API_KEY (or REVENIUM_API_KEY) and LITELLM_PROXY_URL",
+    );
+    return false;
+  }
+
+  if (!install(loaded.litellm, loaded.shared, logger)) return false;
+
   logger.info("Revenium LiteLLM middleware initialized successfully");
   return true;
 }
 
 export function configure(config: LiteLLMConfig): boolean {
-  const logger = getLogger();
-  try {
-    setLiteLLMConfig(config);
-
-    if (!isHttpClientPatched()) {
-      const patchSuccess = patchHttpClient();
-      if (patchSuccess) {
-        isInitialized = true;
-      }
-      return patchSuccess;
-    }
-
-    return true;
-  } catch (error) {
-    logger.error("Failed to set Revenium LiteLLM configuration", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return false;
-  }
+  return install(config, toSharedConfig(config), getLogger());
 }
 
 export function isMiddlewareInitialized(): boolean {
@@ -139,6 +181,7 @@ export function disable(): boolean {
 export function reset(): void {
   isInitialized = false;
   resetHttpClientManager();
+  restoreSharedConfig();
 }
 
 export type {

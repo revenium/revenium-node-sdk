@@ -1,6 +1,8 @@
 import { getLogger } from "../config/manager.js";
 import { ENV_VARS } from "../constants.js";
 
+const TICKET_ID_MAX_LENGTH = 256;
+
 let cachedRegion: string | null = null;
 let regionCached = false;
 
@@ -103,21 +105,25 @@ export function getTraceName(): string | null {
   return traceName;
 }
 
-export function getTicketId(): string | null {
-  const logger = getLogger();
-  const ticketId = process.env[ENV_VARS.TICKET_ID];
+export function normalizeTicketId(ticketId?: string): string | undefined {
+  if (!ticketId) return undefined;
 
-  if (!ticketId) return null;
-
-  if (ticketId.length > 256) {
-    logger.warn("ticket_id exceeds max length of 256 characters. Truncating.", {
-      length: ticketId.length,
-      maxLength: 256,
-    });
-    return ticketId.substring(0, 256);
+  if (ticketId.length > TICKET_ID_MAX_LENGTH) {
+    getLogger().warn(
+      `ticket_id exceeds max length of ${TICKET_ID_MAX_LENGTH} characters. Truncating.`,
+      {
+        length: ticketId.length,
+        maxLength: TICKET_ID_MAX_LENGTH,
+      },
+    );
+    return ticketId.substring(0, TICKET_ID_MAX_LENGTH);
   }
 
   return ticketId;
+}
+
+export function getTicketId(): string | null {
+  return normalizeTicketId(process.env[ENV_VARS.TICKET_ID]) ?? null;
 }
 
 export function detectOperationSubtype(requestBody?: any): string | null {

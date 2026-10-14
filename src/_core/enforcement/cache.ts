@@ -4,6 +4,13 @@ export type BudgetWindow = "DAILY" | "WEEKLY" | "MONTHLY" | "QUARTERLY";
 // Field names mirror the server's CompiledEnforcementRule
 // (hypercurrent#3877 / #3950) and isotope's apps/web/src/types/budgetRule.ts
 // so the on-wire contract is identical across SDK + UI + backend.
+export interface EnforcementGroupEntry {
+  groupValue: string;
+  displayName?: string;
+  currentValue: number;
+  breached: boolean;
+}
+
 export interface EnforcementRule {
   ruleId: number;
   name?: string;
@@ -13,81 +20,86 @@ export interface EnforcementRule {
   action: EnforcementAction;
   breached: boolean;
   shadowMode: boolean;
-  // Optional criteria flattened from server-side `filters`. The current parse
-  // path does not populate these (no filter dimension extraction yet); the
-  // fields exist so evaluator criteria can match if a future parse does.
+  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
   subscriberId?: string;
+  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
   productName?: string;
+  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
   model?: string;
+  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
   provider?: string;
+  groupBy?: string;
+  departmentId?: number;
+  groupBreakdown?: EnforcementGroupEntry[];
 }
 
-const ruleCache = new Map<string, EnforcementRule[]>();
-let lastUpdated: number | null = null;
+export interface EnforcementSnapshot {
+  rules: EnforcementRule[];
+  departmentBlocks: Map<string, number>;
+  departmentBlockBalances: Map<string, number>;
+}
+
+export interface CachedEnforcementRule {
+  rule: EnforcementRule;
+  groupEntries: ReadonlyMap<string, EnforcementGroupEntry> | null;
+}
+
+export interface CachedEnforcementSnapshot {
+  rules: readonly CachedEnforcementRule[];
+  departmentBlocks: ReadonlyMap<string, number>;
+  departmentBlockBalances: ReadonlyMap<string, number>;
+}
+
+export function emptyEnforcementSnapshot(): EnforcementSnapshot {
+  return { rules: [], departmentBlocks: new Map(), departmentBlockBalances: new Map() };
+}
+
+const EMPTY_CACHE: CachedEnforcementSnapshot = {
+  rules: [],
+  departmentBlocks: new Map(),
+  departmentBlockBalances: new Map(),
+};
+
+let cachedSnapshot: CachedEnforcementSnapshot = EMPTY_CACHE;
+
+function outranks(candidate: EnforcementGroupEntry, incumbent: EnforcementGroupEntry): boolean {
+  if (candidate.breached !== incumbent.breached) return candidate.breached;
+  return candidate.currentValue > incumbent.currentValue;
+}
+
+// A grouped rule without a breakdown carries no per-group figures the SDK can
+// act on, so it resolves to an empty map and nobody is blocked: the server
+// only builds a breakdown for cost metrics, and its rule-level currentValue is
+// the whole scope's, which would refuse every caller.
+function foldGroupEntries(
+  rule: EnforcementRule,
+): ReadonlyMap<string, EnforcementGroupEntry> | null {
+  if (!rule.groupBy) return null;
+
+  const entries = new Map<string, EnforcementGroupEntry>();
+  for (const entry of rule.groupBreakdown ?? []) {
+    const incumbent = entries.get(entry.groupValue);
+    if (!incumbent || outranks(entry, incumbent)) entries.set(entry.groupValue, entry);
+  }
+  return entries;
+}
+
+export function getSnapshot(): CachedEnforcementSnapshot {
+  return cachedSnapshot;
+}
 
 export function getRules(): EnforcementRule[] {
-  const all: EnforcementRule[] = [];
-  for (const rules of ruleCache.values()) {
-    all.push(...rules);
-  }
-  return all;
+  return cachedSnapshot.rules.map((cached) => cached.rule);
 }
 
-export function setRules(rules: EnforcementRule[]): void {
-  ruleCache.clear();
-  for (const rule of rules) {
-    const key = buildKey(rule);
-    const existing = ruleCache.get(key) || [];
-    existing.push(rule);
-    ruleCache.set(key, existing);
-  }
-  lastUpdated = Date.now();
-}
-
-export function findMatchingRules(criteria: {
-  subscriberId?: string;
-  productName?: string;
-  model?: string;
-  provider?: string;
-}): EnforcementRule[] {
-  const matches: EnforcementRule[] = [];
-
-  for (const rules of ruleCache.values()) {
-    for (const rule of rules) {
-      if (ruleMatches(rule, criteria)) {
-        matches.push(rule);
-      }
-    }
-  }
-
-  return matches;
-}
-
-export function getLastUpdated(): number | null {
-  return lastUpdated;
+export function setRules(snapshot: EnforcementSnapshot): void {
+  cachedSnapshot = {
+    rules: snapshot.rules.map((rule) => ({ rule, groupEntries: foldGroupEntries(rule) })),
+    departmentBlocks: snapshot.departmentBlocks,
+    departmentBlockBalances: snapshot.departmentBlockBalances,
+  };
 }
 
 export function clearCache(): void {
-  ruleCache.clear();
-  lastUpdated = null;
-}
-
-function buildKey(rule: EnforcementRule): string {
-  return `${rule.ruleId}:${rule.subscriberId || "*"}:${rule.productName || "*"}`;
-}
-
-function ruleMatches(
-  rule: EnforcementRule,
-  criteria: {
-    subscriberId?: string;
-    productName?: string;
-    model?: string;
-    provider?: string;
-  },
-): boolean {
-  if (rule.subscriberId && rule.subscriberId !== criteria.subscriberId) return false;
-  if (rule.productName && rule.productName !== criteria.productName) return false;
-  if (rule.model && rule.model !== criteria.model) return false;
-  if (rule.provider && rule.provider !== criteria.provider) return false;
-  return true;
+  cachedSnapshot = EMPTY_CACHE;
 }

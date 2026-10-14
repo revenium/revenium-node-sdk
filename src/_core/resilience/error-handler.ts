@@ -90,6 +90,26 @@ export class CostLimitExceeded extends ReveniumError {
   }
 }
 
+export class EnforcementRequestRejectedError extends ReveniumError {
+  public readonly url: string;
+  public readonly status: number;
+  public readonly statusText: string;
+  public readonly retryAfterSeconds?: number;
+
+  constructor(url: string, status: number, statusText: string, retryAfterSeconds?: number) {
+    super(
+      `Enforcement rules endpoint rejected the request: ${status} ${statusText}`,
+      "ENFORCEMENT_REQUEST_REJECTED",
+      { url, status, statusText },
+    );
+    this.name = "EnforcementRequestRejectedError";
+    this.url = url;
+    this.status = status;
+    this.statusText = statusText;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;

@@ -4,6 +4,19 @@ import {
   isStopReasonSupported,
 } from "../../../src/_core/stop-reason-mapper";
 
+const BACKEND_STOP_REASONS = [
+  "END",
+  "END_SEQUENCE",
+  "TIMEOUT",
+  "TOKEN_LIMIT",
+  "COST_LIMIT",
+  "COMPLETION_LIMIT",
+  "CONTENT_FILTER",
+  "TOOL_CALL",
+  "ERROR",
+  "CANCELLED",
+];
+
 describe("mapStopReason", () => {
   it.each([
     ["stop", "END"],
@@ -17,7 +30,7 @@ describe("mapStopReason", () => {
     ["max_tokens", "TOKEN_LIMIT"],
     ["cost_limit", "COST_LIMIT"],
     ["completion_limit", "COMPLETION_LIMIT"],
-    ["content_filter", "ERROR"],
+    ["content_filter", "CONTENT_FILTER"],
     ["error", "ERROR"],
     ["cancelled", "CANCELLED"],
     ["canceled", "CANCELLED"],
@@ -26,6 +39,13 @@ describe("mapStopReason", () => {
     ["model_context_window_exceeded", "TOKEN_LIMIT"],
   ])("maps '%s' to '%s'", (input, expected) => {
     expect(mapStopReason(input)).toBe(expected);
+  });
+
+  it("only emits values the backend StopReason enum accepts", () => {
+    const emitted = getSupportedStopReasons().map((reason) => mapStopReason(reason));
+
+    expect(BACKEND_STOP_REASONS).toEqual(expect.arrayContaining(emitted));
+    expect(emitted).toContain("CONTENT_FILTER");
   });
 
   it("handles case-insensitive input", () => {

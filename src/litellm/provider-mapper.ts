@@ -1,5 +1,11 @@
 import type { ProviderPattern } from "./types.js";
 
+/**
+ * Owned by the cache de-fold decision, not by display classification: editing the registry
+ * for reporting must not change how cached tokens are priced.
+ */
+const ANTHROPIC_FAMILY_PATTERNS = ["claude", "anthropic"];
+
 export const PROVIDER_REGISTRY: ProviderPattern[] = [
   {
     source: "OPENAI",
@@ -10,7 +16,7 @@ export const PROVIDER_REGISTRY: ProviderPattern[] = [
   {
     source: "ANTHROPIC",
     displayName: "Anthropic",
-    patterns: ["claude", "anthropic"],
+    patterns: ANTHROPIC_FAMILY_PATTERNS,
     prefixes: ["anthropic"],
   },
   {
@@ -62,6 +68,16 @@ export const PROVIDER_REGISTRY: ProviderPattern[] = [
     prefixes: ["groq"],
   },
 ];
+
+/**
+ * Matches the Anthropic model family regardless of who hosts it: `vertex_ai/claude-*` and
+ * `bedrock/anthropic.claude-*` are served by Anthropic's own transformer even though their
+ * prefix resolves to another source.
+ */
+export function isAnthropicModelFamily(model: string): boolean {
+  const modelLower = model.toLowerCase();
+  return ANTHROPIC_FAMILY_PATTERNS.some((pattern) => modelLower.includes(pattern));
+}
 
 function extractProviderPrefix(model: string): string | null {
   const parts = model.split("/");

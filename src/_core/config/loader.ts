@@ -38,7 +38,9 @@ function loadEnvFiles(): void {
   envFilesLoaded = true;
 }
 
-export function loadConfigFromEnv(): ReveniumConfig | null {
+export type EnvReveniumConfig = ReveniumConfig & { reveniumBaseUrl: string };
+
+export function loadConfigFromEnv(): EnvReveniumConfig | null {
   loadEnvFiles();
 
   const reveniumApiKey =
@@ -56,7 +58,7 @@ export function loadConfigFromEnv(): ReveniumConfig | null {
 
   if (!reveniumApiKey) return null;
 
-  const config: ReveniumConfig = {
+  const config: EnvReveniumConfig = {
     reveniumApiKey,
     reveniumBaseUrl,
     printSummary,
