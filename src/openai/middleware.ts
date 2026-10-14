@@ -269,6 +269,7 @@ export class CompletionsInterface {
 
     enforcePreCallRules({
       subscriberId: metadata?.subscriber?.id,
+      subscriberEmail: metadata?.subscriber?.email,
       productName: metadata?.productName,
       model: params.model,
       provider: providerMeta.provider,
@@ -327,6 +328,7 @@ export class CompletionsInterface {
 
     enforcePreCallRules({
       subscriberId: metadata?.subscriber?.id,
+      subscriberEmail: metadata?.subscriber?.email,
       productName: metadata?.productName,
       model: params.model,
       provider: providerMeta.provider,

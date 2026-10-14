@@ -58,7 +58,11 @@ export function initializeConfig(): boolean {
   return false;
 }
 
-export function resetConfig(): void {
+export function clearConfig(): void {
   globalConfig = null;
+}
+
+export function resetConfig(): void {
+  clearConfig();
   globalLogger = defaultLogger;
 }

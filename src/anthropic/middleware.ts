@@ -2,7 +2,10 @@ import { UsageMetadata, ReveniumPayload } from "../_core/types/index.js";
 import { getConfig, getLogger } from "../_core/config/manager.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import { buildPayload } from "../_core/metering/payload-builder.js";
-import { extractCacheTokenCounts } from "../_core/metering/cache-tokens.js";
+import {
+  extractCacheTokenCounts,
+  extractCacheCreationSplit,
+} from "../_core/metering/cache-tokens.js";
 import { mapStopReason } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import {
@@ -148,19 +151,9 @@ function extractAnthropicPrompts(
   };
 }
 
-function extractCacheCreationSplit(usage: any): {
-  cacheCreation5mTokens?: number;
-  cacheCreation1hTokens?: number;
-} {
-  const split = usage?.cache_creation;
-  if (!split) return {};
-  return {
-    cacheCreation5mTokens: split.ephemeral_5m_input_tokens,
-    cacheCreation1hTokens: split.ephemeral_1h_input_tokens,
-  };
-}
-
-function extractReasoningTokens(usage: any): number | undefined {
+function extractAnthropicThinkingTokens(
+  usage: { output_tokens_details?: { thinking_tokens?: number } | null } | null | undefined,
+): number | undefined {
   return usage?.output_tokens_details?.thinking_tokens ?? undefined;
 }
 
@@ -182,7 +175,7 @@ export function extractUsageFromResponse(response: any): {
     cacheCreationTokens,
     cacheReadTokens,
     ...extractCacheCreationSplit(usage),
-    reasoningTokens: extractReasoningTokens(usage),
+    reasoningTokens: extractAnthropicThinkingTokens(usage),
     stopReason: response?.stop_reason,
   };
 }
@@ -236,7 +229,7 @@ export function extractUsageFromStream(chunks: any[]): {
       cacheCreation5mTokens = split.cacheCreation5mTokens;
       cacheCreation1hTokens = split.cacheCreation1hTokens;
     }
-    const chunkReasoningTokens = extractReasoningTokens(usage);
+    const chunkReasoningTokens = extractAnthropicThinkingTokens(usage);
     if (chunkReasoningTokens !== undefined) {
       reasoningTokens = chunkReasoningTokens;
     }

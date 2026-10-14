@@ -1,4 +1,5 @@
 import { CIRCUIT_BREAKER_CONFIG } from "../constants.js";
+import { EnforcementRequestRejectedError } from "./error-handler.js";
 
 export enum CircuitState {
   CLOSED = "CLOSED",
@@ -27,6 +28,11 @@ export const DEFAULT_CIRCUIT_CONFIG: CircuitBreakerConfig = {
 
 const defaultStrategy: FailureStrategy = {
   isRetryableError: () => true,
+  isProviderThrottling: () => false,
+};
+
+const enforcementFailureStrategy: FailureStrategy = {
+  isRetryableError: (error: unknown) => !(error instanceof EnforcementRequestRejectedError),
   isProviderThrottling: () => false,
 };
 
@@ -192,11 +198,10 @@ export function getMeteringCircuitBreaker(
 
 export function getEnforcementCircuitBreaker(
   config?: Partial<CircuitBreakerConfig>,
-  strategy?: FailureStrategy,
 ): CircuitBreaker {
   if (!enforcementCircuitBreaker) {
     const finalConfig = config ? { ...DEFAULT_CIRCUIT_CONFIG, ...config } : DEFAULT_CIRCUIT_CONFIG;
-    enforcementCircuitBreaker = new CircuitBreaker(finalConfig, strategy);
+    enforcementCircuitBreaker = new CircuitBreaker(finalConfig, enforcementFailureStrategy);
   }
   return enforcementCircuitBreaker;
 }

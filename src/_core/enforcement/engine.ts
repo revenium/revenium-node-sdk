@@ -1,14 +1,43 @@
+import { stripReveniumServicePrefix } from "../base-url.js";
 import { getConfig, getLogger } from "../config/manager.js";
-import { DEFAULT_REVENIUM_BASE_URL, DEFAULT_CONFIG, ENFORCEMENT_CONFIG } from "../constants.js";
+import {
+  DEFAULT_REVENIUM_BASE_URL,
+  DEFAULT_CONFIG,
+  ENFORCEMENT_CONFIG,
+  API_ENDPOINTS,
+  ENV_VARS,
+  RETRY_CONFIG,
+  RETRYABLE_STATUSES,
+} from "../constants.js";
 import { executeWithEnforcementCircuitBreaker } from "../resilience/circuit-breaker.js";
-import { EnforcementRule, setRules, clearCache } from "./cache.js";
+import { EnforcementRequestRejectedError } from "../resilience/error-handler.js";
+import { parseRetryAfter } from "../resilience/retry.js";
+import {
+  EnforcementGroupEntry,
+  EnforcementRule,
+  EnforcementSnapshot,
+  emptyEnforcementSnapshot,
+  setRules,
+  clearCache,
+  getRules,
+} from "./cache.js";
+import { normalizeIdentityKey } from "./identity.js";
+
+const TOO_MANY_REQUESTS = 429;
 
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let polling = false;
 let warnedMissingTeamId = false;
+let backoffDelayMs: number | null = null;
+
+function isRequestRejection(status: number): boolean {
+  if (status < 400 || status >= 500) return false;
+  return status === TOO_MANY_REQUESTS || !RETRYABLE_STATUSES.has(status);
+}
 
 export function buildEnforcementRulesUrl(baseUrl: string, reveniumTeamId: string): string {
-  const normalizedBase = baseUrl.replace(/\/+$/, "");
-  return `${normalizedBase}/v2/api/ai/enforcement-rules/${encodeURIComponent(reveniumTeamId)}`;
+  const host = stripReveniumServicePrefix(baseUrl);
+  return `${host}${API_ENDPOINTS.ENFORCEMENT_RULES}/${encodeURIComponent(reveniumTeamId)}`;
 }
 
 const ACTIONS: ReadonlySet<string> = new Set(["BLOCK", "THROTTLE", "WARN_ONLY"]);
@@ -25,12 +54,59 @@ function toNumber(v: unknown): number | null {
   return null;
 }
 
-export function parseEnforcementRulesResponse(data: unknown): EnforcementRule[] {
+function parseGroupBreakdown(value: unknown): EnforcementGroupEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const entries: EnforcementGroupEntry[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const s = item as Record<string, unknown>;
+    const currentValue = toNumber(s.currentValue);
+
+    if (
+      typeof s.groupValue !== "string" ||
+      currentValue === null ||
+      typeof s.breached !== "boolean"
+    )
+      continue;
+
+    entries.push({
+      groupValue: s.groupValue,
+      displayName: typeof s.displayName === "string" ? s.displayName : undefined,
+      currentValue,
+      breached: s.breached,
+    });
+  }
+  return entries;
+}
+
+function parseNormalizedNumberMap(
+  source: Record<string, unknown>,
+  name: string,
+  accepts: (value: number) => boolean,
+): Map<string, number> {
+  const map = new Map<string, number>();
+  const raw = source[name];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return map;
+
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const parsed = toNumber(value);
+    if (parsed === null || !accepts(parsed)) continue;
+    map.set(normalizeIdentityKey(key), parsed);
+  }
+  return map;
+}
+
+export function parseEnforcementRulesResponse(data: unknown): EnforcementSnapshot {
   // Server shape is `{ rules: [...] }`; accept a bare array too for forward compatibility.
+  const envelope: Record<string, unknown> =
+    !Array.isArray(data) && data && typeof data === "object"
+      ? (data as Record<string, unknown>)
+      : {};
   const raw: unknown[] = Array.isArray(data)
     ? data
-    : Array.isArray((data as { rules?: unknown[] } | null)?.rules)
-      ? (data as { rules: unknown[] }).rules
+    : Array.isArray(envelope.rules)
+      ? envelope.rules
       : [];
 
   const parsed: EnforcementRule[] = [];
@@ -67,27 +143,44 @@ export function parseEnforcementRulesResponse(data: unknown): EnforcementRule[] 
       action: action as EnforcementRule["action"],
       breached,
       shadowMode: typeof s.shadowMode === "boolean" ? s.shadowMode : false,
+      groupBy: typeof s.groupBy === "string" ? s.groupBy : undefined,
+      departmentId: typeof s.departmentId === "number" ? s.departmentId : undefined,
+      groupBreakdown: parseGroupBreakdown(s.groupBreakdown),
     });
   }
-  return parsed;
+
+  return {
+    rules: parsed,
+    departmentBlocks: parseNormalizedNumberMap(
+      envelope,
+      "departmentBudgetBlocks",
+      Number.isInteger,
+    ),
+    departmentBlockBalances: parseNormalizedNumberMap(
+      envelope,
+      "departmentBudgetBlockBalances",
+      Number.isFinite,
+    ),
+  };
 }
 
 export function startEnforcementPolling(): void {
   const logger = getLogger();
 
-  if (pollTimer) {
+  if (polling) {
     logger.debug("Enforcement polling already running");
     return;
   }
 
-  // Fetch immediately, then schedule next poll
-  fetchRules().catch((error) => {
-    logger.warn("Initial enforcement rules fetch failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  });
+  polling = true;
 
-  scheduleNextPoll();
+  fetchRules()
+    .catch(reportFetchFailure)
+    .finally(() => {
+      if (polling) {
+        scheduleNextPoll();
+      }
+    });
 
   logger.debug("Enforcement polling started", {
     intervalMs: ENFORCEMENT_CONFIG.POLL_INTERVAL,
@@ -95,33 +188,34 @@ export function startEnforcementPolling(): void {
 }
 
 export function stopEnforcementPolling(): void {
+  if (!polling) return;
+
+  polling = false;
   if (pollTimer) {
     clearTimeout(pollTimer);
     pollTimer = null;
-    clearCache();
-    warnedMissingTeamId = false;
-    getLogger().debug("Enforcement polling stopped");
   }
+  clearCache();
+  warnedMissingTeamId = false;
+  backoffDelayMs = null;
+  getLogger().debug("Enforcement polling stopped");
 }
 
 export function isPolling(): boolean {
-  return pollTimer !== null;
+  return polling;
 }
 
 function scheduleNextPoll(): void {
   // Add +-20% jitter to avoid thundering herd
   const jitter = ENFORCEMENT_CONFIG.POLL_INTERVAL * 0.2 * (Math.random() * 2 - 1);
-  const delay = ENFORCEMENT_CONFIG.POLL_INTERVAL + jitter;
+  const delay = backoffDelayMs ?? ENFORCEMENT_CONFIG.POLL_INTERVAL + jitter;
+  backoffDelayMs = null;
 
   pollTimer = setTimeout(() => {
     fetchRules()
-      .catch((error) => {
-        getLogger().warn("Enforcement rules poll failed", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      })
+      .catch(reportFetchFailure)
       .finally(() => {
-        if (pollTimer !== null) {
+        if (polling) {
           scheduleNextPoll();
         }
       });
@@ -131,6 +225,47 @@ function scheduleNextPoll(): void {
   if (pollTimer && typeof pollTimer === "object" && "unref" in pollTimer) {
     pollTimer.unref();
   }
+}
+
+function reportFetchFailure(error: unknown): void {
+  getLogger().warn("Enforcement rules fetch failed", {
+    error: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function describeCacheImpact(): string {
+  return getRules().length > 0
+    ? "the cost controls loaded by an earlier poll remain in use"
+    : "cost controls are not loaded and provider calls pass through";
+}
+
+function reportRejectedRequest(error: EnforcementRequestRejectedError): void {
+  const context = {
+    url: error.url,
+    status: error.status,
+    statusText: error.statusText,
+  };
+
+  if (error.status === TOO_MANY_REQUESTS) {
+    getLogger().warn(
+      `Enforcement rules endpoint is rate limiting the SDK; ${describeCacheImpact()}. Polling backs off until the limit clears.`,
+      context,
+    );
+    return;
+  }
+
+  getLogger().warn(
+    `Enforcement rules endpoint rejected the request; ${describeCacheImpact()}. Set ${ENV_VARS.ENFORCEMENT_BASE_URL} to the Revenium host serving the enforcement API, and verify ${ENV_VARS.TEAM_ID} and ${ENV_VARS.REVENIUM_API_KEY}.`,
+    context,
+  );
+}
+
+function applyBackoff(retryAfterSeconds: number | undefined): void {
+  const cappedSeconds = Math.min(
+    retryAfterSeconds ?? RETRY_CONFIG.MAX_RETRY_AFTER_SECONDS,
+    RETRY_CONFIG.MAX_RETRY_AFTER_SECONDS,
+  );
+  backoffDelayMs = Math.max(cappedSeconds * 1000, ENFORCEMENT_CONFIG.POLL_INTERVAL);
 }
 
 async function fetchRules(): Promise<void> {
@@ -158,6 +293,7 @@ async function fetchRules(): Promise<void> {
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DEFAULT_CONFIG.API_TIMEOUT);
+  backoffDelayMs = null;
 
   try {
     await executeWithEnforcementCircuitBreaker(async () => {
@@ -171,9 +307,18 @@ async function fetchRules(): Promise<void> {
       });
 
       if (response.status === 204) {
-        setRules([]);
+        setRules(emptyEnforcementSnapshot());
         logger.debug("Enforcement rules: no rules configured (204)");
         return;
+      }
+
+      if (isRequestRejection(response.status)) {
+        throw new EnforcementRequestRejectedError(
+          url,
+          response.status,
+          response.statusText,
+          parseRetryAfter(response.headers.get("Retry-After")),
+        );
       }
 
       if (!response.ok) {
@@ -181,10 +326,17 @@ async function fetchRules(): Promise<void> {
       }
 
       const data: unknown = await response.json();
-      const rules = parseEnforcementRulesResponse(data);
-      setRules(rules);
-      logger.debug("Enforcement rules updated", { ruleCount: rules.length });
+      const snapshot = parseEnforcementRulesResponse(data);
+      setRules(snapshot);
+      logger.debug("Enforcement rules updated", { ruleCount: snapshot.rules.length });
     });
+  } catch (error) {
+    if (!(error instanceof EnforcementRequestRejectedError)) throw error;
+
+    if (error.status === TOO_MANY_REQUESTS) {
+      applyBackoff(error.retryAfterSeconds);
+    }
+    reportRejectedRequest(error);
   } finally {
     clearTimeout(timeout);
   }

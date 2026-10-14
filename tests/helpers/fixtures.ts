@@ -1,4 +1,14 @@
 import { ReveniumConfig, ReveniumPayload, OperationType } from "../../src/_core/types/index";
+import { LiteLLMConfig } from "../../src/litellm/types";
+
+export function createLiteLLMConfig(overrides: Partial<LiteLLMConfig> = {}): LiteLLMConfig {
+  return {
+    reveniumMeteringApiKey: "hak_test_key",
+    reveniumMeteringBaseUrl: "https://api.revenium.ai",
+    litellmProxyUrl: "http://localhost:4000",
+    ...overrides,
+  };
+}
 
 export function createReveniumConfig(overrides: Partial<ReveniumConfig> = {}): ReveniumConfig {
   return {
@@ -34,19 +44,24 @@ export function createPayload(overrides: Partial<ReveniumPayload> = {}): Reveniu
 }
 
 export function createMockFetch(
-  response: Partial<Response> & { headers?: Record<string, string> } = {},
+  response: Omit<Partial<Response>, "headers"> & {
+    headers?: Record<string, string>;
+    jsonBody?: unknown;
+  } = {},
 ): jest.Mock {
-  const { headers: headerOverrides, ...rest } = response;
+  const { headers: headerOverrides, jsonBody, ...rest } = response;
   const headerMap = new Map(Object.entries(headerOverrides ?? {}));
-  return jest.fn(() =>
-    Promise.resolve({
+  return jest.fn(() => {
+    const mockResponse = {
       ok: true,
       status: 200,
       statusText: "OK",
-      json: () => Promise.resolve({}),
-      text: () => Promise.resolve(""),
+      json: () => Promise.resolve(jsonBody ?? {}),
+      text: () => Promise.resolve(jsonBody === undefined ? "" : JSON.stringify(jsonBody)),
       headers: { get: (name: string) => headerMap.get(name) ?? null },
+      clone: () => mockResponse,
       ...rest,
-    } as unknown as Response),
-  );
+    } as unknown as Response;
+    return Promise.resolve(mockResponse);
+  });
 }

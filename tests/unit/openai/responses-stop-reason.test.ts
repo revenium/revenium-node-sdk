@@ -151,7 +151,7 @@ describe("ResponsesInterface stop reason metering", () => {
     ["completed", undefined, "END"],
     ["incomplete", "max_output_tokens", "TOKEN_LIMIT"],
     ["incomplete", "max_messages", "COMPLETION_LIMIT"],
-    ["incomplete", "content_filter", "ERROR"],
+    ["incomplete", "content_filter", "CONTENT_FILTER"],
     ["failed", undefined, "ERROR"],
   ];
 

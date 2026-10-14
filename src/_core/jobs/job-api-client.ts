@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { stripReveniumServicePrefix } from "../base-url.js";
 import { getConfig, getLogger } from "../config/manager.js";
 import { DEFAULT_REVENIUM_BASE_URL, API_ENDPOINTS, ENV_VARS } from "../constants.js";
 import { withRetry, HttpError, parseRetryAfter } from "../resilience/retry.js";
@@ -40,9 +41,7 @@ function buildJobRequest(
     );
   }
 
-  const baseUrl = (config.reveniumBaseUrl || DEFAULT_REVENIUM_BASE_URL)
-    .replace(/\/+$/, "")
-    .replace(/\/meter(\/v2)?$/, "");
+  const baseUrl = stripReveniumServicePrefix(config.reveniumBaseUrl || DEFAULT_REVENIUM_BASE_URL);
   const separator = path.includes("?") ? "&" : "?";
   const url = `${baseUrl}${API_ENDPOINTS.JOBS}${path}${separator}teamId=${encodeURIComponent(resolvedTeamId)}`;
 

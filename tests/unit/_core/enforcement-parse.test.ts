@@ -27,7 +27,7 @@ describe("parseEnforcementRulesResponse", () => {
         },
       ],
     };
-    const rules = parseEnforcementRulesResponse(payload);
+    const { rules } = parseEnforcementRulesResponse(payload);
     expect(rules).toHaveLength(1);
     expect(rules[0]).toMatchObject({
       ruleId: 202,
@@ -43,7 +43,7 @@ describe("parseEnforcementRulesResponse", () => {
 
   it("coerces string-BigDecimal threshold/currentValue to number", () => {
     // Jackson `WRITE_BIGDECIMAL_AS_PLAIN` can emit numeric fields as strings.
-    const rules = parseEnforcementRulesResponse({
+    const { rules } = parseEnforcementRulesResponse({
       rules: [
         {
           ruleId: 1,
@@ -61,7 +61,7 @@ describe("parseEnforcementRulesResponse", () => {
   });
 
   it("accepts WARN_ONLY and THROTTLE actions", () => {
-    const rules = parseEnforcementRulesResponse({
+    const { rules } = parseEnforcementRulesResponse({
       rules: [
         {
           ruleId: 1,
@@ -87,7 +87,7 @@ describe("parseEnforcementRulesResponse", () => {
   });
 
   it("drops rules with out-of-enum action or period", () => {
-    const rules = parseEnforcementRulesResponse({
+    const { rules } = parseEnforcementRulesResponse({
       rules: [
         {
           ruleId: 1,
@@ -111,7 +111,7 @@ describe("parseEnforcementRulesResponse", () => {
   });
 
   it("defaults missing shadowMode to false", () => {
-    const rules = parseEnforcementRulesResponse({
+    const { rules } = parseEnforcementRulesResponse({
       rules: [
         {
           ruleId: 1,
@@ -127,7 +127,7 @@ describe("parseEnforcementRulesResponse", () => {
   });
 
   it("accepts a bare array as a forward-compat shape", () => {
-    const rules = parseEnforcementRulesResponse([
+    const { rules } = parseEnforcementRulesResponse([
       {
         ruleId: 7,
         threshold: 2,
@@ -144,14 +144,14 @@ describe("parseEnforcementRulesResponse", () => {
   });
 
   it("returns [] for unknown shapes without throwing", () => {
-    expect(parseEnforcementRulesResponse(null)).toEqual([]);
-    expect(parseEnforcementRulesResponse({})).toEqual([]);
-    expect(parseEnforcementRulesResponse({ rules: "nope" })).toEqual([]);
-    expect(parseEnforcementRulesResponse("string")).toEqual([]);
+    expect(parseEnforcementRulesResponse(null).rules).toEqual([]);
+    expect(parseEnforcementRulesResponse({}).rules).toEqual([]);
+    expect(parseEnforcementRulesResponse({ rules: "nope" }).rules).toEqual([]);
+    expect(parseEnforcementRulesResponse("string").rules).toEqual([]);
   });
 
   it("drops malformed items without failing the whole batch", () => {
-    const rules = parseEnforcementRulesResponse({
+    const { rules } = parseEnforcementRulesResponse({
       rules: [
         null,
         "bad",
@@ -168,5 +168,91 @@ describe("parseEnforcementRulesResponse", () => {
     });
     expect(rules).toHaveLength(1);
     expect(rules[0].ruleId).toBe(1);
+  });
+
+  it("keeps groupBy, departmentId and groupBreakdown", () => {
+    const { rules } = parseEnforcementRulesResponse({
+      rules: [
+        {
+          ruleId: 301,
+          threshold: 5,
+          currentValue: 7.5,
+          periodType: "DAILY",
+          action: "BLOCK",
+          breached: true,
+          groupBy: "SUBSCRIBER",
+          departmentId: 173,
+          groupBreakdown: [
+            {
+              groupValue: "alice@example.com",
+              displayName: "Alice",
+              currentValue: "7.5",
+              usagePercent: 150,
+              breached: true,
+            },
+          ],
+        },
+      ],
+    });
+    expect(rules[0].groupBy).toBe("SUBSCRIBER");
+    expect(rules[0].departmentId).toBe(173);
+    expect(rules[0].groupBreakdown).toEqual([
+      {
+        groupValue: "alice@example.com",
+        displayName: "Alice",
+        currentValue: 7.5,
+        breached: true,
+      },
+    ]);
+  });
+
+  it("drops a malformed breakdown entry without dropping its rule", () => {
+    const { rules } = parseEnforcementRulesResponse({
+      rules: [
+        {
+          ruleId: 1,
+          threshold: 1,
+          currentValue: 0,
+          periodType: "DAILY",
+          action: "BLOCK",
+          breached: false,
+          groupBreakdown: [
+            null,
+            { groupValue: 42, currentValue: 1, breached: true },
+            { groupValue: "bob@example.com", currentValue: "nope", breached: true },
+            { groupValue: "bob@example.com", currentValue: 1, breached: true },
+          ],
+        },
+      ],
+    });
+    expect(rules).toHaveLength(1);
+    expect(rules[0].groupBreakdown).toHaveLength(1);
+    expect(rules[0].groupBreakdown?.[0].groupValue).toBe("bob@example.com");
+  });
+
+  it("normalizes department map keys at ingestion", () => {
+    const snapshot = parseEnforcementRulesResponse({
+      rules: [],
+      departmentBudgetBlocks: { "  BOB@Example.com ": 301 },
+      departmentBudgetBlockBalances: { "  BOB@Example.com ": "6.25" },
+    });
+    expect(snapshot.departmentBlocks.get("bob@example.com")).toBe(301);
+    expect(snapshot.departmentBlockBalances.get("bob@example.com")).toBe(6.25);
+  });
+
+  it("rejects non-numeric and non-integer department map values", () => {
+    const snapshot = parseEnforcementRulesResponse({
+      rules: [],
+      departmentBudgetBlocks: { "a@example.com": 1.5, "b@example.com": true },
+      departmentBudgetBlockBalances: { "a@example.com": Number.NaN, "b@example.com": false },
+    });
+    expect(snapshot.departmentBlocks.size).toBe(0);
+    expect(snapshot.departmentBlockBalances.size).toBe(0);
+  });
+
+  it("yields empty department maps for a bare array payload", () => {
+    const snapshot = parseEnforcementRulesResponse([]);
+    expect(snapshot.departmentBlocks.size).toBe(0);
+    expect(snapshot.departmentBlockBalances.size).toBe(0);
   });
 });

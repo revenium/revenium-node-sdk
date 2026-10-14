@@ -7,7 +7,7 @@ const STOP_REASON_MAP: Record<string, string> = {
   max_tokens: "TOKEN_LIMIT",
   cost_limit: "COST_LIMIT",
   completion_limit: "COMPLETION_LIMIT",
-  content_filter: "ERROR",
+  content_filter: "CONTENT_FILTER",
   error: "ERROR",
   cancelled: "CANCELLED",
   canceled: "CANCELLED",

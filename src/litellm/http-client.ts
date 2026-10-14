@@ -105,19 +105,14 @@ async function handleNonStreamingResponse(
   const logger = getLogger();
   try {
     const responseData = (await response.json()) as LiteLLMChatCompletionResponse;
-    const usage = extractUsageFromResponse(responseData);
+    const usage = extractUsageFromResponse(responseData, model);
     const requestBody = extractRequestBody(requestContext);
 
     trackUsageAsync({
+      ...usage,
       requestId,
       model,
-      promptTokens: usage.promptTokens,
-      completionTokens: usage.completionTokens,
-      totalTokens: usage.totalTokens,
-      cachedTokens: usage.cachedTokens,
-      cacheCreationTokens: usage.cacheCreationTokens,
       duration,
-      finishReason: usage.finishReason,
       usageMetadata: requestContext.metadata,
       isStreamed: false,
       responseFormat,

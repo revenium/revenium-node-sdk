@@ -1,5 +1,7 @@
-import { getLogger } from "../_core/config/manager.js";
+import { getConfig, getLogger } from "../_core/config/manager.js";
+import { DEFAULT_CONFIG } from "../_core/constants.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
+import { getErrorMessage } from "../_core/resilience/error-handler.js";
 import { mapStopReason } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import { extractPrompts } from "../_core/prompt/extraction.js";
@@ -14,11 +16,12 @@ import {
   getRetryNumber,
   detectOperationSubtype,
   getTicketId,
+  normalizeTicketId,
 } from "../_core/metadata/trace-fields.js";
-import { resolveSkillFields } from "../_core/metadata/metadata-builder.js";
+import { resolveSkillFields, resolveAgenticJobFields } from "../_core/metadata/metadata-builder.js";
 import { extractModelSource, extractProvider, extractModelName } from "./provider-mapper.js";
-import { extractCacheTokenCounts } from "../_core/metering/cache-tokens.js";
-import type { ReveniumPayload } from "../_core/types/index.js";
+import { extractUsageTokens, resolveMeteredModel, type ExtractedUsageTokens } from "./usage.js";
+import type { ReveniumPayload, Subscriber } from "../_core/types/index.js";
 import type {
   LiteLLMUsageMetadata,
   LiteLLMChatCompletionRequest,
@@ -28,44 +31,37 @@ import { getLiteLLMConfig } from "./http-client.js";
 
 const MIDDLEWARE_SOURCE = "revenium-litellm-node";
 
-function buildSubscriber(metadata?: LiteLLMUsageMetadata) {
-  if (
-    metadata?.subscriberId &&
-    metadata?.subscriberEmail &&
-    metadata?.subscriberCredentialName &&
-    metadata?.subscriberCredential
-  ) {
-    return {
-      id: metadata.subscriberId,
-      email: metadata.subscriberEmail,
-      credential: {
-        name: metadata.subscriberCredentialName,
-        value: metadata.subscriberCredential,
-      },
-    };
+function buildSubscriber(metadata?: LiteLLMUsageMetadata): Subscriber | undefined {
+  if (!metadata) return undefined;
+
+  const { subscriberId, subscriberEmail, subscriberCredentialName, subscriberCredential } =
+    metadata;
+
+  const subscriber: Subscriber = { ...metadata.subscriber };
+  if (subscriberId) subscriber.id = subscriberId;
+  if (subscriberEmail) subscriber.email = subscriberEmail;
+  if (subscriberCredentialName && subscriberCredential) {
+    subscriber.credential = { name: subscriberCredentialName, value: subscriberCredential };
   }
-  return undefined;
+
+  return Object.keys(subscriber).length ? subscriber : undefined;
 }
 
-export async function sendReveniumMetrics(data: {
-  requestId: string;
-  model: string;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  reasoningTokens?: number;
-  cachedTokens?: number;
-  cacheCreationTokens?: number;
-  duration: number;
-  finishReason: string | null;
-  usageMetadata?: LiteLLMUsageMetadata;
-  isStreamed?: boolean;
-  timeToFirstToken?: number;
-  operationType?: "CHAT" | "EMBED";
-  responseFormat?: any;
-  request?: LiteLLMChatCompletionRequest;
-  response?: LiteLLMChatCompletionResponse;
-}): Promise<void> {
+export async function sendReveniumMetrics(
+  data: ExtractedUsageTokens & {
+    requestId: string;
+    model: string;
+    duration: number;
+    finishReason: string | null;
+    usageMetadata?: LiteLLMUsageMetadata;
+    isStreamed?: boolean;
+    timeToFirstToken?: number;
+    operationType?: "CHAT" | "EMBED";
+    responseFormat?: any;
+    request?: LiteLLMChatCompletionRequest;
+    response?: LiteLLMChatCompletionResponse;
+  },
+): Promise<void> {
   const logger = getLogger();
   const litellmConfig = getLiteLLMConfig();
 
@@ -116,8 +112,10 @@ export async function sendReveniumMetrics(data: {
     operationType,
     inputTokenCount: data.promptTokens,
     outputTokenCount: isEmbedding ? 0 : data.completionTokens,
-    reasoningTokenCount: data.reasoningTokens || 0,
+    reasoningTokenCount: data.reasoningTokens,
     cacheCreationTokenCount: data.cacheCreationTokens,
+    cacheCreation5mTokenCount: data.cacheCreation5mTokens,
+    cacheCreation1hTokenCount: data.cacheCreation1hTokens,
     cacheReadTokenCount: data.cachedTokens,
     totalTokenCount: data.totalTokens,
     model: extractModelName(data.model),
@@ -156,10 +154,7 @@ export async function sendReveniumMetrics(data: {
     credentialAlias: data.usageMetadata?.credentialAlias || getCredentialAlias() || undefined,
     traceType: data.usageMetadata?.traceType || getTraceType() || undefined,
     traceName: data.usageMetadata?.traceName || getTraceName() || undefined,
-    agenticJobId: data.usageMetadata?.agenticJobId,
-    agenticJobName: data.usageMetadata?.agenticJobName,
-    agenticJobType: data.usageMetadata?.agenticJobType,
-    agenticJobVersion: data.usageMetadata?.agenticJobVersion,
+    ...resolveAgenticJobFields(data.usageMetadata),
     ticketId: data.usageMetadata?.ticketId || getTicketId() || undefined,
     ...resolveSkillFields(data.usageMetadata),
     attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
@@ -171,14 +166,9 @@ export async function sendReveniumMetrics(data: {
 
   try {
     await sendToRevenium(payload);
-  } catch (error) {
-    logger.warn("Revenium tracking failed", {
-      error: error instanceof Error ? error.message : String(error),
-      requestId: data.requestId,
-    });
+  } finally {
+    printUsageSummary(payload);
   }
-
-  printUsageSummary(payload);
 }
 
 export function trackUsageAsync(trackingData: Parameters<typeof sendReveniumMetrics>[0]): void {
@@ -191,10 +181,17 @@ export function trackUsageAsync(trackingData: Parameters<typeof sendReveniumMetr
       });
     })
     .catch((error) => {
-      logger.warn("Revenium tracking failed completely", {
-        error: error instanceof Error ? error.message : String(error),
+      const details = {
+        error: getErrorMessage(error),
         requestId: trackingData.requestId,
-      });
+      };
+
+      if (getConfig()?.failSilent ?? DEFAULT_CONFIG.FAIL_SILENT) {
+        logger.warn("Revenium tracking failed", details);
+        return;
+      }
+
+      logger.error("Revenium tracking failed", details);
     });
 }
 
@@ -216,6 +213,13 @@ export function trackEmbeddingsUsageAsync(data: {
   });
 }
 
+function parseRetryNumber(value?: string): number | undefined {
+  if (!value) return undefined;
+
+  const retryNumber = Number.parseInt(value, 10);
+  return Number.isInteger(retryNumber) ? retryNumber : undefined;
+}
+
 export function extractMetadataFromHeaders(headers: Record<string, string>): LiteLLMUsageMetadata {
   return {
     subscriberId: headers["x-revenium-subscriber-id"],
@@ -231,15 +235,18 @@ export function extractMetadataFromHeaders(headers: Record<string, string>): Lit
     subscriberCredential: headers["x-revenium-subscriber-credential"],
     environment: headers["x-revenium-environment"],
     operationSubtype: headers["x-revenium-operation-subtype"],
-    retryNumber: headers["x-revenium-retry-number"]
-      ? parseInt(headers["x-revenium-retry-number"], 10)
-      : undefined,
+    retryNumber: parseRetryNumber(headers["x-revenium-retry-number"]),
     parentTransactionId: headers["x-revenium-parent-transaction-id"],
     transactionName: headers["x-revenium-transaction-name"],
     region: headers["x-revenium-region"],
     credentialAlias: headers["x-revenium-credential-alias"],
     traceType: headers["x-revenium-trace-type"],
     traceName: headers["x-revenium-trace-name"],
+    ticketId: normalizeTicketId(headers["x-revenium-ticket-id"]),
+    agenticJobId: headers["x-revenium-agentic-job-id"],
+    agenticJobName: headers["x-revenium-agentic-job-name"],
+    agenticJobType: headers["x-revenium-agentic-job-type"],
+    agenticJobVersion: headers["x-revenium-agentic-job-version"],
     skillName: headers["x-revenium-skill-name"],
     skillSource: headers["x-revenium-skill-source"],
     skillKind: headers["x-revenium-skill-kind"],
@@ -252,22 +259,12 @@ export function extractMetadataFromHeaders(headers: Record<string, string>): Lit
   };
 }
 
-export function extractUsageFromResponse(response: LiteLLMChatCompletionResponse): {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  cachedTokens?: number;
-  cacheCreationTokens?: number;
-  finishReason: string | null;
-} {
-  const usage = response.usage;
-  const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(usage);
+export function extractUsageFromResponse(
+  response: LiteLLMChatCompletionResponse,
+  model: string,
+): ExtractedUsageTokens & { finishReason: string | null } {
   return {
-    promptTokens: usage?.prompt_tokens || 0,
-    completionTokens: usage?.completion_tokens || 0,
-    totalTokens: usage?.total_tokens || 0,
-    cachedTokens: cacheReadTokens,
-    cacheCreationTokens,
+    ...extractUsageTokens(response.usage, resolveMeteredModel(model, response.model)),
     finishReason: response.choices?.[0]?.finish_reason || null,
   };
 }

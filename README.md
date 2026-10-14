@@ -292,12 +292,12 @@ The `metadata` parameter is optional on all methods and enables cost attribution
 
 **Media Type Routing:**
 
-| Media Type | Metering Endpoint | Detection Examples                    | Billing Metric                      |
-| ---------- | ----------------- | ------------------------------------- | ----------------------------------- |
-| IMAGE      | `/ai/images`      | flux, stable-diffusion, recraft, sdxl | Per image (+ resolution)            |
-| VIDEO      | `/ai/video`       | kling-video, veo, sora, runway, luma  | Seconds of video                    |
+| Media Type | Metering Endpoint | Detection Examples                    | Billing Metric                                                         |
+| ---------- | ----------------- | ------------------------------------- | ---------------------------------------------------------------------- |
+| IMAGE      | `/ai/images`      | flux, stable-diffusion, recraft, sdxl | Per image (+ resolution)                                               |
+| VIDEO      | `/ai/video`       | kling-video, veo, sora, runway, luma  | Seconds of video                                                       |
 | AUDIO      | `/ai/audio`       | kokoro, chatterbox, whisper, f5-tts   | Characters (`tts`) / minutes (`transcription`) / seconds (`synthesis`) |
-| CHAT       | `/ai/completions` | openrouter                            | Token usage (input/output/total)    |
+| CHAT       | `/ai/completions` | openrouter                            | Token usage (input/output/total)                                       |
 
 Media type is detected via a two-phase approach: first by regex matching on the endpoint ID, then corrected by inspecting the response structure (e.g., presence of `images`, `video`, `audio_url`, or `usage` fields).
 
@@ -316,6 +316,52 @@ HTTP client patching for LiteLLM proxy:
 | `isMiddlewareInitialized()` | Check initialization status           |
 | `getStatus()`               | Get status including proxy URL        |
 | `reset()`                   | Reset all state                       |
+
+#### LiteLLM per-request tagging headers
+
+Any request sent through the patched HTTP client can carry attribution as `x-revenium-*` headers. Each header overrides the payload field listed below. When a header is absent the field falls back to the matching `REVENIUM_*` environment variable, the LiteLLM configuration (for the organization), or the active `JobContext` (for the job fields); only fields with no such fallback stay unset. Note that `environment` resolves to `NODE_ENV` and `retryNumber` resolves to `0` when nothing else is set.
+
+| Header                                  | Payload field                 |
+| --------------------------------------- | ----------------------------- |
+| `x-revenium-subscriber-id`              | `subscriber.id`               |
+| `x-revenium-subscriber-email`           | `subscriber.email`            |
+| `x-revenium-subscriber-credential-name` | `subscriber.credential.name`  |
+| `x-revenium-subscriber-credential`      | `subscriber.credential.value` |
+| `x-revenium-subscription-id`            | `subscriptionId`              |
+| `x-revenium-organization-name`          | `organizationName`            |
+| `x-revenium-organization-id`            | `organizationName` (fallback) |
+| `x-revenium-product-name`               | `productName`                 |
+| `x-revenium-product-id`                 | `productName` (fallback)      |
+| `x-revenium-trace-id`                   | `traceId`                     |
+| `x-revenium-trace-type`                 | `traceType`                   |
+| `x-revenium-trace-name`                 | `traceName`                   |
+| `x-revenium-task-type`                  | `taskType`                    |
+| `x-revenium-agent`                      | `agent`                       |
+| `x-revenium-environment`                | `environment`                 |
+| `x-revenium-region`                     | `region`                      |
+| `x-revenium-operation-subtype`          | `operationSubtype`            |
+| `x-revenium-retry-number`               | `retryNumber`                 |
+| `x-revenium-parent-transaction-id`      | `parentTransactionId`         |
+| `x-revenium-transaction-name`           | `transactionName`             |
+| `x-revenium-credential-alias`           | `credentialAlias`             |
+| `x-revenium-ticket-id`                  | `ticketId`                    |
+| `x-revenium-agentic-job-id`             | `agenticJobId`                |
+| `x-revenium-agentic-job-name`           | `agenticJobName`              |
+| `x-revenium-agentic-job-type`           | `agenticJobType`              |
+| `x-revenium-agentic-job-version`        | `agenticJobVersion`           |
+| `x-revenium-skill-name`                 | `skillName`                   |
+| `x-revenium-skill-source`               | `skillSource`                 |
+| `x-revenium-skill-kind`                 | `skillKind`                   |
+| `x-revenium-skill-plugin-name`          | `skillPluginName`             |
+| `x-revenium-skill-marketplace-name`     | `skillMarketplaceName`        |
+| `x-revenium-skill-invocation-trigger`   | `skillInvocationTrigger`      |
+| `x-revenium-capture-prompts`            | prompt capture toggle         |
+
+Subscriber headers are independent: supplying only an id, or only an email, still attributes the call. A credential is attached only when both the name and the value are supplied.
+
+LiteLLM calls made inside a `JobContext` are tagged with that job, as with every other provider. When the same job field is supplied more than once, the per-request `x-revenium-agentic-job-*` header wins over the active job context, and the job context wins over the `REVENIUM_AGENTIC_JOB_*` environment variables.
+
+`x-revenium-ticket-id` is truncated at 256 characters, and an `x-revenium-agentic-job-id` the metering API would reject is dropped with a warning rather than failing the whole record. Prefer `JobContext.run()` over `JobContext.start()` in a shared-process server: `start()` has no scope end, so the job stays attached to everything the process handles afterwards.
 
 ## Tool Metering
 
@@ -420,21 +466,25 @@ Per-call enforcement blocks outgoing provider requests when a subscriber has a b
 
 ### Environment variables
 
-| Variable                        | Required             | Description                                                                                                       |
-| ------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `REVENIUM_METERING_API_KEY`     | Yes                  | Revenium API key (starts with `hak_` or `rev_`). The `_METERING_` infix is load-bearing.                          |
-| `REVENIUM_TEAM_ID`              | Yes for enforcement  | Hashed team ID. If unset, the engine starts dormant (warns once, skips cost control fetch) and all provider calls pass through. |
-| `REVENIUM_ENFORCEMENT_BASE_URL` | No                   | Base URL for the enforcement API. Falls back to `REVENIUM_METERING_BASE_URL` when unset.                          |
+| Variable                        | Required            | Description                                                                                                                                                         |
+| ------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REVENIUM_METERING_API_KEY`     | Yes                 | Revenium API key (starts with `hak_` or `rev_`). The `_METERING_` infix is load-bearing.                                                                            |
+| `REVENIUM_TEAM_ID`              | Yes for enforcement | Hashed team ID. If unset, the engine starts dormant (warns once, skips cost control fetch) and all provider calls pass through.                                     |
+| `REVENIUM_ENFORCEMENT_BASE_URL` | No                  | Host base for the enforcement API (e.g. `https://api.revenium.ai`); the SDK appends the service path itself. Falls back to `REVENIUM_METERING_BASE_URL` when unset. |
 
 ### How it works
 
-`Initialize()` (from `@revenium/middleware/openai`) calls `startEnforcementPolling()`, which boots a background poller on `/v2/api/ai/enforcement-rules/{teamId}` every 30s with ±20% jitter. Fetched cost controls are cached in memory; a `204 No Content` response caches an empty set. The poll timer is `unref`'d so it never prevents process exit.
+`Initialize()` (from `@revenium/middleware/openai`) calls `startEnforcementPolling()`, which boots a background poller on `/profitstream/v2/api/ai/enforcement-rules/{teamId}` every 30s with ±20% jitter. Fetched cost controls are cached in memory; a `204 No Content` response caches an empty set. A `4xx` response leaves the cache untouched and logs a warning on every poll, naming the requested URL and status and stating whether previously loaded cost controls are still blocking calls or nothing is loaded; a `429` additionally backs polling off for the `Retry-After` window (capped at 60s). The poll timer is `unref`'d so it never prevents process exit.
 
-Before every chat completion (sync and streaming), the middleware builds enforcement criteria from the request — `subscriberId` from `metadata.subscriber.id`, `model` from request params, `productName` from metadata, `provider` from the detected provider — and calls `enforcePreCallRules(criteria)`. The evaluator:
+Before every chat completion (sync and streaming), the middleware builds enforcement criteria from the request — `subscriberId` and `subscriberEmail` from `metadata.subscriber`, `model` from request params, `productName` from metadata, `provider` from the detected provider — and calls `enforcePreCallRules(criteria)`. The evaluator resolves the caller to the subscriber id and the normalized email, then:
 
-- skips cost controls where `breached === false`;
+- on a per-person cost control (`groupBy` set), looks the caller up in `groupBreakdown` and acts only on their own row: someone who has not crossed the limit passes even while a teammate is blocked, and the error reports the blocked person's own figure. A grouped cost control the server sent no breakdown for (its metric is not cost) blocks nobody;
+- on a department-scoped cost control, acts only when the caller is named in `departmentBudgetBlocks`, reporting the balance from `departmentBudgetBlockBalances`;
+- on a team-wide cost control, skips it where `breached === false` and otherwise acts on the rule-level `currentValue`;
 - logs a warning and continues past cost controls where `shadowMode === true` or `action ∈ {WARN_ONLY, THROTTLE}` — these are observation-only client-side; the server still enforces server-side throttling;
 - throws `CostLimitExceeded` on the first matching `BLOCK` cost control.
+
+A caller carrying neither a subscriber id nor an email cannot be matched against a per-person or department-scoped cost control, so those pass; team-wide cost controls still block it.
 
 The engine fails open: missing team ID, network outages, an unreachable Revenium API, or a parse error all leave the cache untouched and `enforcePreCallRules` becomes a no-op (the request passes). Enforcement errors never bubble to user code as metering failures.
 
@@ -442,11 +492,11 @@ The engine fails open: missing team ID, network outages, an unreachable Revenium
 
 ```ts
 class CostLimitExceeded extends ReveniumError {
-  readonly ruleId: string;       // numeric server ruleId, stringified for JSON-safe logging
-  readonly threshold: number;    // cost control limit
+  readonly ruleId: string; // numeric server ruleId, stringified for JSON-safe logging
+  readonly threshold: number; // cost control limit
   readonly currentValue: number; // subscriber's metered value at block time
-  readonly periodType: string;   // DAILY / WEEKLY / MONTHLY / QUARTERLY
-  readonly context?: Record<string, unknown>; // subscriberId / productName / model / provider at call time
+  readonly periodType: string; // DAILY / WEEKLY / MONTHLY / QUARTERLY
+  readonly context?: Record<string, unknown>; // subscriberId / subscriberEmail / productName / model / provider at call time
 }
 ```
 
@@ -466,13 +516,16 @@ Initialize(); // loads REVENIUM_METERING_API_KEY + REVENIUM_TEAM_ID from env, st
 const client = GetClient();
 
 try {
-  const response = await client.chat().completions().create(
-    {
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: "hello" }],
-    },
-    { subscriber: { id: "alice@example.com" } },
-  );
+  const response = await client
+    .chat()
+    .completions()
+    .create(
+      {
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "hello" }],
+      },
+      { subscriber: { id: "alice@example.com" } },
+    );
   console.log(response.choices[0].message.content);
 } catch (err) {
   if (err instanceof CostLimitExceeded) {
@@ -494,14 +547,14 @@ try {
 ### Reporting an Outcome
 
 ```typescript
-import { reportJobOutcome, OutcomeAlreadyReportedError } from '@revenium/middleware';
+import { reportJobOutcome, OutcomeAlreadyReportedError } from "@revenium/middleware";
 
 try {
-  const job = await reportJobOutcome('loan-app-123', {
-    executionStatus: 'SUCCESS',
-    outcomeType: 'CONVERTED',
-    outcomeValue: 150.00,
-    outcomeCurrency: 'USD',
+  const job = await reportJobOutcome("loan-app-123", {
+    executionStatus: "SUCCESS",
+    outcomeType: "CONVERTED",
+    outcomeValue: 150.0,
+    outcomeCurrency: "USD",
   });
 } catch (err) {
   if (err instanceof OutcomeAlreadyReportedError) {
@@ -517,19 +570,19 @@ import {
   amendJobOutcome,
   OutcomeNotReportedError,
   OutcomeAmendConflictError,
-} from '@revenium/middleware';
+} from "@revenium/middleware";
 
 try {
-  const updated = await amendJobOutcome('loan-app-123', {
-    reason: 'Customer churned 30 days after initial conversion',
-    executionStatus: 'FAILED',
+  const updated = await amendJobOutcome("loan-app-123", {
+    reason: "Customer churned 30 days after initial conversion",
+    executionStatus: "FAILED",
   });
   console.log(`Update count: ${updated.outcomeUpdateCount}`);
 } catch (err) {
   if (err instanceof OutcomeNotReportedError) {
-    console.log('No outcome to amend yet');
+    console.log("No outcome to amend yet");
   } else if (err instanceof OutcomeAmendConflictError) {
-    console.log('Concurrent update detected, refetch and retry');
+    console.log("Concurrent update detected, refetch and retry");
   }
 }
 ```
@@ -537,28 +590,32 @@ try {
 ### Outcome History
 
 ```typescript
-import { getJobOutcomeHistory } from '@revenium/middleware';
+import { getJobOutcomeHistory } from "@revenium/middleware";
 
-const history = await getJobOutcomeHistory('loan-app-123');
+const history = await getJobOutcomeHistory("loan-app-123");
 for (const entry of history) {
-  console.log(`#${entry.sequence}: ${entry.executionStatus} (${entry.reason ?? 'initial report'})`);
+  console.log(`#${entry.sequence}: ${entry.executionStatus} (${entry.reason ?? "initial report"})`);
 }
 ```
 
 ### Using JobContext
 
 ```typescript
-import { JobContext } from '@revenium/middleware';
+import { JobContext } from "@revenium/middleware";
 
-const ctx = new JobContext({ jobId: 'loan-app-123', teamId: 'team-1' });
+const ctx = new JobContext({ jobId: "loan-app-123", teamId: "team-1" });
 const result = await ctx.run(async () => {
   // AI calls within this scope are automatically tagged with the job
   return await processLoanApplication();
 });
 
 // Report or amend outcomes through the context
-await ctx.reportOutcome({ executionStatus: 'SUCCESS', outcomeType: 'CONVERTED', outcomeValue: 150 });
-await ctx.amendOutcome({ reason: 'Value correction', outcomeValue: 175 });
+await ctx.reportOutcome({
+  executionStatus: "SUCCESS",
+  outcomeType: "CONVERTED",
+  outcomeValue: 150,
+});
+await ctx.amendOutcome({ reason: "Value correction", outcomeValue: 175 });
 ```
 
 ## Configuration Options

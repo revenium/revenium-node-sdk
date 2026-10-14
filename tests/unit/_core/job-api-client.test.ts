@@ -1,4 +1,5 @@
 import { createReveniumConfig, createMockFetch } from "../../helpers/fixtures";
+import { ENV_VARS } from "../../../src/_core/constants";
 import type {
   JobOutcome,
   JobOutcomeAmendment,
@@ -91,9 +92,11 @@ const mockPagedJobs: PagedResponse<JobResource> = {
 };
 
 const originalFetch = global.fetch;
+const originalTeamId = process.env[ENV_VARS.TEAM_ID];
 
 beforeEach(async () => {
   jest.resetModules();
+  delete process.env[ENV_VARS.TEAM_ID];
   const manager = await import("../../../src/_core/config/manager");
   const client = await import("../../../src/_core/jobs/job-api-client");
   reportJobOutcome = client.reportJobOutcome;
@@ -110,6 +113,11 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  if (originalTeamId === undefined) {
+    delete process.env[ENV_VARS.TEAM_ID];
+  } else {
+    process.env[ENV_VARS.TEAM_ID] = originalTeamId;
+  }
   global.fetch = originalFetch;
   resetConfig();
   jest.restoreAllMocks();
@@ -152,6 +160,25 @@ describe("reportJobOutcome", () => {
     const [url] = mockFetch.mock.calls[0];
     expect(url).toContain("https://api.revenium.ai/profitstream/");
     expect(url).not.toContain("/meter/v2/profitstream");
+  });
+
+  it("does not repeat the service prefix when the base already ends in /profitstream", async () => {
+    setConfig(
+      createReveniumConfig({
+        reveniumTeamId: "team-1",
+        reveniumBaseUrl: "https://api.revenium.ai/profitstream",
+      }),
+    );
+    const mockFetch = createMockFetch({
+      json: () => Promise.resolve(mockJobResource),
+    });
+    global.fetch = mockFetch;
+
+    await reportJobOutcome("job-123", validOutcome);
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toContain("https://api.revenium.ai/profitstream/v2/api/jobs/job-123/outcome");
+    expect(url).not.toContain("/profitstream/profitstream");
   });
 
   it("uses teamId parameter over config teamId", async () => {
