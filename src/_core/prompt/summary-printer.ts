@@ -1,5 +1,6 @@
 import { ReveniumPayload, SummaryFormat } from "../types/index.js";
-import { getConfig, getLogger } from "../config/manager.js";
+import { getLogger } from "../config/manager.js";
+import { resolveConfig } from "../config/call-config.js";
 import { DEFAULT_REVENIUM_BASE_URL, SUMMARY_PRINTER_CONFIG } from "../constants.js";
 
 interface CompletionMetrics {
@@ -36,7 +37,7 @@ async function fetchCompletionMetrics(
   maxRetries: number = SUMMARY_PRINTER_CONFIG.MAX_RETRIES,
   retryDelay: number = SUMMARY_PRINTER_CONFIG.RETRY_DELAY,
 ): Promise<CompletionMetrics | null> {
-  const config = getConfig();
+  const config = resolveConfig();
   const logger = getLogger();
   if (!config) return null;
   if (!config.reveniumTeamId) return null;
@@ -102,7 +103,7 @@ interface JsonSummary {
 }
 
 function formatJsonSummary(payload: ReveniumPayload, metrics?: CompletionMetrics | null): void {
-  const config = getConfig();
+  const config = resolveConfig();
   const summary: JsonSummary = {
     model: payload.model,
     provider: payload.provider,
@@ -121,6 +122,10 @@ function formatJsonSummary(payload: ReveniumPayload, metrics?: CompletionMetrics
   console.log(JSON.stringify(summary));
 }
 
+function formatTokenCount(count: number | null | undefined): string {
+  return typeof count === "number" ? count.toLocaleString() : "unknown";
+}
+
 function formatHumanSummary(payload: ReveniumPayload, metrics?: CompletionMetrics | null): void {
   console.log("\n" + "=".repeat(60));
   console.log("REVENIUM USAGE SUMMARY");
@@ -129,14 +134,14 @@ function formatHumanSummary(payload: ReveniumPayload, metrics?: CompletionMetric
   console.log(`Provider: ${payload.provider}`);
   console.log(`Duration: ${(payload.requestDuration / 1000).toFixed(2)}s`);
   console.log(`\nToken Usage:`);
-  console.log(`  Input Tokens:  ${(payload.inputTokenCount ?? 0).toLocaleString()}`);
-  console.log(`  Output Tokens: ${(payload.outputTokenCount ?? 0).toLocaleString()}`);
-  console.log(`  Total Tokens:  ${(payload.totalTokenCount ?? 0).toLocaleString()}`);
+  console.log(`  Input Tokens:  ${formatTokenCount(payload.inputTokenCount)}`);
+  console.log(`  Output Tokens: ${formatTokenCount(payload.outputTokenCount)}`);
+  console.log(`  Total Tokens:  ${formatTokenCount(payload.totalTokenCount)}`);
 
   if (typeof metrics?.totalCost === "number") {
     console.log(`\nCost: $${metrics.totalCost.toFixed(6)}`);
   } else {
-    const config = getConfig();
+    const config = resolveConfig();
     if (!config?.reveniumTeamId) {
       console.log(`\nCost: Set REVENIUM_TEAM_ID in .env to see pricing`);
     } else {
@@ -156,7 +161,7 @@ function getSummaryFormat(value: boolean | SummaryFormat | undefined): SummaryFo
 }
 
 export function printUsageSummary(payload: ReveniumPayload): void {
-  const config = getConfig();
+  const config = resolveConfig();
   const format = getSummaryFormat(config?.printSummary);
   if (!format) return;
 

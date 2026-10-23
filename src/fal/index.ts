@@ -3,6 +3,7 @@ import { loadConfigFromEnv as loadCoreEnv } from "../_core/config/loader.js";
 import { validateConfig } from "../_core/config/validator.js";
 import { DEFAULT_REVENIUM_BASE_URL } from "../_core/constants.js";
 import { ReveniumFal } from "./client.js";
+import { toReveniumConfig } from "./config.js";
 import type { FalConfig } from "./types.js";
 
 let globalClient: ReveniumFal | null = null;
@@ -58,22 +59,9 @@ export function Initialize(config?: Partial<FalConfig>): void {
     finalConfig = envConfig;
   }
 
-  validateConfig({
-    reveniumApiKey: finalConfig.reveniumApiKey,
-    reveniumBaseUrl: finalConfig.reveniumBaseUrl,
-  });
-
-  setConfig({
-    reveniumApiKey: finalConfig.reveniumApiKey,
-    reveniumBaseUrl: finalConfig.reveniumBaseUrl,
-    debug: finalConfig.debug,
-    printSummary: finalConfig.printSummary,
-    reveniumTeamId: finalConfig.teamId,
-    capturePrompts: finalConfig.capturePrompts,
-    maxPromptSize: finalConfig.maxPromptSize,
-    failSilent: finalConfig.failSilent,
-    maxRetries: finalConfig.maxRetries,
-  });
+  const reveniumConfig = toReveniumConfig(finalConfig);
+  validateConfig(reveniumConfig);
+  setConfig(reveniumConfig);
 
   globalClient = new ReveniumFal(finalConfig);
 

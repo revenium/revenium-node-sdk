@@ -1,17 +1,26 @@
 import { randomUUID } from "crypto";
-import { UsageMetadata } from "../_core/types/index.js";
-import { getLogger } from "../_core/config/manager.js";
+import { Subscriber, UsageMetadata } from "../_core/types/index.js";
+import { getConfig, getLogger } from "../_core/config/manager.js";
+import { getErrorMessage } from "../_core/resilience/error-handler.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
+import { resolveReportedCount } from "../_core/metering/cache-tokens.js";
 import { buildPayload } from "../_core/metering/payload-builder.js";
+import { ERROR_STOP_REASON } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import {
   shouldCapturePrompts,
   getMaxPromptSize,
   truncateString,
 } from "../_core/prompt/extraction.js";
-import { GoogleUsageMetadata } from "./types.js";
+import {
+  GoogleEmbeddingResponseFields,
+  GoogleUsageMetadata,
+  IGoogleEmbeddingResponse,
+} from "./types.js";
 
 const MIDDLEWARE_SOURCE = "revenium-google-node";
+
+const MAX_ERROR_REASON_LENGTH = 255;
 
 const ASPECT_RATIO_TO_RESOLUTION: Record<string, string> = {
   "1:1": "1024x1024",
@@ -54,7 +63,7 @@ export function mapGoogleFinishReason(finishReason: any, defaultReason: string =
       case "MALFORMED_FUNCTION_CALL":
       case "UNEXPECTED_TOOL_CALL":
       case "NO_IMAGE":
-        return "ERROR";
+        return ERROR_STOP_REASON;
       case "CANCELLED":
       case "CANCELED":
         return "CANCELLED";
@@ -132,40 +141,52 @@ export function extractConfidenceScore(response: any): number | undefined {
   }
 }
 
+type GoogleOnlyField = Exclude<keyof GoogleUsageMetadata, keyof UsageMetadata>;
+
+const GOOGLE_ONLY_FIELDS: Record<GoogleOnlyField, true> = {
+  subscriberId: true,
+  subscriberEmail: true,
+  subscriberCredential: true,
+  subscriberCredentialName: true,
+  modelSource: true,
+};
+
+function mergeGoogleSubscriber(meta: GoogleUsageMetadata): Subscriber | undefined {
+  const id = meta.subscriber?.id ?? meta.subscriberId;
+  const email = meta.subscriber?.email ?? meta.subscriberEmail;
+  const credential =
+    meta.subscriber?.credential ??
+    (meta.subscriberCredential
+      ? { name: meta.subscriberCredentialName || "apiKey", value: meta.subscriberCredential }
+      : undefined);
+
+  if (!id && !email && !credential) return undefined;
+  return { id, email, credential };
+}
+
 export function mapGoogleUsageMetadata(meta?: GoogleUsageMetadata): UsageMetadata | undefined {
   if (!meta) return undefined;
-  const result: UsageMetadata = {};
 
-  if (meta.traceId) result.traceId = meta.traceId;
-  if (meta.taskType) result.taskType = meta.taskType;
-  if (meta.organizationName || meta.organizationId)
-    result.organizationName = meta.organizationName || meta.organizationId;
-  if (meta.productName || meta.productId) result.productName = meta.productName || meta.productId;
-  if (meta.subscriptionId) result.subscriptionId = meta.subscriptionId;
-  if (meta.agent) result.agent = meta.agent;
-  if (meta.responseQualityScore !== undefined)
-    result.responseQualityScore = meta.responseQualityScore;
-  if (meta.capturePrompts !== undefined) result.capturePrompts = meta.capturePrompts;
-  if (meta.agenticJobId) result.agenticJobId = meta.agenticJobId;
-  if (meta.agenticJobName) result.agenticJobName = meta.agenticJobName;
-  if (meta.agenticJobType) result.agenticJobType = meta.agenticJobType;
-  if (meta.agenticJobVersion) result.agenticJobVersion = meta.agenticJobVersion;
-  if (meta.operationSubtype) result.operationSubtype = meta.operationSubtype;
+  const { subscriber: _subscriber, ...rest } = meta;
 
-  if (meta.subscriberId || meta.subscriberEmail || meta.subscriberCredential) {
-    result.subscriber = {
-      id: meta.subscriberId,
-      email: meta.subscriberEmail,
-    };
-    if (meta.subscriberCredential) {
-      result.subscriber.credential = {
-        name: meta.subscriberCredentialName || "apiKey",
-        value: meta.subscriberCredential,
-      };
-    }
-  }
+  const result: UsageMetadata = Object.fromEntries(
+    Object.entries(rest).filter(([field]) => !(field in GOOGLE_ONLY_FIELDS)),
+  );
+
+  const subscriber = mergeGoogleSubscriber(meta);
+  if (subscriber) result.subscriber = subscriber;
 
   return result;
+}
+
+export function withGoogleErrorReason(
+  usageMetadata: UsageMetadata | undefined,
+  error: unknown,
+): UsageMetadata {
+  return {
+    ...usageMetadata,
+    errorReason: truncateString(getErrorMessage(error), MAX_ERROR_REASON_LENGTH).value,
+  };
 }
 
 function extractGooglePrompts(
@@ -202,6 +223,90 @@ function extractGooglePrompts(
   };
 }
 
+function mergeStreamedUsageMetadata(previous: any, chunk: any): any {
+  if (!previous) return chunk;
+  if (!chunk) return previous;
+  return {
+    ...previous,
+    ...chunk,
+    promptTokenCount: resolveReportedCount(chunk.promptTokenCount, previous.promptTokenCount),
+    candidatesTokenCount: resolveReportedCount(
+      chunk.candidatesTokenCount,
+      previous.candidatesTokenCount,
+    ),
+    thoughtsTokenCount: resolveReportedCount(chunk.thoughtsTokenCount, previous.thoughtsTokenCount),
+    cachedContentTokenCount: resolveReportedCount(
+      chunk.cachedContentTokenCount,
+      previous.cachedContentTokenCount,
+    ),
+    totalTokenCount: resolveReportedCount(chunk.totalTokenCount, previous.totalTokenCount),
+  };
+}
+
+export function mergeStreamedGoogleResponse(previous: any, chunk: any): any {
+  if (!previous) return chunk;
+  if (!chunk) return previous;
+  return Object.assign(Object.create(Object.getPrototypeOf(chunk)), chunk, {
+    usageMetadata: mergeStreamedUsageMetadata(previous.usageMetadata, chunk.usageMetadata),
+  });
+}
+
+function toPositiveCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export async function countGoogleEmbeddingTokens(
+  countTokens: () => Promise<{ totalTokens?: number }>,
+): Promise<number | null> {
+  try {
+    const { totalTokens } = await countTokens();
+    return toPositiveCount(totalTokens) ?? null;
+  } catch (error) {
+    getLogger().warn("Google embedding token count failed", {
+      error: getErrorMessage(error),
+    });
+    return null;
+  }
+}
+
+function extractReportedEmbeddingTokens(
+  response: GoogleEmbeddingResponseFields,
+): number | undefined {
+  const countedByEmbedding = (response?.embeddings ?? []).reduce(
+    (total, embedding) => total + (toPositiveCount(embedding?.statistics?.tokenCount) ?? 0),
+    0,
+  );
+  return (
+    toPositiveCount(countedByEmbedding) ??
+    toPositiveCount(response?.usageMetadata?.promptTokenCount)
+  );
+}
+
+async function resolveEmbeddingInputTokens(
+  response: GoogleEmbeddingResponseFields,
+  resolveInputTokens?: () => Promise<number | null>,
+): Promise<number | null> {
+  const reported = extractReportedEmbeddingTokens(response);
+  if (reported !== undefined) return reported;
+  return resolveInputTokens ? resolveInputTokens() : null;
+}
+
+export function buildGoogleEmbeddingResponse(
+  response: GoogleEmbeddingResponseFields,
+): IGoogleEmbeddingResponse {
+  const reportedInputTokens = extractReportedEmbeddingTokens(response);
+  return {
+    embedding: {
+      embedding: response.embeddings?.[0]?.values ?? [],
+      modelVersion: response.modelVersion ?? "",
+      usageMetadata: {
+        totalTokenCount: response.usageMetadata?.totalTokenCount ?? reportedInputTokens,
+        promptTokenCount: response.usageMetadata?.promptTokenCount ?? reportedInputTokens,
+      },
+    },
+  };
+}
+
 export async function trackGoogleUsageAsync(params: {
   transactionId: string;
   model: string;
@@ -214,17 +319,24 @@ export async function trackGoogleUsageAsync(params: {
   usageMetadata?: GoogleUsageMetadata;
   prompts?: string[];
   timeToFirstToken?: number;
+  resolveInputTokens?: () => Promise<number | null>;
+  error?: unknown;
 }): Promise<void> {
   const logger = getLogger();
 
-  const finishReason = extractFinishReason(params.response);
-  const stopReason = mapGoogleFinishReason(finishReason, "END");
+  const failed = params.error !== undefined;
+  const stopReason = failed
+    ? ERROR_STOP_REASON
+    : mapGoogleFinishReason(extractFinishReason(params.response), "END");
   const confidenceScore = extractConfidenceScore(params.response);
 
-  const usageMeta = mapGoogleUsageMetadata(params.usageMetadata);
-  if (confidenceScore !== undefined && usageMeta) {
-    usageMeta.responseQualityScore = params.usageMetadata?.responseQualityScore ?? confidenceScore;
+  const providedMeta = mapGoogleUsageMetadata(params.usageMetadata);
+  if (confidenceScore !== undefined && providedMeta) {
+    providedMeta.responseQualityScore =
+      params.usageMetadata?.responseQualityScore ?? confidenceScore;
   }
+
+  const usageMeta = failed ? withGoogleErrorReason(providedMeta, params.error) : providedMeta;
 
   const promptData = params.prompts
     ? extractGooglePrompts(params.prompts, params.response, params.usageMetadata)
@@ -233,6 +345,16 @@ export async function trackGoogleUsageAsync(params: {
   const duration = params.endTime.getTime() - params.startTime.getTime();
 
   try {
+    const reportedUsage = params.response?.usageMetadata;
+    const isEmbedding = params.operationType === "EMBED";
+    const shouldCountEmbeddingTokens = !failed && getConfig() !== null;
+    const inputTokens = isEmbedding
+      ? ((await resolveEmbeddingInputTokens(
+          params.response,
+          shouldCountEmbeddingTokens ? params.resolveInputTokens : undefined,
+        )) ?? (failed ? 0 : null))
+      : (reportedUsage?.promptTokenCount ?? 0);
+
     const payload = await buildPayload({
       operationType: params.operationType,
       model: params.model,
@@ -244,11 +366,14 @@ export async function trackGoogleUsageAsync(params: {
       middlewareSource: MIDDLEWARE_SOURCE,
       usageMetadata: usageMeta,
       usage: {
-        prompt_tokens: params.response?.usageMetadata?.promptTokenCount ?? 0,
-        completion_tokens: params.response?.usageMetadata?.candidatesTokenCount ?? 0,
-        total_tokens: params.response?.usageMetadata?.totalTokenCount ?? 0,
-        reasoning_tokens: params.response?.usageMetadata?.thoughtsTokenCount,
-        cached_tokens: params.response?.usageMetadata?.cachedContentTokenCount,
+        prompt_tokens: inputTokens,
+        completion_tokens:
+          (reportedUsage?.candidatesTokenCount ?? 0) + (reportedUsage?.thoughtsTokenCount ?? 0),
+        total_tokens: isEmbedding
+          ? (toPositiveCount(reportedUsage?.totalTokenCount) ?? inputTokens)
+          : (reportedUsage?.totalTokenCount ?? 0),
+        reasoning_tokens: reportedUsage?.thoughtsTokenCount,
+        cached_tokens: reportedUsage?.cachedContentTokenCount,
       },
       stopReason,
       isStreamed: params.isStreaming,
@@ -263,7 +388,7 @@ export async function trackGoogleUsageAsync(params: {
     }
   } catch (error) {
     logger.warn("Google tracking failed", {
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
       transactionId: params.transactionId,
     });
   }

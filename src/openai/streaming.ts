@@ -7,6 +7,7 @@ import {
   sanitizeCredentials,
   getMaxPromptSize,
 } from "../_core/prompt/extraction.js";
+import { runWithCallConfig } from "../_core/config/call-config.js";
 
 export type TrackUsageFn = (data: any) => void;
 
@@ -18,6 +19,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
   private config: Config;
   private providerInfo: ProviderInfo;
   private model: string;
+  private responseModel?: string;
   private metadata?: UsageMetadata;
   private startTime: number;
   private firstTokenTime?: number;
@@ -27,6 +29,8 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
   private accumulatedContent: string = "";
   private finishReason: string | null = null;
   private trackFn: TrackUsageFn;
+  private capturePrompts: boolean;
+  private maxPromptSize: number;
 
   constructor(
     stream: AsyncIterable<OpenAI.ChatCompletionChunk>,
@@ -46,12 +50,20 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
     this.metadata = metadata;
     this.startTime = Date.now();
     this.requestId = randomUUID();
+    this.capturePrompts = runWithCallConfig(config, () => shouldCapturePrompts(metadata));
+    this.maxPromptSize = runWithCallConfig(config, getMaxPromptSize);
+  }
+
+  private track(finishReason: string | null, timeToFirstToken?: number): void {
+    runWithCallConfig(this.config, () =>
+      this.trackFn(this.buildTrackingPayload(finishReason, timeToFirstToken)),
+    );
   }
 
   private buildTrackingPayload(finishReason: string | null, timeToFirstToken?: number) {
     return {
       requestId: this.requestId,
-      model: this.model,
+      model: this.responseModel || this.model,
       promptTokens: this.usage.prompt_tokens || 0,
       completionTokens: this.usage.completion_tokens || 0,
       totalTokens: this.usage.total_tokens || 0,
@@ -82,8 +94,8 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
           this.firstTokenTime = Date.now();
         }
 
-        if (deltaContent && shouldCapturePrompts(this.metadata)) {
-          const remaining = getMaxPromptSize() - this.accumulatedContent.length;
+        if (deltaContent && this.capturePrompts) {
+          const remaining = this.maxPromptSize - this.accumulatedContent.length;
           if (remaining > 0) {
             this.accumulatedContent += deltaContent.slice(0, remaining);
           }
@@ -93,6 +105,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
 
         if (chunk.usage) this.usage = chunk.usage;
         if (chunk.id) this.requestId = chunk.id;
+        if (!this.responseModel && chunk.model) this.responseModel = chunk.model;
 
         yield chunk;
       }
@@ -102,17 +115,17 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
         ? this.firstTokenTime - this.startTime
         : undefined;
 
-      this.trackFn(this.buildTrackingPayload(this.finishReason, timeToFirstToken));
+      this.track(this.finishReason, timeToFirstToken);
     } catch (error) {
       completed = true;
-      this.trackFn(this.buildTrackingPayload("error"));
+      this.track("error");
       throw error;
     } finally {
       if (!completed) {
         const timeToFirstToken = this.firstTokenTime
           ? this.firstTokenTime - this.startTime
           : undefined;
-        this.trackFn(this.buildTrackingPayload(this.finishReason ?? "cancelled", timeToFirstToken));
+        this.track(this.finishReason ?? "cancelled", timeToFirstToken);
       }
     }
   }

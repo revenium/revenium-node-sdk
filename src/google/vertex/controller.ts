@@ -1,3 +1,4 @@
+import { loadEnvFiles } from "../../_core/config/loader.js";
 import { getLogger } from "../../_core/config/manager.js";
 import {
   GoogleUsageMetadata,
@@ -16,6 +17,7 @@ import {
 import { VertexAIService } from "./service.js";
 
 function verifyVertexAIEnvironment(): void {
+  loadEnvFiles();
   const logger = getLogger();
 
   if (!process.env.GOOGLE_CLOUD_PROJECT) {
@@ -30,10 +32,6 @@ function verifyVertexAIEnvironment(): void {
 
   if (!process.env.GOOGLE_CLOUD_LOCATION) {
     logger.warn("GOOGLE_CLOUD_LOCATION not set, defaulting to us-central1");
-  }
-
-  if (!process.env.REVENIUM_METERING_API_KEY) {
-    logger.warn("REVENIUM_METERING_API_KEY not set. Metering data will not be sent.");
   }
 }
 

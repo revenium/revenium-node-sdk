@@ -39,16 +39,19 @@ const PROVIDERS = [
         mapperFiles: ["src/openai/responses-stop-reason.ts"],
       },
     ],
-    mapperKeyPattern: /^\s+([a-z_]+): "/gm,
+    mapperKeyPattern: /^\s+([a-z_]+):\s*["A-Z]/gm,
   },
   {
     name: "anthropic",
     pkg: "@anthropic-ai/sdk",
     sourceDirs: ["src/anthropic"],
-    typeFiles: ["resources/messages/messages.d.ts"],
-    usageRoots: ["Usage", "MessageDeltaUsage"],
-    stopReasonTypes: [{ alias: "StopReason", mapperFiles: ["src/_core/stop-reason-mapper.ts"] }],
-    mapperKeyPattern: /^\s+([a-z_]+): "/gm,
+    typeFiles: ["resources/messages/messages.d.ts", "resources/beta/messages/messages.d.ts"],
+    usageRoots: ["Usage", "MessageDeltaUsage", "BetaUsage", "BetaMessageDeltaUsage"],
+    stopReasonTypes: [
+      { alias: "StopReason", mapperFiles: ["src/_core/stop-reason-mapper.ts"] },
+      { alias: "BetaStopReason", mapperFiles: ["src/_core/stop-reason-mapper.ts"] },
+    ],
+    mapperKeyPattern: /^\s+([a-z_]+):\s*["A-Z]/gm,
   },
   {
     name: "google",
@@ -195,11 +198,15 @@ function usagePaths(provider, surface) {
   return new Set(provider.usageRoots.flatMap((root) => flattenPaths(surface.interfaces, root)));
 }
 
+function extractMapperKeys(pattern, text) {
+  return [...text.matchAll(pattern)].map((m) => m[1].toLowerCase());
+}
+
 function mapperKeys(provider, spec) {
   const keys = new Set();
   for (const file of spec.mapperFiles) {
     const text = readFileSync(join(ROOT, file), "utf8");
-    const fileKeys = [...text.matchAll(provider.mapperKeyPattern)].map((m) => m[1].toLowerCase());
+    const fileKeys = extractMapperKeys(provider.mapperKeyPattern, text);
     if (fileKeys.length === 0) throw new Error(`${file}: no mapper keys found`);
     for (const key of fileKeys) keys.add(key);
   }
@@ -341,6 +348,13 @@ export type SecondaryStatus = 'refusal';
 
 const FIXTURE_RENAMED = FIXTURE_LATEST.replace("thinking_tokens", "reasoning_tokens");
 
+const FIXTURE_MAPPER = `const STOP_REASON_MAP: Record<string, StopReason> = {
+  end_turn: "END",
+  error: ERROR_STOP_REASON,
+  refusal: errorStopReason,
+};
+`;
+
 function selftest() {
   const keysBySpec = new Map([
     ["StopReason", new Set(["end_turn", "max_tokens"])],
@@ -372,7 +386,18 @@ function selftest() {
     missingRootRefused = true;
   }
 
+  const mapperPattern = PROVIDERS.find((entry) => entry.name === "openai").mapperKeyPattern;
+  const extractedMapperKeys = extractMapperKeys(mapperPattern, FIXTURE_MAPPER);
+
   const checks = [
+    [
+      "string-valued and constant-valued mapper entries are both read",
+      extractedMapperKeys.includes("end_turn") && extractedMapperKeys.includes("error"),
+    ],
+    [
+      "a mapper value that is neither a string nor a constant stays invisible",
+      !extractedMapperKeys.includes("refusal"),
+    ],
     ["own-object paths are ignored", inSync.consumed.length === 2],
     ["identical surfaces report nothing", !isFailure(inSync) && inSync.addedSiblings.length === 0],
     [

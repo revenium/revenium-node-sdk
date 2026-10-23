@@ -10,7 +10,7 @@ import { resetEnforcementCircuitBreaker } from "../../../src/_core/resilience/ci
 import { CostLimitExceeded } from "../../../src/_core/resilience/error-handler";
 import { CompletionsInterface } from "../../../src/openai/middleware";
 import { Provider, type ProviderInfo } from "../../../src/openai/provider-detection";
-import type { Config } from "../../../src/_core/types/index";
+import type { Config, Credential } from "../../../src/_core/types/index";
 
 jest.mock("../../../src/_core/metering/api-client", () => ({
   sendToRevenium: jest.fn().mockResolvedValue(undefined),
@@ -208,6 +208,144 @@ describe("enforcement blocks an OpenAI chat call with README-only configuration"
     const completions = new CompletionsInterface(client, getConfig() as Config, providerInfo);
     await completions.create(chatParams(), { subscriber: { email: "carol@example.com" } });
 
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  async function loadFilteredCap(dimension: string, value: string): Promise<CompletionsInterface> {
+    servePayload({
+      rules: [
+        {
+          ...breachedBlockRule,
+          filters: [{ dimension, operator: "IS", value, values: [] }],
+        },
+      ],
+    });
+    await loadRules();
+
+    return new CompletionsInterface(client, getConfig() as Config, providerInfo);
+  }
+
+  it("lets the call through when the breached cap is filtered on another provider", async () => {
+    const completions = await loadFilteredCap("PROVIDER", "anthropic");
+
+    await expect(completions.create(chatParams())).resolves.toBeDefined();
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("still blocks when the breached cap is filtered on this provider", async () => {
+    const completions = await loadFilteredCap("PROVIDER", "openai");
+
+    await expect(completions.create(chatParams())).rejects.toBeInstanceOf(CostLimitExceeded);
+    expect(providerCreate).not.toHaveBeenCalled();
+  });
+
+  it("blocks only the model a model-filtered cap names", async () => {
+    const completions = await loadFilteredCap("MODEL", "gpt-4o");
+
+    await expect(completions.create(chatParams())).rejects.toBeInstanceOf(CostLimitExceeded);
+    await completions.create({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks only the agent an agent-filtered cap names", async () => {
+    const completions = await loadFilteredCap("AGENT", "batch-bot");
+
+    await expect(completions.create(chatParams(), { agent: "batch-bot" })).rejects.toBeInstanceOf(
+      CostLimitExceeded,
+    );
+    await completions.create(chatParams(), { agent: "chat-bot" });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("matches a credential-filtered cap on the alias, never on the raw key", async () => {
+    const completions = await loadFilteredCap("CREDENTIAL", "sk-proj-secret");
+
+    await completions.create(chatParams(), {
+      subscriber: { email: "bob@example.com", credential: { name: "", value: "sk-proj-secret" } },
+    });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks only the alias a credential-filtered cap names", async () => {
+    const completions = await loadFilteredCap("CREDENTIAL", "prod-key");
+
+    await expect(
+      completions.create(chatParams(), {
+        subscriber: { credential: { name: "prod-key", value: "sk-proj-secret" } },
+      }),
+    ).rejects.toBeInstanceOf(CostLimitExceeded);
+    await completions.create(chatParams(), {
+      subscriber: { credential: { name: "dev-key", value: "prod-key" } },
+    });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the credential value when no name field was supplied at all", async () => {
+    const completions = await loadFilteredCap("CREDENTIAL", "sk-proj-secret");
+    const nameless = (value: string): Credential => ({ value }) as unknown as Credential;
+
+    await expect(
+      completions.create(chatParams(), {
+        subscriber: { credential: nameless("sk-proj-secret") },
+      }),
+    ).rejects.toBeInstanceOf(CostLimitExceeded);
+    await completions.create(chatParams(), {
+      subscriber: { credential: nameless("sk-proj-other") },
+    });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks only the product a product-filtered cap names, read from productId", async () => {
+    const completions = await loadFilteredCap("PRODUCT", "assistant");
+
+    await expect(
+      completions.create(chatParams(), { productId: "assistant" }),
+    ).rejects.toBeInstanceOf(CostLimitExceeded);
+    await completions.create(chatParams(), { productId: "reporting" });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks only the organization an org-filtered cap names, read from organizationId", async () => {
+    const completions = await loadFilteredCap("ORGANIZATION", "acme");
+
+    await expect(
+      completions.create(chatParams(), { organizationId: "acme" }),
+    ).rejects.toBeInstanceOf(CostLimitExceeded);
+    await completions.create(chatParams(), { organizationId: "globex" });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks only the task type a task-filtered cap names", async () => {
+    const completions = await loadFilteredCap("TASK_TYPE", "summarize");
+
+    await expect(
+      completions.create(chatParams(), { taskType: "summarize" }),
+    ).rejects.toBeInstanceOf(CostLimitExceeded);
+    await completions.create(chatParams(), { taskType: "classify" });
+
+    expect(providerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a streamed call through when the breached cap is filtered on another provider", async () => {
+    const completions = await loadFilteredCap("PROVIDER", "anthropic");
+
+    await expect(
+      completions.createStreaming({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    ).resolves.toBeDefined();
     expect(providerCreate).toHaveBeenCalledTimes(1);
   });
 });

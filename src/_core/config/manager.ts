@@ -28,7 +28,7 @@ export function getConfig(): ReveniumConfig | null {
 
 export function setConfig(config: ReveniumConfig): void {
   validateConfig(config);
-  globalConfig = config;
+  globalConfig = { ...config };
   globalLogger.debug("Revenium configuration updated", {
     baseUrl: config.reveniumBaseUrl,
     hasApiKey: !!config.reveniumApiKey,

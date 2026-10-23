@@ -1,4 +1,5 @@
-import { getConfig, getLogger } from "../_core/config/manager.js";
+import { getLogger } from "../_core/config/manager.js";
+import { resolveConfig } from "../_core/config/call-config.js";
 import { DEFAULT_CONFIG } from "../_core/constants.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import { getErrorMessage } from "../_core/resilience/error-handler.js";
@@ -21,7 +22,7 @@ import {
 import { resolveSkillFields, resolveAgenticJobFields } from "../_core/metadata/metadata-builder.js";
 import { extractModelSource, extractProvider, extractModelName } from "./provider-mapper.js";
 import { extractUsageTokens, resolveMeteredModel, type ExtractedUsageTokens } from "./usage.js";
-import type { ReveniumPayload, Subscriber } from "../_core/types/index.js";
+import type { ReveniumPayload, Subscriber, UsageMetadata } from "../_core/types/index.js";
 import type {
   LiteLLMUsageMetadata,
   LiteLLMChatCompletionRequest,
@@ -29,7 +30,7 @@ import type {
 } from "./types.js";
 import { getLiteLLMConfig } from "./http-client.js";
 
-const MIDDLEWARE_SOURCE = "revenium-litellm-node";
+export const MIDDLEWARE_SOURCE = "revenium-litellm-node";
 
 function buildSubscriber(metadata?: LiteLLMUsageMetadata): Subscriber | undefined {
   if (!metadata) return undefined;
@@ -118,6 +119,9 @@ export async function sendReveniumMetrics(
     cacheCreation1hTokenCount: data.cacheCreation1hTokens,
     cacheReadTokenCount: data.cachedTokens,
     totalTokenCount: data.totalTokens,
+    inputTokenCost: data.inputTokenCost,
+    outputTokenCost: data.outputTokenCost,
+    totalCost: data.totalCost,
     model: extractModelName(data.model),
     modelSource: extractModelSource(data.model),
     transactionId: data.requestId,
@@ -186,7 +190,7 @@ export function trackUsageAsync(trackingData: Parameters<typeof sendReveniumMetr
         requestId: trackingData.requestId,
       };
 
-      if (getConfig()?.failSilent ?? DEFAULT_CONFIG.FAIL_SILENT) {
+      if (resolveConfig()?.failSilent ?? DEFAULT_CONFIG.FAIL_SILENT) {
         logger.warn("Revenium tracking failed", details);
         return;
       }
@@ -218,6 +222,19 @@ function parseRetryNumber(value?: string): number | undefined {
 
   const retryNumber = Number.parseInt(value, 10);
   return Number.isInteger(retryNumber) ? retryNumber : undefined;
+}
+
+export function mergeCallMetadata(
+  headerMetadata: LiteLLMUsageMetadata,
+  callMetadata?: UsageMetadata,
+): LiteLLMUsageMetadata {
+  if (!callMetadata) return headerMetadata;
+
+  const definedCallFields = Object.fromEntries(
+    Object.entries(callMetadata).filter(([, value]) => value !== undefined),
+  );
+
+  return { ...headerMetadata, ...definedCallFields };
 }
 
 export function extractMetadataFromHeaders(headers: Record<string, string>): LiteLLMUsageMetadata {

@@ -136,7 +136,11 @@ export interface ReveniumPayload {
   requestedImageCount?: number;
   actualImageCount?: number;
   durationSeconds?: number;
+  resolution?: string;
+  quality?: string;
+  style?: string;
   characterCount?: number;
+  billingUnit?: string;
   inputAudioTokenCount?: number;
   outputAudioTokenCount?: number;
   attributes?: Record<string, unknown>;

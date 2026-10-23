@@ -1,4 +1,4 @@
-import { getLogger } from "../../_core/config/manager.js";
+import { loadEnvFiles } from "../../_core/config/loader.js";
 import {
   GoogleUsageMetadata,
   IGoogleResponseChat,
@@ -16,17 +16,13 @@ import {
 import { GoogleGenAIService } from "./service.js";
 
 function verifyGoogleGenAIEnvironment(): void {
-  const logger = getLogger();
+  loadEnvFiles();
 
   if (!process.env.GOOGLE_API_KEY) {
     throw new Error(
       "GOOGLE_API_KEY environment variable is required for Google AI. " +
         "Get your API key from https://aistudio.google.com/apikey",
     );
-  }
-
-  if (!process.env.REVENIUM_METERING_API_KEY) {
-    logger.warn("REVENIUM_METERING_API_KEY not set. Metering data will not be sent.");
   }
 }
 

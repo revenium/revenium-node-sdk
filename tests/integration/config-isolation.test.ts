@@ -40,3 +40,26 @@ describe("config isolation between providers", () => {
     expect(m3.getConfig()).toBeNull();
   });
 });
+
+describe("call config scope across module reloads", () => {
+  beforeEach(() => {
+    jest.resetModules();
+  });
+
+  it("shares one store so a mixed CJS and ESM process sees the same scope", async () => {
+    const m1 = await import("../../src/_core/config/call-config");
+
+    jest.resetModules();
+
+    const m2 = await import("../../src/_core/config/call-config");
+
+    m1.runWithCallConfig(
+      { reveniumApiKey: "hak_scoped_shared", reveniumBaseUrl: "https://api.revenium.ai" },
+      () => {
+        expect(m2.getCallConfig()!.reveniumApiKey).toBe("hak_scoped_shared");
+      },
+    );
+
+    expect(m2.getCallConfig()).toBeNull();
+  });
+});

@@ -83,6 +83,7 @@ export { startEnforcementPolling, stopEnforcementPolling } from "./_core/enforce
 export { enforcePreCallRules } from "./_core/enforcement/evaluator.js";
 
 export type { EnforcementRule } from "./_core/enforcement/cache.js";
+export type { EnforcementFilter } from "./_core/enforcement/filters.js";
 
 export { flushMeteringBuffer, getBufferStats } from "./_core/metering/buffer.js";
 export type { BufferStats } from "./_core/metering/buffer.js";

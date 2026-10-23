@@ -32,11 +32,11 @@ export const LEGACY_AUDIO_OPERATION_SUBTYPES: Readonly<
   audio_generation: "synthesis",
 };
 
-export type AudioBillingUnit = "per_character" | "per_minute" | "per_second";
+export type AudioBillingUnit = "per_character" | "per_second" | "per_token";
 
 const AUDIO_BILLING_UNITS: Record<AudioOperationSubtype, AudioBillingUnit> = {
-  transcription: "per_minute",
-  translation: "per_minute",
+  transcription: "per_second",
+  translation: "per_second",
   synthesis: "per_second",
   speech: "per_character",
   tts: "per_character",
@@ -46,13 +46,19 @@ const AUDIO_BILLING_UNITS: Record<AudioOperationSubtype, AudioBillingUnit> = {
 export function resolveAudioBillingUnit(
   subtype: AudioOperationSubtype,
   characterCount: number,
-  durationSeconds: number,
+  durationSeconds: number | undefined,
+  audioTokenCount = 0,
 ): AudioBillingUnit {
   const unit = AUDIO_BILLING_UNITS[subtype];
-  if (unit === "per_character" && characterCount === 0 && durationSeconds > 0) {
-    return "per_second";
+  const measuredSeconds = durationSeconds ?? 0;
+  if (unit === "per_character") {
+    return characterCount === 0 && measuredSeconds > 0 ? "per_second" : unit;
   }
-  return unit;
+  return measuredSeconds === 0 && audioTokenCount > 0 ? "per_token" : unit;
+}
+
+export function toMeteringBillingUnit(unit: AudioBillingUnit): string {
+  return unit.toUpperCase();
 }
 
 function normalizeOperationSubtype<T extends string>(

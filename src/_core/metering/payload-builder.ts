@@ -19,11 +19,16 @@ import {
   resolveAudioBillingUnit,
   resolveAudioOperationSubtype,
   resolveOperationSubtype,
+  toMeteringBillingUnit,
   type AudioOperationSubtype,
   type ImageOperationSubtype,
   type LegacyAudioOperationSubtype,
   type VideoOperationSubtype,
 } from "./operation-subtype.js";
+import { ERROR_STOP_REASON } from "../stop-reason-mapper.js";
+import { readAudioUsage } from "./audio-usage.js";
+
+const DEFAULT_IMAGE_RESOLUTION = "1024x1024";
 
 export interface PayloadParams {
   operationType: "CHAT" | "EMBED";
@@ -36,9 +41,9 @@ export interface PayloadParams {
   middlewareSource: string;
   usageMetadata?: UsageMetadata;
   usage: {
-    prompt_tokens: number;
+    prompt_tokens: number | null;
     completion_tokens?: number;
-    total_tokens: number;
+    total_tokens: number | null;
     reasoning_tokens?: number;
     cached_tokens?: number;
     cache_creation_tokens?: number;
@@ -116,6 +121,19 @@ export async function buildPayload(params: PayloadParams): Promise<ReveniumPaylo
   return basePayload;
 }
 
+export interface ImagePayloadExtra {
+  failed?: boolean;
+  completedImageCount?: number;
+  isStreamed?: boolean;
+  timeToFirstToken?: number;
+  stopReason?: string;
+  tokens?: {
+    input: number | null;
+    output: number | null;
+    total: number | null;
+  };
+}
+
 export function buildImagePayload(
   detectedSubtype: ImageOperationSubtype,
   response: any,
@@ -126,6 +144,7 @@ export function buildImagePayload(
   modelSource: string,
   middlewareSource: string,
   usageMetadata?: UsageMetadata,
+  extra?: ImagePayloadExtra,
 ): ReveniumPayload {
   const now = new Date().toISOString();
   const requestTime = new Date(startTime).toISOString();
@@ -135,28 +154,29 @@ export function buildImagePayload(
     metadataFields.operationSubtype,
     detectedSubtype,
   );
+  const actualImageCount = extra?.failed
+    ? 0
+    : (extra?.completedImageCount ?? response?.data?.length ?? 0);
+
+  const requestedImageCount = request.n || 1;
+  const resolution: string | undefined = response?.size ?? request.size;
+  const quality = response?.quality ?? request.quality;
+  const style = request.style;
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_image",
-    actual_image_count: response.data?.length || 0,
+    actual_image_count: actualImageCount,
+    requested_image_count: requestedImageCount,
+    resolution: resolution ?? DEFAULT_IMAGE_RESOLUTION,
+    quality,
+    style,
+    response_format: request.response_format || "url",
   };
 
   if (operationSubtype === "generation") {
-    attributes.requested_image_count = request.n || 1;
-    attributes.resolution = request.size || "1024x1024";
-    attributes.quality = request.quality;
-    attributes.style = request.style;
-    attributes.response_format = request.response_format || "url";
-    attributes.revised_prompt_provided = response.data?.[0]?.revised_prompt !== undefined;
+    attributes.revised_prompt_provided = response?.data?.[0]?.revised_prompt !== undefined;
   } else if (operationSubtype === "edit") {
-    attributes.requested_image_count = request.n || 1;
-    attributes.resolution = request.size || "1024x1024";
-    attributes.response_format = request.response_format || "url";
     attributes.has_mask = request.mask !== undefined;
-  } else {
-    attributes.requested_image_count = request.n || 1;
-    attributes.resolution = request.size || "1024x1024";
-    attributes.response_format = request.response_format || "url";
   }
 
   return {
@@ -171,19 +191,22 @@ export function buildImagePayload(
     responseTime: now,
     requestDuration: duration,
     completionStartTime: now,
-    inputTokenCount: null,
-    outputTokenCount: null,
-    totalTokenCount: null,
+    inputTokenCount: extra?.tokens?.input ?? null,
+    outputTokenCount: extra?.tokens?.output ?? null,
+    totalTokenCount: extra?.tokens?.total ?? null,
     reasoningTokenCount: undefined,
     cacheCreationTokenCount: undefined,
     cacheReadTokenCount: undefined,
-    stopReason: "END",
-    isStreamed: false,
-    timeToFirstToken: undefined,
+    stopReason: extra?.failed ? ERROR_STOP_REASON : (extra?.stopReason ?? "END"),
+    isStreamed: extra?.isStreamed ?? false,
+    timeToFirstToken: extra?.timeToFirstToken,
     ...metadataFields,
     operationSubtype,
-    requestedImageCount: request.n || 1,
-    actualImageCount: response.data?.length || 0,
+    requestedImageCount,
+    actualImageCount,
+    resolution,
+    quality,
+    style,
     attributes,
   };
 }
@@ -210,13 +233,15 @@ export function buildAudioPayload(
   const attributes: Record<string, unknown> = {};
   let durationSeconds: number | undefined;
   let characterCount: number | undefined;
+  let inputAudioTokenCount: number | undefined;
 
   const requestedCharacterCount = typeof request.input === "string" ? request.input.length : 0;
-  const actualDurationSeconds = typeof response.duration === "number" ? response.duration : 0;
+  const audioUsage = readAudioUsage(response);
   const billingUnit = resolveAudioBillingUnit(
     operationSubtype,
     requestedCharacterCount,
-    actualDurationSeconds,
+    audioUsage.durationSeconds,
+    audioUsage.audioTokenCount,
   );
   const producesAudio =
     operationSubtype === "tts" || operationSubtype === "speech" || operationSubtype === "synthesis";
@@ -237,13 +262,15 @@ export function buildAudioPayload(
     }
   }
 
-  attributes.billing_unit = billingUnit;
   if (billingUnit === "per_character") {
     attributes.requested_character_count = requestedCharacterCount;
     characterCount = requestedCharacterCount;
+  } else if (billingUnit === "per_token") {
+    attributes.audio_token_count = audioUsage.audioTokenCount;
+    inputAudioTokenCount = audioUsage.audioTokenCount;
   } else {
-    attributes.actual_duration_seconds = actualDurationSeconds;
-    durationSeconds = actualDurationSeconds;
+    attributes.actual_duration_seconds = audioUsage.durationSeconds;
+    durationSeconds = audioUsage.durationSeconds;
   }
 
   return {
@@ -258,9 +285,9 @@ export function buildAudioPayload(
     responseTime: now,
     requestDuration: duration,
     completionStartTime: now,
-    inputTokenCount: null,
-    outputTokenCount: null,
-    totalTokenCount: null,
+    inputTokenCount: audioUsage.inputTokenCount ?? null,
+    outputTokenCount: audioUsage.outputTokenCount ?? null,
+    totalTokenCount: audioUsage.totalTokenCount ?? null,
     reasoningTokenCount: undefined,
     cacheCreationTokenCount: undefined,
     cacheReadTokenCount: undefined,
@@ -269,10 +296,24 @@ export function buildAudioPayload(
     timeToFirstToken: undefined,
     ...metadataFields,
     operationSubtype,
+    billingUnit: toMeteringBillingUnit(billingUnit),
     durationSeconds,
     characterCount,
+    inputAudioTokenCount,
     attributes,
   };
+}
+
+export interface VideoPayloadExtra {
+  videoDurationSeconds?: number;
+  resolution?: string;
+  aspectRatio?: string;
+  quality?: string;
+  frameRate?: number;
+  serviceTier?: string;
+  region?: string;
+  asyncJobId?: string;
+  failed?: boolean;
 }
 
 export function buildVideoPayload(
@@ -284,17 +325,7 @@ export function buildVideoPayload(
   modelSource: string,
   middlewareSource: string,
   usageMetadata?: UsageMetadata,
-  extra?: {
-    videoDurationSeconds?: number;
-    resolution?: string;
-    aspectRatio?: string;
-    quality?: string;
-    frameRate?: number;
-    serviceTier?: string;
-    region?: string;
-    asyncJobId?: string;
-    errorReason?: string;
-  },
+  extra?: VideoPayloadExtra,
 ): ReveniumPayload {
   const now = new Date().toISOString();
   const requestTime = new Date(startTime).toISOString();
@@ -304,10 +335,11 @@ export function buildVideoPayload(
     metadataFields.operationSubtype,
     detectedSubtype,
   );
+  const videoDurationSeconds = extra?.failed ? 0 : extra?.videoDurationSeconds;
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_second",
-    video_duration_seconds: extra?.videoDurationSeconds || 0,
+    video_duration_seconds: videoDurationSeconds || 0,
     resolution: extra?.resolution,
     aspect_ratio: extra?.aspectRatio,
     quality: extra?.quality,
@@ -335,12 +367,13 @@ export function buildVideoPayload(
     reasoningTokenCount: undefined,
     cacheCreationTokenCount: undefined,
     cacheReadTokenCount: undefined,
-    stopReason: extra?.errorReason || "END",
+    stopReason: extra?.failed ? ERROR_STOP_REASON : "END",
     isStreamed: false,
     timeToFirstToken: undefined,
     ...metadataFields,
     operationSubtype,
-    durationSeconds: extra?.videoDurationSeconds,
+    durationSeconds: videoDurationSeconds,
+    resolution: extra?.resolution,
     attributes,
   };
 }

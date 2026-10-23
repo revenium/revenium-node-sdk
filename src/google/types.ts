@@ -32,8 +32,29 @@ export interface IGoogleStreamingResponse {
   isStreaming: boolean;
 }
 
+export interface GoogleEmbeddingUsageMetadata {
+  totalTokenCount?: number;
+  promptTokenCount?: number;
+}
+
+export interface GoogleEmbeddingStatistics {
+  tokenCount?: number;
+}
+
+export interface GoogleEmbeddingResponseFields {
+  modelVersion?: string;
+  usageMetadata?: GoogleEmbeddingUsageMetadata;
+  embeddings?: Array<{ values?: number[]; statistics?: GoogleEmbeddingStatistics }>;
+}
+
 export interface IGoogleEmbeddingResponse {
-  embedding: number[] | { embedding: number[]; modelVersion: string; usageMetadata: any };
+  embedding:
+    | number[]
+    | {
+        embedding: number[];
+        modelVersion: string;
+        usageMetadata: GoogleEmbeddingUsageMetadata;
+      };
 }
 
 export interface IImageGenerationRequest {

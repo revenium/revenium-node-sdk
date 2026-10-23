@@ -1,6 +1,10 @@
 import { createFalClient } from "@fal-ai/client";
 import type { FalClient } from "@fal-ai/client";
 import { getLogger } from "../_core/config/manager.js";
+import { validateConfig } from "../_core/config/validator.js";
+import { runWithCallConfig } from "../_core/config/call-config.js";
+import type { ReveniumConfig } from "../_core/types/index.js";
+import { toClientReveniumConfig } from "./config.js";
 import { detectMediaType } from "./media-type-detector.js";
 import { trackFalUsageAsync } from "./tracking.js";
 import type { FalConfig, FalUsageMetadata } from "./types.js";
@@ -8,9 +12,12 @@ import type { FalConfig, FalUsageMetadata } from "./types.js";
 export class ReveniumFal {
   private client: FalClient;
   private falConfig: FalConfig;
+  private reveniumConfig: ReveniumConfig;
 
   constructor(config: FalConfig, falClientConfig?: Parameters<typeof createFalClient>[0]) {
     this.falConfig = config;
+    this.reveniumConfig = toClientReveniumConfig(config);
+    validateConfig(this.reveniumConfig);
     this.client = createFalClient({
       ...(config.falApiKey ? { credentials: config.falApiKey } : {}),
       ...falClientConfig,
@@ -26,6 +33,16 @@ export class ReveniumFal {
   }
 
   async run<T = any>(
+    endpointId: string,
+    options: Record<string, any>,
+    usageMetadata?: FalUsageMetadata,
+  ): Promise<{ data: T; requestId: string }> {
+    return runWithCallConfig(this.reveniumConfig, () =>
+      this.meteredRun(endpointId, options, usageMetadata),
+    );
+  }
+
+  private async meteredRun<T = any>(
     endpointId: string,
     options: Record<string, any>,
     usageMetadata?: FalUsageMetadata,
@@ -56,6 +73,16 @@ export class ReveniumFal {
     options: Record<string, any>,
     usageMetadata?: FalUsageMetadata,
   ): Promise<{ data: T; requestId: string }> {
+    return runWithCallConfig(this.reveniumConfig, () =>
+      this.meteredSubscribe(endpointId, options, usageMetadata),
+    );
+  }
+
+  private async meteredSubscribe<T = any>(
+    endpointId: string,
+    options: Record<string, any>,
+    usageMetadata?: FalUsageMetadata,
+  ): Promise<{ data: T; requestId: string }> {
     const startTime = Date.now();
 
     const result = await this.client.subscribe(endpointId, options);
@@ -82,6 +109,16 @@ export class ReveniumFal {
     options: Record<string, any>,
     usageMetadata?: FalUsageMetadata,
   ): Promise<any> {
+    return runWithCallConfig(this.reveniumConfig, () =>
+      this.meteredStream<T>(endpointId, options, usageMetadata),
+    );
+  }
+
+  private async meteredStream<T = any>(
+    endpointId: string,
+    options: Record<string, any>,
+    usageMetadata?: FalUsageMetadata,
+  ): Promise<any> {
     const startTime = Date.now();
     const logger = getLogger();
 
@@ -96,16 +133,18 @@ export class ReveniumFal {
           : rawResult;
       const operationType = detectMediaType(endpointId, resultData);
 
-      trackFalUsageAsync({
-        endpointId,
-        operationType,
-        startTime,
-        duration,
-        input: (options.input as Record<string, unknown>) || {},
-        result: resultData || {},
-        isStreamed: true,
-        usageMetadata: this.mergeConfigDefaults(usageMetadata),
-      });
+      runWithCallConfig(this.reveniumConfig, () =>
+        trackFalUsageAsync({
+          endpointId,
+          operationType,
+          startTime,
+          duration,
+          input: (options.input as Record<string, unknown>) || {},
+          result: resultData || {},
+          isStreamed: true,
+          usageMetadata: this.mergeConfigDefaults(usageMetadata),
+        }),
+      );
     });
 
     falStream.on("error", (error: unknown) => {

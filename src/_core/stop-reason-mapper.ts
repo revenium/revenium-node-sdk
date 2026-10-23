@@ -1,3 +1,5 @@
+export const ERROR_STOP_REASON = "ERROR";
+
 const STOP_REASON_MAP: Record<string, string> = {
   stop: "END",
   function_call: "END_SEQUENCE",
@@ -8,14 +10,15 @@ const STOP_REASON_MAP: Record<string, string> = {
   cost_limit: "COST_LIMIT",
   completion_limit: "COMPLETION_LIMIT",
   content_filter: "CONTENT_FILTER",
-  error: "ERROR",
+  error: ERROR_STOP_REASON,
   cancelled: "CANCELLED",
   canceled: "CANCELLED",
   end_turn: "END",
   stop_sequence: "END_SEQUENCE",
   tool_use: "END_SEQUENCE",
   pause_turn: "END",
-  refusal: "ERROR",
+  compaction: "END",
+  refusal: ERROR_STOP_REASON,
   model_context_window_exceeded: "TOKEN_LIMIT",
 };
 

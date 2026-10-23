@@ -1,5 +1,6 @@
 export { GoogleGenAIController } from "./controller.js";
 export { GoogleGenAIService } from "./service.js";
+export { initialize, configure, isInitialized } from "../config.js";
 
 export type {
   GoogleUsageMetadata,

@@ -1,6 +1,7 @@
 import { clearConfig, getConfig, getLogger, setConfig } from "../_core/config/manager.js";
 import { loadConfigFromEnv as loadCoreConfigFromEnv } from "../_core/config/loader.js";
 import { validateConfig } from "../_core/config/validator.js";
+import { applyDefined } from "../_core/config/client-config.js";
 import { ENV_VARS } from "../_core/constants.js";
 import { getErrorMessage } from "../_core/resilience/error-handler.js";
 import type { Logger, ReveniumConfig } from "../_core/types/index.js";
@@ -12,6 +13,7 @@ import {
   setLiteLLMConfig,
   getLiteLLMConfig,
 } from "./http-client.js";
+import { resetMeteringWarnings } from "../_core/metering/metering-context.js";
 import type { LiteLLMConfig, MiddlewareStatus } from "./types.js";
 
 let isInitialized = false;
@@ -32,16 +34,6 @@ function readNonNegativeIntEnv(name: string, logger: Logger): number | undefined
 
   logger.warn(`Ignoring ${name}="${rawValue}" - expected a non-negative integer`);
   return undefined;
-}
-
-function applyDefined(base: ReveniumConfig, overrides: Partial<ReveniumConfig>): ReveniumConfig {
-  const merged: ReveniumConfig = { ...base };
-
-  for (const [key, value] of Object.entries(overrides)) {
-    if (value !== undefined) Reflect.set(merged, key, value);
-  }
-
-  return merged;
 }
 
 function loadConfigFromEnv(): LoadedConfig | null {
@@ -104,7 +96,7 @@ function install(litellm: LiteLLMConfig, shared: ReveniumConfig, logger: Logger)
   setLiteLLMConfig(litellm);
   sharedConfigBeforeInstall = getConfig();
   setConfig(shared);
-  installedSharedConfig = shared;
+  installedSharedConfig = getConfig();
   isInitialized = true;
   return true;
 }
@@ -180,6 +172,7 @@ export function disable(): boolean {
 
 export function reset(): void {
   isInitialized = false;
+  resetMeteringWarnings();
   resetHttpClientManager();
   restoreSharedConfig();
 }

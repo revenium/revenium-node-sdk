@@ -1,3 +1,5 @@
+import type { EnforcementFilter } from "./filters.js";
+
 export type EnforcementAction = "BLOCK" | "THROTTLE" | "WARN_ONLY";
 export type BudgetWindow = "DAILY" | "WEEKLY" | "MONTHLY" | "QUARTERLY";
 
@@ -20,14 +22,7 @@ export interface EnforcementRule {
   action: EnforcementAction;
   breached: boolean;
   shadowMode: boolean;
-  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
-  subscriberId?: string;
-  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
-  productName?: string;
-  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
-  model?: string;
-  /** @deprecated Never populated by the server; kept so published typings stay compatible. */
-  provider?: string;
+  filters: EnforcementFilter[];
   groupBy?: string;
   departmentId?: number;
   groupBreakdown?: EnforcementGroupEntry[];

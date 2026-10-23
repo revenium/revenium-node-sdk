@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { ReveniumPayload } from "../types/index.js";
-import { getConfig, getLogger } from "../config/manager.js";
+import { getLogger } from "../config/manager.js";
+import { resolveConfig } from "../config/call-config.js";
 import { buildReveniumUrl } from "./url-builder.js";
 import { DEFAULT_REVENIUM_BASE_URL, API_ENDPOINTS, DEFAULT_CONFIG } from "../constants.js";
 import { executeWithMeteringCircuitBreaker } from "../resilience/circuit-breaker.js";
@@ -8,7 +9,7 @@ import { withRetry, HttpError, parseRetryAfter } from "../resilience/retry.js";
 import { getMeteringBuffer, shouldBufferError } from "./buffer.js";
 
 export async function sendToRevenium(payload: ReveniumPayload): Promise<void> {
-  const config = getConfig();
+  const config = resolveConfig();
   const logger = getLogger();
 
   if (!config) {

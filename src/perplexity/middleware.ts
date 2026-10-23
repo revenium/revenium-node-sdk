@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { randomUUID } from "crypto";
-import { UsageMetadata } from "../_core/types/index.js";
+import { Config, UsageMetadata } from "../_core/types/index.js";
 import { getLogger } from "../_core/config/manager.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import { buildPayload } from "../_core/metering/payload-builder.js";
@@ -12,6 +12,8 @@ import {
   getMaxPromptSize,
   extractPrompts,
 } from "../_core/prompt/extraction.js";
+import { runProviderCall } from "../_core/metering/metering-context.js";
+import { resolveConfig, runWithCallConfig } from "../_core/config/call-config.js";
 import type { PerplexityCost } from "./types.js";
 
 interface PerplexityCompletionResponse {
@@ -30,6 +32,10 @@ interface PerplexityCompletionResponse {
 }
 
 const MIDDLEWARE_SOURCE = "revenium-perplexity-node";
+
+export type TrackUsageFn = typeof trackUsageAsync;
+
+const skipTracking: TrackUsageFn = () => undefined;
 
 export function trackUsageAsync(trackingData: {
   requestId: string;
@@ -131,6 +137,10 @@ export class StreamingWrapper implements AsyncIterable<any> {
   private responseFormat?: { type: string; json_schema?: { name: string } } | string;
   private messages: any;
   private accumulatedContent: string = "";
+  private trackFn: TrackUsageFn;
+  private callConfig: Config | null;
+  private capturePrompts: boolean;
+  private maxPromptSize: number;
 
   constructor(
     stream: AsyncIterable<any>,
@@ -140,6 +150,8 @@ export class StreamingWrapper implements AsyncIterable<any> {
     metadata?: UsageMetadata,
     responseFormat?: { type: string; json_schema?: { name: string } } | string,
     messages?: any,
+    trackFn: TrackUsageFn = trackUsageAsync,
+    callConfig: Config | null = resolveConfig(),
   ) {
     this.stream = stream;
     this.model = model;
@@ -148,6 +160,14 @@ export class StreamingWrapper implements AsyncIterable<any> {
     this.metadata = metadata;
     this.responseFormat = responseFormat;
     this.messages = messages || [];
+    this.trackFn = trackFn;
+    this.callConfig = callConfig;
+    this.capturePrompts = runWithCallConfig(callConfig, () => shouldCapturePrompts(metadata));
+    this.maxPromptSize = runWithCallConfig(callConfig, getMaxPromptSize);
+  }
+
+  private track(trackingData: Parameters<TrackUsageFn>[0]): void {
+    runWithCallConfig(this.callConfig, () => this.trackFn(trackingData));
   }
 
   async *[Symbol.asyncIterator](): AsyncGenerator<any> {
@@ -167,9 +187,8 @@ export class StreamingWrapper implements AsyncIterable<any> {
           timeToFirstToken = firstChunkTime - this.startTime;
         }
 
-        if (chunk.choices?.[0]?.delta?.content && shouldCapturePrompts(this.metadata)) {
-          const maxSize = getMaxPromptSize();
-          const remaining = maxSize - this.accumulatedContent.length;
+        if (chunk.choices?.[0]?.delta?.content && this.capturePrompts) {
+          const remaining = this.maxPromptSize - this.accumulatedContent.length;
           if (remaining > 0) {
             this.accumulatedContent += chunk.choices[0].delta.content.slice(0, remaining);
           }
@@ -194,7 +213,7 @@ export class StreamingWrapper implements AsyncIterable<any> {
       completed = true;
       const duration = Date.now() - this.startTime;
 
-      trackUsageAsync({
+      this.track({
         requestId: this.transactionId,
         model: this.model,
         promptTokens: inputTokens,
@@ -216,7 +235,7 @@ export class StreamingWrapper implements AsyncIterable<any> {
       completed = true;
       const duration = Date.now() - this.startTime;
 
-      trackUsageAsync({
+      this.track({
         requestId: this.transactionId,
         model: this.model,
         promptTokens: inputTokens,
@@ -237,7 +256,7 @@ export class StreamingWrapper implements AsyncIterable<any> {
       if (!completed) {
         const duration = Date.now() - this.startTime;
 
-        trackUsageAsync({
+        this.track({
           requestId: this.transactionId,
           model: this.model,
           promptTokens: inputTokens,
@@ -261,9 +280,19 @@ export class StreamingWrapper implements AsyncIterable<any> {
 }
 
 export class CompletionsInterface {
-  constructor(private client: OpenAI) {}
+  constructor(
+    private client: OpenAI,
+    private config: Config,
+  ) {}
 
   async create(
+    params: OpenAI.Chat.ChatCompletionCreateParams,
+    metadata?: UsageMetadata,
+  ): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params, metadata));
+  }
+
+  private async meteredCreate(
     params: OpenAI.Chat.ChatCompletionCreateParams,
     metadata?: UsageMetadata,
   ): Promise<any> {
@@ -271,7 +300,14 @@ export class CompletionsInterface {
     const transactionId = randomUUID();
 
     try {
-      const response = await this.client.chat.completions.create(params);
+      const { result: response, meteredElsewhere } = await runProviderCall(
+        MIDDLEWARE_SOURCE,
+        metadata,
+        () => this.client.chat.completions.create(params),
+      );
+
+      if (meteredElsewhere) return response;
+
       const duration = Date.now() - startTime;
 
       const perplexityResponse = response as unknown as PerplexityCompletionResponse;
@@ -324,14 +360,26 @@ export class CompletionsInterface {
     params: OpenAI.Chat.ChatCompletionCreateParams,
     metadata?: UsageMetadata,
   ): Promise<StreamingWrapper> {
+    return runWithCallConfig(this.config, () => this.meteredCreateStreaming(params, metadata));
+  }
+
+  private async meteredCreateStreaming(
+    params: OpenAI.Chat.ChatCompletionCreateParams,
+    metadata?: UsageMetadata,
+  ): Promise<StreamingWrapper> {
     const startTime = Date.now();
     const transactionId = randomUUID();
 
     try {
-      const stream = await this.client.chat.completions.create({
-        ...params,
-        stream: true,
-      });
+      const { result: stream, meteredElsewhere } = await runProviderCall(
+        MIDDLEWARE_SOURCE,
+        metadata,
+        () =>
+          this.client.chat.completions.create({
+            ...params,
+            stream: true,
+          }),
+      );
 
       return new StreamingWrapper(
         stream as AsyncIterable<unknown>,
@@ -341,6 +389,8 @@ export class CompletionsInterface {
         metadata,
         params.response_format,
         params.messages,
+        meteredElsewhere ? skipTracking : trackUsageAsync,
+        this.config,
       );
     } catch (error: any) {
       const duration = Date.now() - startTime;
@@ -364,9 +414,12 @@ export class CompletionsInterface {
 }
 
 export class ChatInterface {
-  constructor(private client: OpenAI) {}
+  constructor(
+    private client: OpenAI,
+    private config: Config,
+  ) {}
 
   completions(): CompletionsInterface {
-    return new CompletionsInterface(this.client);
+    return new CompletionsInterface(this.client, this.config);
   }
 }

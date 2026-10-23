@@ -106,6 +106,19 @@ describe("buildPayload precedence", () => {
     expect(payload.ticketId).toBe("FRONT-123");
   });
 
+  it("keeps an unknown EMBED token count as null instead of zero", async () => {
+    const params = createParams({
+      operationType: "EMBED",
+      usage: { prompt_tokens: null, total_tokens: null },
+    });
+
+    const payload = await buildPayload(params);
+
+    expect(payload.inputTokenCount).toBeNull();
+    expect(payload.totalTokenCount).toBeNull();
+    expect(payload.outputTokenCount).toBe(0);
+  });
+
   it("falls back to env vars when user provides no metadata", async () => {
     process.env.REVENIUM_ENVIRONMENT = "staging";
     process.env.REVENIUM_RETRY_NUMBER = "1";
@@ -274,7 +287,7 @@ describe("multimodal operationSubtype", () => {
     const payload = buildAudio("transcription", { operationSubtype: "speech_synthesis" });
 
     expect(payload.operationSubtype).toBe("tts");
-    expect(payload.attributes?.billing_unit).toBe("per_character");
+    expect(payload.billingUnit).toBe("PER_CHARACTER");
   });
 
   it("bills a caller-corrected audio subtype by the unit that subtype implies", () => {
@@ -283,13 +296,13 @@ describe("multimodal operationSubtype", () => {
     expect(payload.operationSubtype).toBe("tts");
     expect(payload.characterCount).toBe(5);
     expect(payload.durationSeconds).toBeUndefined();
-    expect(payload.attributes?.billing_unit).toBe("per_character");
+    expect(payload.billingUnit).toBe("PER_CHARACTER");
   });
 
   it("bills a synthesis subtype per second instead of inheriting transcription billing", () => {
     const payload = buildAudio("synthesis");
 
-    expect(payload.attributes?.billing_unit).toBe("per_second");
+    expect(payload.billingUnit).toBe("PER_SECOND");
     expect(payload.durationSeconds).toBe(42);
     expect(payload.characterCount).toBeUndefined();
   });
@@ -308,8 +321,318 @@ describe("multimodal operationSubtype", () => {
     );
 
     expect(payload.operationSubtype).toBe("tts");
-    expect(payload.attributes?.billing_unit).toBe("per_second");
+    expect(payload.billingUnit).toBe("PER_SECOND");
     expect(payload.durationSeconds).toBe(42);
     expect(payload.characterCount).toBeUndefined();
+  });
+
+  const buildTranscription = (response: unknown, request: Record<string, unknown> = {}) =>
+    buildAudioPayload(
+      "transcription",
+      response,
+      { model: "whisper-1", ...request },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+    );
+
+  it("bills a transcription by the seconds the provider reports in its usage object", () => {
+    const payload = buildTranscription({ text: "hello", usage: { type: "duration", seconds: 2 } });
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(2);
+    expect(payload.attributes?.actual_duration_seconds).toBe(2);
+  });
+
+  it("bills a translation by the seconds the provider reports", () => {
+    const payload = buildAudioPayload(
+      "translation",
+      { text: "hello", usage: { type: "duration", seconds: 3 } },
+      { model: "whisper-1" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+    );
+
+    expect(payload.operationSubtype).toBe("translation");
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(3);
+  });
+
+  it("bills a token-metered transcription by its audio input tokens", () => {
+    const payload = buildTranscription({
+      text: "hello",
+      usage: {
+        type: "tokens",
+        total_tokens: 26,
+        input_tokens: 19,
+        input_token_details: { text_tokens: 0, audio_tokens: 19 },
+        output_tokens: 7,
+      },
+    });
+
+    expect(payload.billingUnit).toBe("PER_TOKEN");
+    expect(payload.inputAudioTokenCount).toBe(19);
+    expect(payload.inputTokenCount).toBe(19);
+    expect(payload.outputTokenCount).toBe(7);
+    expect(payload.totalTokenCount).toBe(26);
+    expect(payload.outputAudioTokenCount).toBeUndefined();
+    expect(payload.durationSeconds).toBeUndefined();
+    expect(payload.attributes?.audio_token_count).toBe(19);
+  });
+
+  it.each([
+    ["without an input token breakdown", { type: "tokens", input_tokens: 19, output_tokens: 7 }],
+    [
+      "reporting no audio tokens",
+      {
+        type: "tokens",
+        input_tokens: 19,
+        input_token_details: { text_tokens: 19, audio_tokens: 0 },
+        output_tokens: 7,
+      },
+    ],
+  ])("never bills text tokens at the audio token rate when usage arrives %s", (_case, usage) => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const payload = buildTranscription({ text: "hello", usage });
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.inputAudioTokenCount).toBeUndefined();
+    expect(payload.inputTokenCount).toBe(19);
+    expect(payload.outputTokenCount).toBe(7);
+    expect(payload.totalTokenCount).toBe(26);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("warns and falls back to the response duration when the usage shape is unrecognized", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const payload = buildTranscription({ text: "hello", duration: 9, usage: { type: "credits" } });
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(9);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("keeps billing a verbose_json transcription by its top-level duration", () => {
+    const payload = buildTranscription(
+      { text: "hello", duration: 42 },
+      {
+        response_format: "verbose_json",
+      },
+    );
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(42);
+    expect(payload.inputTokenCount).toBeNull();
+    expect(payload.inputAudioTokenCount).toBeUndefined();
+  });
+
+  it("bills a verbose_json transcription by the provider usage seconds over the response duration", () => {
+    const payload = buildTranscription(
+      { text: "hello", duration: 2.4, usage: { type: "duration", seconds: 3 } },
+      { response_format: "verbose_json" },
+    );
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(3);
+    expect(payload.attributes?.actual_duration_seconds).toBe(3);
+  });
+
+  it("meters a plain-text transcription response without throwing", () => {
+    const payload = buildTranscription("hello", { response_format: "text" });
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(0);
+    expect(payload.inputAudioTokenCount).toBeUndefined();
+    expect(payload.inputTokenCount).toBeNull();
+    expect(payload.outputTokenCount).toBeNull();
+  });
+
+  it("bills a speech call by the characters the caller sent", () => {
+    const payload = buildAudioPayload(
+      "tts",
+      {},
+      { model: "gpt-4o-mini-tts", input: "twenty one characters", voice: "alloy" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+    );
+
+    expect(payload.billingUnit).toBe("PER_CHARACTER");
+    expect(payload.characterCount).toBe(21);
+    expect(payload.durationSeconds).toBeUndefined();
+  });
+
+  it("bills no seconds for a failed video and marks it as an error", () => {
+    const payload = buildVideoPayload(
+      "generation",
+      { model: "veo-001" },
+      Date.now() - 1000,
+      1000,
+      "Google",
+      "GOOGLE_VERTEX_AI",
+      "revenium-google-node",
+      undefined,
+      { videoDurationSeconds: 8, failed: true },
+    );
+
+    expect(payload.stopReason).toBe("ERROR");
+    expect(payload.durationSeconds).toBe(0);
+    expect(payload.attributes?.video_duration_seconds).toBe(0);
+  });
+
+  it("bills the requested seconds for a successful video", () => {
+    const payload = buildVideo("generation");
+
+    expect(payload.stopReason).toBe("END");
+    expect(payload.durationSeconds).toBe(8);
+    expect(payload.attributes?.video_duration_seconds).toBe(8);
+  });
+
+  it("produces no image for a failed image call and marks it as an error", () => {
+    const payload = buildImagePayload(
+      "generation",
+      { data: [{ url: "https://example.com/1.png" }] },
+      { n: 1, model: "dall-e-3", size: "1024x1024" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+      undefined,
+      { failed: true },
+    );
+
+    expect(payload.stopReason).toBe("ERROR");
+    expect(payload.actualImageCount).toBe(0);
+    expect(payload.attributes?.actual_image_count).toBe(0);
+  });
+
+  it("counts the produced images for a successful image call", () => {
+    const payload = buildImage("generation");
+
+    expect(payload.stopReason).toBe("END");
+    expect(payload.actualImageCount).toBe(1);
+    expect(payload.attributes?.actual_image_count).toBe(1);
+  });
+});
+
+describe("pricing fields at the top level", () => {
+  it("prefers the size and quality the response reports over an auto request", () => {
+    const payload = buildImagePayload(
+      "generation",
+      { data: [{ url: "https://example.com/1.png" }], size: "1536x1024", quality: "high" },
+      { n: 1, model: "gpt-image-1", size: "auto", quality: "auto" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+    );
+
+    expect(payload.resolution).toBe("1536x1024");
+    expect(payload.quality).toBe("high");
+    expect(payload.attributes?.resolution).toBe("1536x1024");
+    expect(payload.attributes?.quality).toBe("high");
+  });
+
+  it("reports resolution, quality and style top-level and in attributes for a generation", () => {
+    const payload = buildImagePayload(
+      "generation",
+      { data: [{ url: "https://example.com/1.png" }] },
+      { n: 1, model: "dall-e-3", size: "1792x1024", quality: "hd", style: "vivid" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+    );
+
+    expect(payload.resolution).toBe("1792x1024");
+    expect(payload.quality).toBe("hd");
+    expect(payload.style).toBe("vivid");
+    expect(payload.attributes?.resolution).toBe("1792x1024");
+    expect(payload.attributes?.quality).toBe("hd");
+    expect(payload.attributes?.style).toBe("vivid");
+  });
+
+  it("keeps the default resolution in attributes only when the request has no size", () => {
+    const payload = buildImagePayload(
+      "upscale",
+      { data: [{ url: "https://example.com/1.png" }] },
+      { n: 1, model: "imagen-3.0-generate-002", quality: "standard" },
+      Date.now() - 1000,
+      1000,
+      "Google",
+      "GOOGLE_VERTEX_AI",
+      "revenium-google-node",
+    );
+
+    expect(payload.resolution).toBeUndefined();
+    expect(payload.attributes?.resolution).toBe("1024x1024");
+    expect(JSON.parse(JSON.stringify(payload))).not.toHaveProperty("resolution");
+  });
+
+  it("reports resolution and quality for a failed image call", () => {
+    const payload = buildImagePayload(
+      "generation",
+      { data: [] },
+      { n: 1, model: "dall-e-3", size: "1792x1024", quality: "hd" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+      undefined,
+      { failed: true },
+    );
+
+    expect(payload.actualImageCount).toBe(0);
+    expect(payload.resolution).toBe("1792x1024");
+    expect(payload.quality).toBe("hd");
+  });
+
+  it("omits quality from the serialized body of an edit without quality", () => {
+    const payload = buildImagePayload(
+      "edit",
+      { data: [{ url: "https://example.com/1.png" }] },
+      { n: 1, model: "dall-e-2", size: "1024x1024" },
+      Date.now() - 1000,
+      1000,
+      "OpenAI",
+      "OPENAI",
+      "revenium-openai-node",
+    );
+
+    expect(JSON.parse(JSON.stringify(payload))).not.toHaveProperty("quality");
+  });
+
+  it("reports video resolution top-level and leaves quality to attributes only", () => {
+    const payload = buildVideoPayload(
+      "generation",
+      { model: "veo-001" },
+      Date.now() - 1000,
+      1000,
+      "Google",
+      "GOOGLE_VERTEX_AI",
+      "revenium-google-node",
+      undefined,
+      { videoDurationSeconds: 8, resolution: "1080p", quality: "high" },
+    );
+
+    expect(payload.resolution).toBe("1080p");
+    expect(payload.quality).toBeUndefined();
+    expect(payload.attributes?.resolution).toBe("1080p");
+    expect(payload.attributes?.quality).toBe("high");
   });
 });

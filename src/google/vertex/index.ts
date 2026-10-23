@@ -1,5 +1,6 @@
 export { VertexAIController } from "./controller.js";
 export { VertexAIService } from "./service.js";
+export { initialize, configure, isInitialized } from "../config.js";
 
 export type {
   GoogleUsageMetadata,

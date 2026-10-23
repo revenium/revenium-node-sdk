@@ -2,6 +2,7 @@ import OpenAI, { AzureOpenAI } from "openai";
 import { Config } from "../_core/types/index.js";
 import { getLogger, getConfig, setConfig, initializeConfig } from "../_core/config/manager.js";
 import { validateConfig } from "../_core/config/validator.js";
+import { snapshotClientConfig } from "../_core/config/client-config.js";
 import { DEFAULT_REVENIUM_BASE_URL } from "../_core/constants.js";
 import { startEnforcementPolling, stopEnforcementPolling } from "../_core/enforcement/engine.js";
 import {
@@ -15,6 +16,10 @@ import {
 } from "./middleware.js";
 import { Provider, ProviderInfo, detectProviderFromConfig } from "./provider-detection.js";
 import { AzureConfig, loadAzureConfigFromEnv } from "./azure-config.js";
+import { resetMeteringWarnings } from "../_core/metering/metering-context.js";
+
+const lateBoundGlobalFetch: typeof globalThis.fetch = (input, init) =>
+  globalThis.fetch(input, init);
 
 export interface OpenAIConfig extends Config {
   azure?: AzureConfig;
@@ -25,29 +30,34 @@ export class ReveniumOpenAI {
   private client: OpenAI | AzureOpenAI;
   private config: OpenAIConfig;
   private providerInfo: ProviderInfo;
+  private responsesInterface?: ResponsesInterface;
 
   constructor(config: OpenAIConfig, provider: Provider) {
     const logger = getLogger();
-    this.config = config;
 
-    if (provider === Provider.AZURE_OPENAI) {
-      if (!config.azure) {
-        throw new Error("Azure configuration required for Azure OpenAI provider");
-      }
+    const azure = provider === Provider.AZURE_OPENAI ? config.azure : undefined;
+    if (provider === Provider.AZURE_OPENAI && !azure) {
+      throw new Error("Azure configuration required for Azure OpenAI provider");
+    }
 
+    this.config = snapshotClientConfig(config);
+    validateConfig(this.config);
+
+    if (azure) {
       this.client = new AzureOpenAI({
-        apiKey: config.azure.apiKey,
-        endpoint: config.azure.endpoint,
-        apiVersion: config.azure.apiVersion,
+        apiKey: azure.apiKey,
+        endpoint: azure.endpoint,
+        apiVersion: azure.apiVersion,
+        fetch: lateBoundGlobalFetch,
       });
 
       this.providerInfo = {
         provider: Provider.AZURE_OPENAI,
         isAzure: true,
-        azureConfig: config.azure,
+        azureConfig: azure,
       };
     } else {
-      this.client = new OpenAI({ apiKey: config.openaiApiKey });
+      this.client = new OpenAI({ apiKey: config.openaiApiKey, fetch: lateBoundGlobalFetch });
       this.providerInfo = { provider: Provider.OPENAI, isAzure: false };
     }
 
@@ -66,7 +76,8 @@ export class ReveniumOpenAI {
   }
 
   responses(): ResponsesInterface {
-    return new ResponsesInterface(this.client, this.config, this.providerInfo);
+    this.responsesInterface ??= new ResponsesInterface(this.client, this.config, this.providerInfo);
+    return this.responsesInterface;
   }
 
   images(): ImagesInterface {
@@ -157,6 +168,7 @@ export function IsInitialized(): boolean {
 
 export function Reset(): void {
   stopEnforcementPolling();
+  resetMeteringWarnings();
   globalClient = null;
 }
 

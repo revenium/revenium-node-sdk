@@ -6,6 +6,7 @@ import {
   EnforcementRule,
   getSnapshot,
 } from "./cache.js";
+import { ruleCovers, ruleCoversBeyondDepartment } from "./filters.js";
 import { normalizeIdentityKey } from "./identity.js";
 
 export interface EnforcementCriteria {
@@ -14,6 +15,10 @@ export interface EnforcementCriteria {
   productName?: string;
   model?: string;
   provider?: string;
+  agent?: string;
+  taskType?: string;
+  organizationName?: string;
+  credential?: string;
 }
 
 // Department-block rows are keyed by the normalized identity, while
@@ -99,6 +104,8 @@ function enforceDepartmentBlock(
       continue;
     }
 
+    if (!ruleCoversBeyondDepartment(cached.rule.filters, criteria)) continue;
+
     applyDecision(
       cached.rule,
       snapshot.departmentBlockBalances.get(key) ?? cached.rule.currentValue,
@@ -119,6 +126,7 @@ export function enforcePreCallRules(criteria: EnforcementCriteria): void {
 
     const currentValue = breachedValueFor(cached, keys);
     if (currentValue === null) continue;
+    if (!ruleCovers(cached.rule.filters, criteria)) continue;
 
     applyDecision(cached.rule, currentValue, criteria);
   }

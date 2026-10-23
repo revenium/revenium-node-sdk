@@ -1,14 +1,19 @@
 import { randomUUID } from "crypto";
 import { getLogger } from "../_core/config/manager.js";
+import { resolveConfig, runWithCallConfig } from "../_core/config/call-config.js";
 import {
   trackUsageAsync,
   trackEmbeddingsUsageAsync,
   extractMetadataFromHeaders,
+  mergeCallMetadata,
   extractUsageFromResponse,
+  MIDDLEWARE_SOURCE,
 } from "./tracking.js";
+import { claimMetering, getCallUsageMetadata } from "../_core/metering/metering-context.js";
 import { StreamingResponseParser } from "./sse-parser.js";
 import type {
   LiteLLMConfig,
+  LiteLLMUsageMetadata,
   RequestBody,
   RequestContext,
   LiteLLMChatCompletionRequest,
@@ -268,6 +273,20 @@ async function handleSuccessfulResponse(
   }
 }
 
+function withOrganizationDefaults(
+  metadata: LiteLLMUsageMetadata,
+  config: LiteLLMConfig,
+): LiteLLMUsageMetadata {
+  return {
+    ...metadata,
+    organizationName:
+      metadata.organizationName ||
+      metadata.organizationId ||
+      config.organizationName ||
+      config.organizationId,
+  };
+}
+
 function createPatchedFetch(): typeof fetch {
   return async function patchedFetch(input: any, init?: RequestInit): Promise<Response> {
     const logger = getLogger();
@@ -287,9 +306,13 @@ function createPatchedFetch(): typeof fetch {
       headers: rawHeaders,
       body: (init?.body as RequestBody) || null,
       startTime: Date.now(),
-      metadata: extractMetadataFromHeaders(rawHeaders),
+      metadata: withOrganizationDefaults(
+        mergeCallMetadata(extractMetadataFromHeaders(rawHeaders), getCallUsageMetadata()),
+        litellmConfig,
+      ),
     };
 
+    const callConfig = resolveConfig();
     const requestId = randomUUID();
 
     try {
@@ -300,11 +323,13 @@ function createPatchedFetch(): typeof fetch {
       if (!originalFetch) throw new Error("Original fetch function not available");
 
       const response = await originalFetch(input, { ...init, headers });
-      const duration = Date.now() - requestContext.startTime;
-      const responseClone = response.clone();
 
       if (response.ok && requestContext.method === "POST") {
-        handleSuccessfulResponse(requestContext, response, responseClone, requestId, duration);
+        const duration = Date.now() - requestContext.startTime;
+        claimMetering(MIDDLEWARE_SOURCE);
+        void runWithCallConfig(callConfig, () =>
+          handleSuccessfulResponse(requestContext, response, response.clone(), requestId, duration),
+        );
       }
 
       return response;

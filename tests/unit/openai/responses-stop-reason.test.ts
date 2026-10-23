@@ -1,3 +1,4 @@
+import { Stream } from "openai/core/streaming";
 import { createReveniumConfig } from "../../helpers/fixtures";
 import {
   isTerminalResponseStatus,
@@ -98,21 +99,35 @@ describe("mapResponsesStatusToStopReason", () => {
 describe("ResponsesInterface stop reason metering", () => {
   const warn = jest.fn();
 
-  function buildResponse(status: string, incompleteReason?: string): Record<string, unknown> {
+  function buildResponse(
+    status: string,
+    incompleteReason?: string,
+    usage: Record<string, number> | null = { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+  ): Record<string, unknown> {
     return {
       id: "resp-stop-001",
       model: "gpt-4o-mini",
       status,
       incomplete_details: incompleteReason ? { reason: incompleteReason } : null,
-      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+      usage: usage ?? undefined,
     };
   }
 
-  function buildInterface(create: jest.Mock): InstanceType<typeof ResponsesInterface> {
-    return new ResponsesInterface({ responses: { create } } as any, createReveniumConfig(), {
+  function buildInterfaceFor(
+    responses: Record<string, jest.Mock>,
+  ): InstanceType<typeof ResponsesInterface> {
+    return new ResponsesInterface({ responses } as any, createReveniumConfig(), {
       provider: Provider.OPENAI,
       isAzure: false,
     });
+  }
+
+  function buildInterface(create: jest.Mock): InstanceType<typeof ResponsesInterface> {
+    return buildInterfaceFor({ create });
+  }
+
+  function buildCollectingInterface(retrieve: jest.Mock): InstanceType<typeof ResponsesInterface> {
+    return buildInterfaceFor({ create: jest.fn(), retrieve });
   }
 
   beforeEach(async () => {
@@ -264,6 +279,275 @@ describe("ResponsesInterface stop reason metering", () => {
     expect(sendToRevenium).not.toHaveBeenCalled();
   });
 
+  it("meters a collected background response exactly once", async () => {
+    const create = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "queued" });
+    const retrieve = jest.fn().mockResolvedValue({
+      id: "resp_stub",
+      model: "gpt-4o-mini",
+      status: "completed",
+      usage: { input_tokens: 333, output_tokens: 44, total_tokens: 377 },
+    });
+    const responses = buildInterfaceFor({ create, retrieve });
+
+    await responses.create({ model: "gpt-4o-mini", input: "hello", background: true });
+    await responses.retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledTimes(1);
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({
+        transactionId: "resp_stub",
+        inputTokenCount: 333,
+        outputTokenCount: 44,
+        stopReason: "END",
+      }),
+    );
+  });
+
+  it("does not meter a second collection of the same response", async () => {
+    const retrieve = jest.fn().mockResolvedValue({
+      id: "resp_stub",
+      model: "gpt-4o-mini",
+      status: "completed",
+      usage: { input_tokens: 333, output_tokens: 44, total_tokens: 377 },
+    });
+    const responses = buildCollectingInterface(retrieve);
+
+    await responses.retrieve("resp_stub");
+    await responses.retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledTimes(1);
+  });
+
+  it("meters a response without a status", async () => {
+    const create = jest.fn().mockResolvedValue({
+      id: "resp_stub",
+      model: "gpt-4o-mini",
+      usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+    });
+
+    await buildInterface(create).create({ model: "gpt-4o-mini", input: "hello" });
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({
+        transactionId: "resp_stub",
+        inputTokenCount: 12,
+        outputTokenCount: 3,
+      }),
+    );
+  });
+
+  it("does not meter a collection of a response already metered by its create", async () => {
+    const completed = {
+      id: "resp_stub",
+      model: "gpt-4o-mini",
+      status: "completed",
+      usage: { input_tokens: 333, output_tokens: 44, total_tokens: 377 },
+    };
+    const responses = buildInterfaceFor({
+      create: jest.fn().mockResolvedValue(completed),
+      retrieve: jest.fn().mockResolvedValue(completed),
+    });
+
+    await responses.create({ model: "gpt-4o-mini", input: "hello" });
+    await responses.retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the response-derived idempotency key from create as well", async () => {
+    const create = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" });
+
+    await buildInterface(create).create({ model: "gpt-4o-mini", input: "hello" });
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ idempotencyKey: "openai-response-resp_stub" }),
+    );
+  });
+
+  it("carries the metadata given at create into the collected record", async () => {
+    const responses = buildInterfaceFor({
+      create: jest
+        .fn()
+        .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "queued" }),
+      retrieve: jest
+        .fn()
+        .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" }),
+    });
+
+    await responses.create(
+      { model: "gpt-4o-mini", input: "hello", background: true },
+      { organizationName: "org_1", traceId: "trace_1" },
+    );
+    await responses.retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ organizationName: "org_1", traceId: "trace_1" }),
+    );
+  });
+
+  it("lets collection metadata override the metadata given at create", async () => {
+    const responses = buildInterfaceFor({
+      create: jest
+        .fn()
+        .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "queued" }),
+      retrieve: jest
+        .fn()
+        .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" }),
+    });
+
+    await responses.create(
+      { model: "gpt-4o-mini", input: "hello", background: true },
+      { organizationName: "org_1" },
+    );
+    await responses.retrieve("resp_stub", { organizationName: "org_2" });
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ organizationName: "org_2" }),
+    );
+  });
+
+  it("reports the job wall time as the duration of a collected response", async () => {
+    const retrieve = jest.fn().mockResolvedValue({
+      id: "resp_stub",
+      model: "gpt-4o-mini",
+      status: "completed",
+      created_at: 1_700_000_000,
+      completed_at: 1_700_000_030,
+    });
+
+    await buildCollectingInterface(retrieve).retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ requestDuration: 30_000 }),
+    );
+  });
+
+  it("falls back to the collection latency when the job has no timestamps", async () => {
+    const retrieve = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" });
+
+    await buildCollectingInterface(retrieve).retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ requestDuration: expect.any(Number) }),
+    );
+    const [[payload]] = jest.mocked(sendToRevenium).mock.calls;
+    expect(payload.requestDuration).toBeLessThan(5_000);
+  });
+
+  it("allows a later collection when the metering delivery failed", async () => {
+    jest.mocked(sendToRevenium).mockRejectedValueOnce(new Error("metering down"));
+    const retrieve = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" });
+    const responses = buildCollectingInterface(retrieve);
+
+    await responses.retrieve("resp_stub");
+    await flushPromises();
+    await responses.retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not meter a response that is still in progress", async () => {
+    const retrieve = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "in_progress" });
+
+    await buildCollectingInterface(retrieve).retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["failed", "ERROR"],
+    ["cancelled", "CANCELLED"],
+  ])("records a collected '%s' background response as '%s'", async (status, expected) => {
+    const retrieve = jest.fn().mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status });
+
+    await buildCollectingInterface(retrieve).retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledTimes(1);
+    expect(sendToRevenium).toHaveBeenCalledWith(expect.objectContaining({ stopReason: expected }));
+  });
+
+  it("does not meter when retrieve itself throws", async () => {
+    const retrieve = jest.fn().mockRejectedValue(new Error("collection failure"));
+
+    await expect(buildCollectingInterface(retrieve).retrieve("resp_stub")).rejects.toThrow(
+      "collection failure",
+    );
+    await flushPromises();
+
+    expect(sendToRevenium).not.toHaveBeenCalled();
+  });
+
+  it("sends an idempotency key derived from the response id", async () => {
+    const retrieve = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" });
+
+    await buildCollectingInterface(retrieve).retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ idempotencyKey: "openai-response-resp_stub" }),
+    );
+  });
+
+  it("keeps an explicit idempotency key supplied by the caller", async () => {
+    const retrieve = jest
+      .fn()
+      .mockResolvedValue({ id: "resp_stub", model: "gpt-4o-mini", status: "completed" });
+
+    await buildCollectingInterface(retrieve).retrieve("resp_stub", {
+      idempotencyKey: "caller-key",
+    });
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ idempotencyKey: "caller-key" }),
+    );
+  });
+
+  it("reports reasoning tokens on a non-streaming response", async () => {
+    const create = jest.fn().mockResolvedValue({
+      id: "resp-stop-004",
+      model: "gpt-4o-mini",
+      status: "completed",
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15,
+        output_tokens_details: { reasoning_tokens: 12 },
+      },
+    });
+
+    await buildInterface(create).create({ model: "gpt-4o-mini", input: "hello" });
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ reasoningTokenCount: 12 }),
+    );
+  });
+
   it("meters a stream that throws mid-flight as ERROR", async () => {
     async function* stream() {
       yield { type: "response.output_text.delta", delta: "hi" };
@@ -395,6 +679,235 @@ describe("ResponsesInterface stop reason metering", () => {
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ stopReason: "ERROR", model: "gpt-4o-mini" }),
     );
+  });
+
+  describe("create with stream: true", () => {
+    const streamedUsage = { input_tokens: 333, output_tokens: 44, total_tokens: 377 };
+
+    function buildEventStream(usage: Record<string, number> | null): AsyncGenerator<unknown> {
+      return (async function* () {
+        yield { type: "response.output_text.delta", delta: "hel" };
+        yield { type: "response.output_text.delta", delta: "lo" };
+        yield {
+          type: "response.completed",
+          response: buildResponse("completed", undefined, usage),
+        };
+      })();
+    }
+
+    function abortableEventStream(signal: AbortSignal): AsyncGenerator<unknown> {
+      return (async function* () {
+        for (const delta of ["hel", "lo"]) {
+          if (signal.aborted) return;
+          yield { type: "response.output_text.delta", delta };
+        }
+        yield { type: "response.completed", response: buildResponse("completed") };
+      })();
+    }
+
+    async function drain(stream: unknown): Promise<void> {
+      for await (const chunk of stream as AsyncIterable<unknown>) {
+        expect(chunk).toBeDefined();
+      }
+    }
+
+    it("meters the final event usage once when the stream is drained", async () => {
+      const create = jest.fn().mockResolvedValue(buildEventStream(streamedUsage));
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+      await drain(stream);
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputTokenCount: 333,
+          outputTokenCount: 44,
+          totalTokenCount: 377,
+          isStreamed: true,
+          stopReason: "END",
+        }),
+      );
+    });
+
+    it("sends no record before the stream is read", async () => {
+      const create = jest.fn().mockResolvedValue(buildEventStream(streamedUsage));
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+      await flushPromises();
+
+      expect(sendToRevenium).not.toHaveBeenCalled();
+
+      await drain(stream);
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+    });
+
+    it("meters an abandoned stream once as CANCELLED", async () => {
+      const create = jest.fn().mockResolvedValue(buildEventStream(streamedUsage));
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+
+      for await (const chunk of stream as unknown as AsyncIterable<unknown>) {
+        expect(chunk).toBeDefined();
+        break;
+      }
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({ stopReason: "CANCELLED", isStreamed: true }),
+      );
+    });
+
+    it("meters a rejection before the stream exists once as ERROR", async () => {
+      const create = jest.fn().mockRejectedValue(new Error("stream rejected"));
+
+      await expect(
+        buildInterface(create).create({ model: "gpt-4o-mini", input: "hello", stream: true }),
+      ).rejects.toThrow("stream rejected");
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({ stopReason: "ERROR", isStreamed: true, model: "gpt-4o-mini" }),
+      );
+    });
+
+    it("returns the provider stream itself with its controller intact", async () => {
+      const controller = new AbortController();
+      const providerStream = {
+        controller,
+        iterator: () => buildEventStream(streamedUsage),
+        [Symbol.asyncIterator]() {
+          return this.iterator();
+        },
+      };
+      const create = jest.fn().mockResolvedValue(providerStream);
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+
+      expect(stream).toBe(providerStream);
+      expect(stream.controller).toBe(controller);
+
+      await drain(stream);
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({ totalTokenCount: 377, isStreamed: true }),
+      );
+    });
+
+    it("sends no extra record when the returned stream is iterated again", async () => {
+      const providerStream = {
+        iterator: () => buildEventStream(streamedUsage),
+        [Symbol.asyncIterator]() {
+          return this.iterator();
+        },
+      };
+      const create = jest.fn().mockResolvedValue(providerStream);
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+      await drain(stream);
+      await drain(stream);
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({ totalTokenCount: 377, stopReason: "END" }),
+      );
+    });
+
+    it("meters a real OpenAI Stream drained through its own read path", async () => {
+      const providerStream = new Stream(
+        () => buildEventStream(streamedUsage),
+        new AbortController(),
+      );
+      const create = jest.fn().mockResolvedValue(providerStream);
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+      await drain(stream);
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputTokenCount: 333,
+          outputTokenCount: 44,
+          totalTokenCount: 377,
+          isStreamed: true,
+          stopReason: "END",
+        }),
+      );
+    });
+
+    it("meters a real OpenAI Stream aborted through its controller as CANCELLED", async () => {
+      const controller = new AbortController();
+      const providerStream = new Stream(() => abortableEventStream(controller.signal), controller);
+      const create = jest.fn().mockResolvedValue(providerStream);
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+
+      const seen: unknown[] = [];
+      for await (const chunk of stream as AsyncIterable<unknown>) {
+        seen.push(chunk);
+        controller.abort();
+      }
+      await flushPromises();
+
+      expect(seen).toHaveLength(1);
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({ stopReason: "CANCELLED", isStreamed: true }),
+      );
+    });
+
+    it("meters a terminal event without usage as zero counts with a real stop reason", async () => {
+      const create = jest.fn().mockResolvedValue(buildEventStream(null));
+
+      const stream = await buildInterface(create).create({
+        model: "gpt-4o-mini",
+        input: "hello",
+        stream: true,
+      });
+      await drain(stream);
+      await flushPromises();
+
+      expect(sendToRevenium).toHaveBeenCalledTimes(1);
+      expect(sendToRevenium).toHaveBeenCalledWith(
+        expect.objectContaining({ totalTokenCount: 0, isStreamed: true, stopReason: "END" }),
+      );
+    });
   });
 
   it("logs no unknown stop reason warning for a successful response", async () => {

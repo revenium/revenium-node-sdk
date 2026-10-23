@@ -1,6 +1,6 @@
-jest.mock("dotenv", () => ({
-  config: jest.fn(),
-}));
+import { TEST_CWD_ENV_VAR } from "./jest.globalSetup";
+
+process.chdir(process.env[TEST_CWD_ENV_VAR] as string);
 
 const noop = () => {};
 global.console.debug = noop;

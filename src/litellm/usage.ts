@@ -12,6 +12,9 @@ export interface ExtractedUsageTokens {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  inputTokenCost?: number;
+  outputTokenCost?: number;
+  totalCost?: number;
   cachedTokens?: number;
   cacheCreationTokens?: number;
   cacheCreation5mTokens?: number;
@@ -139,6 +142,9 @@ export function extractUsageTokens(
 
   return {
     ...totals,
+    inputTokenCost: usage?.cost?.input_tokens_cost,
+    outputTokenCost: usage?.cost?.output_tokens_cost,
+    totalCost: usage?.cost?.total_cost,
     cachedTokens: cacheTokens.cacheReadTokens,
     cacheCreationTokens: cacheTokens.cacheCreationTokens,
     ...extractCacheCreationSplit(usage),
