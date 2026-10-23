@@ -1,5 +1,5 @@
 import { UsageMetadata } from "../types/index.js";
-import { getConfig } from "../config/manager.js";
+import { resolveConfig } from "../config/call-config.js";
 import { DEFAULT_CONFIG } from "../constants.js";
 
 export interface PromptData {
@@ -18,7 +18,7 @@ interface ContentBlock {
 type MessageContent = string | ContentBlock[];
 
 export function getMaxPromptSize(): number {
-  const config = getConfig();
+  const config = resolveConfig();
   if (config?.maxPromptSize && config.maxPromptSize > 0) {
     return config.maxPromptSize;
   }
@@ -37,7 +37,7 @@ export function shouldCapturePrompts(metadata?: UsageMetadata): boolean {
     return metadata.capturePrompts;
   }
 
-  const config = getConfig();
+  const config = resolveConfig();
   if (config?.capturePrompts !== undefined) {
     return config.capturePrompts;
   }

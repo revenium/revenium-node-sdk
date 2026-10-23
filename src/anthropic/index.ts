@@ -1,7 +1,9 @@
 import "./anthropic-augmentation.js";
 
-import { initializeConfig, getConfig, getLogger, setConfig } from "../_core/config/manager.js";
+import { getConfig, getLogger, setConfig } from "../_core/config/manager.js";
+import { loadConfigFromEnv } from "../_core/config/loader.js";
 import { Config } from "../_core/types/index.js";
+import { ENV_VARS } from "../_core/constants.js";
 import { patchAnthropic, unpatchAnthropic, isAnthropicPatched } from "./wrapper.js";
 import { trackUsageAsync } from "./middleware.js";
 import type { AnthropicTrackingData } from "./middleware.js";
@@ -47,14 +49,15 @@ export interface AnthropicConfig extends Config {
 }
 
 export function initialize(): void {
-  const initialized = initializeConfig();
-  if (!initialized) {
+  const envConfig = loadConfigFromEnv();
+  if (!envConfig) {
     throw new Error(
       "Failed to initialize Revenium middleware: missing required environment variables. " +
         "Set REVENIUM_METERING_API_KEY or call configure() with manual configuration.",
     );
   }
 
+  setConfig(envConfig);
   patchAnthropic();
   getLogger().info("Revenium Anthropic middleware initialized successfully");
 }
@@ -101,11 +104,20 @@ export function reset(): void {
   }
 }
 
+function hasReveniumApiKeyInEnv(): boolean {
+  return !!(process.env[ENV_VARS.REVENIUM_API_KEY] || process.env[ENV_VARS.REVENIUM_API_KEY_ALT]);
+}
+
 function autoInitialize(): void {
   try {
     initialize();
-  } catch {
-    getLogger().debug("Auto-initialization skipped, manual configuration required");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    getLogger().warn(
+      hasReveniumApiKeyInEnv()
+        ? `Revenium metering is not active - no usage records will be sent. Initialization failed: ${reason}`
+        : `Revenium metering is not active - no usage records will be sent. Set ${ENV_VARS.REVENIUM_API_KEY} (or ${ENV_VARS.REVENIUM_API_KEY_ALT}) before importing the middleware, or call configure() with a valid key.`,
+    );
   }
 }
 

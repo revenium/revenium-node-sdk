@@ -21,6 +21,7 @@ import {
   clearCache,
   getRules,
 } from "./cache.js";
+import { unevaluableFilters, type EnforcementFilter } from "./filters.js";
 import { normalizeIdentityKey } from "./identity.js";
 
 const TOO_MANY_REQUESTS = 429;
@@ -29,6 +30,7 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let polling = false;
 let warnedMissingTeamId = false;
 let backoffDelayMs: number | null = null;
+let reportedUnevaluableFilters: ReadonlySet<string> = new Set();
 
 function isRequestRejection(status: number): boolean {
   if (status < 400 || status >= 500) return false;
@@ -80,6 +82,61 @@ function parseGroupBreakdown(value: unknown): EnforcementGroupEntry[] | undefine
   return entries;
 }
 
+function isReadableFilterValue(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+// An IN list the SDK cannot read whole has to stay unevaluable: dropping its bad
+// entries would leave an empty list, which constrains nothing and would make a
+// breached cap refuse every call.
+function parseFilterValues(value: unknown): string[] | null {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) return null;
+  return value.every((entry) => typeof entry === "string") ? (value as string[]) : null;
+}
+
+function parseFilters(value: unknown): EnforcementFilter[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.map((item) => {
+    const s = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+    const values = parseFilterValues(s.values);
+    const unevaluable = !isReadableFilterValue(s.value) || values === null;
+    return {
+      dimension: typeof s.dimension === "string" ? s.dimension : "",
+      operator: typeof s.operator === "string" ? s.operator : "",
+      value: typeof s.value === "string" ? s.value : undefined,
+      values: values ?? [],
+      ...(unevaluable && { unevaluable: true }),
+    };
+  });
+}
+
+function unevaluableFilterKey(
+  ruleId: number,
+  filters: readonly { dimension: string; operator: string }[],
+): string {
+  return JSON.stringify([ruleId, filters]);
+}
+
+// The poller runs every 30s, so a rule keeps its warning to the poll that first
+// saw it and is reported again only once its unevaluable rows change.
+function reportUnevaluableFilters(rule: EnforcementRule, reported: Set<string>): void {
+  const resolvedByDepartmentBlocks = rule.departmentId !== undefined && rule.groupBy === undefined;
+  const unevaluable = unevaluableFilters(rule.filters, resolvedByDepartmentBlocks);
+  if (unevaluable.length === 0) return;
+
+  const filters = unevaluable.map(({ dimension, operator }) => ({ dimension, operator }));
+  const key = unevaluableFilterKey(rule.ruleId, filters);
+  reported.add(key);
+  if (reportedUnevaluableFilters.has(key)) return;
+
+  getLogger().warn(
+    "Cost control carries filters this SDK cannot evaluate; it blocks nobody client-side and stays enforced server-side",
+    { ruleId: rule.ruleId, filters },
+  );
+}
+
 function parseNormalizedNumberMap(
   source: Record<string, unknown>,
   name: string,
@@ -110,6 +167,7 @@ export function parseEnforcementRulesResponse(data: unknown): EnforcementSnapsho
       : [];
 
   const parsed: EnforcementRule[] = [];
+  const reported = new Set<string>();
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const s = item as Record<string, unknown>;
@@ -134,7 +192,7 @@ export function parseEnforcementRulesResponse(data: unknown): EnforcementSnapsho
       continue;
     }
 
-    parsed.push({
+    const rule: EnforcementRule = {
       ruleId,
       name: typeof s.name === "string" ? s.name : undefined,
       threshold,
@@ -143,11 +201,17 @@ export function parseEnforcementRulesResponse(data: unknown): EnforcementSnapsho
       action: action as EnforcementRule["action"],
       breached,
       shadowMode: typeof s.shadowMode === "boolean" ? s.shadowMode : false,
+      filters: parseFilters(s.filters),
       groupBy: typeof s.groupBy === "string" ? s.groupBy : undefined,
       departmentId: typeof s.departmentId === "number" ? s.departmentId : undefined,
       groupBreakdown: parseGroupBreakdown(s.groupBreakdown),
-    });
+    };
+
+    reportUnevaluableFilters(rule, reported);
+    parsed.push(rule);
   }
+
+  reportedUnevaluableFilters = reported;
 
   return {
     rules: parsed,
@@ -198,6 +262,7 @@ export function stopEnforcementPolling(): void {
   clearCache();
   warnedMissingTeamId = false;
   backoffDelayMs = null;
+  reportedUnevaluableFilters = new Set();
   getLogger().debug("Enforcement polling stopped");
 }
 

@@ -19,10 +19,16 @@ import {
   resolveAudioBillingUnit,
   resolveAudioOperationSubtype,
   resolveOperationSubtype,
+  toMeteringBillingUnit,
   type AudioOperationSubtype,
 } from "../_core/metering/operation-subtype.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import type { ReveniumPayload } from "../_core/types/index.js";
+import {
+  readStatedDurationSeconds,
+  resolveTranscriptDurationSeconds,
+  resolveVideoDurationSeconds,
+} from "./duration.js";
 import type {
   FalTrackingData,
   FalUsageMetadata,
@@ -35,6 +41,8 @@ import type {
 const MIDDLEWARE_SOURCE = "revenium-fal-node";
 const PROVIDER = "fal_ai";
 const MODEL_SOURCE = "FAL_AI";
+const DIMENSIONS_PATTERN = /^\d+x\d+$/;
+const UNKNOWN_RESOLUTION = "unknown";
 
 function extractModelName(endpointId: string, input?: Record<string, unknown>): string {
   if (typeof input?.model === "string" && input.model) return input.model;
@@ -88,21 +96,31 @@ function subtypeFor<T extends string>(
   return resolveOperationSubtype(accepted, data.usageMetadata?.operationSubtype, detected);
 }
 
+function formatDimensions(source: unknown): string | undefined {
+  const { width, height } = (source ?? {}) as { width?: number; height?: number };
+  return width && height ? `${width}x${height}` : undefined;
+}
+
+function resolveImageResolution(firstImage: unknown, imageSize: unknown): string | undefined {
+  const dimensions = formatDimensions(firstImage) ?? formatDimensions(imageSize);
+  if (dimensions) return dimensions;
+  return typeof imageSize === "string" && DIMENSIONS_PATTERN.test(imageSize)
+    ? imageSize
+    : undefined;
+}
+
 function buildImageTrackingPayload(data: FalTrackingData): ReveniumPayload {
   const result = data.result as FalImageResult;
   const images = result?.images || [];
   const requestedCount = (data.input?.num_images as number) ?? 1;
-  const firstImage = images[0];
-  const hasValidDimensions = firstImage?.width && firstImage?.height;
-  const resolution = hasValidDimensions
-    ? `${firstImage.width}x${firstImage.height}`
-    : (data.input?.image_size as string) || "unknown";
+  const imageSize = data.input?.image_size;
+  const resolution = resolveImageResolution(images[0], imageSize);
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_image",
     actual_image_count: images.length,
     requested_image_count: requestedCount,
-    resolution,
+    resolution: resolution ?? (typeof imageSize === "string" ? imageSize : UNKNOWN_RESOLUTION),
   };
 
   if (result?.seed !== undefined) attributes.seed = result.seed;
@@ -119,21 +137,23 @@ function buildImageTrackingPayload(data: FalTrackingData): ReveniumPayload {
     totalTokenCount: null,
     requestedImageCount: requestedCount,
     actualImageCount: images.length,
+    resolution,
     attributes,
   };
 }
 
 function buildVideoTrackingPayload(data: FalTrackingData): ReveniumPayload {
   const result = data.result as FalVideoResult;
-  const videoDuration =
-    (data.input?.duration as number) || (data.result?.duration as number) || undefined;
+  const videoDuration = resolveVideoDurationSeconds(data.endpointId, data.input, result);
   const aspectRatio = (data.input?.aspect_ratio as string) || undefined;
+  const resolution = (data.input?.resolution as string) || undefined;
 
   const attributes: Record<string, unknown> = {
     billing_unit: "per_second",
-    video_duration_seconds: videoDuration,
+    resolution,
   };
 
+  if (videoDuration !== undefined) attributes.video_duration_seconds = videoDuration;
   if (aspectRatio) attributes.aspect_ratio = aspectRatio;
   if (result?.video?.url || result?.file_url) attributes.has_output = true;
 
@@ -147,6 +167,7 @@ function buildVideoTrackingPayload(data: FalTrackingData): ReveniumPayload {
     outputTokenCount: null,
     totalTokenCount: null,
     durationSeconds: videoDuration,
+    resolution,
     attributes,
   };
 }
@@ -171,12 +192,11 @@ function resolveAudioDurationSeconds(
   data: FalTrackingData,
   result: FalAudioResult,
   subtype: AudioOperationSubtype,
-): number {
-  const measuredDurationSeconds = result?.duration || 0;
-  if (measuredDurationSeconds > 0 || MEASURED_DURATION_SUBTYPES.includes(subtype)) {
-    return measuredDurationSeconds;
+): number | undefined {
+  if (MEASURED_DURATION_SUBTYPES.includes(subtype)) {
+    return resolveTranscriptDurationSeconds(result);
   }
-  return (data.input?.duration as number) || 0;
+  return readStatedDurationSeconds(result) ?? readStatedDurationSeconds(data.input);
 }
 
 function buildAudioTrackingPayload(data: FalTrackingData): ReveniumPayload {
@@ -199,11 +219,10 @@ function buildAudioTrackingPayload(data: FalTrackingData): ReveniumPayload {
   const audioDurationSeconds = resolveAudioDurationSeconds(data, result, subtype);
   const billingUnit = resolveAudioBillingUnit(subtype, inputCharacterCount, audioDurationSeconds);
 
-  attributes.billing_unit = billingUnit;
   if (billingUnit === "per_character") {
     characterCount = inputCharacterCount;
     attributes.character_count = characterCount;
-  } else {
+  } else if (audioDurationSeconds !== undefined) {
     durationSeconds = audioDurationSeconds;
     attributes.duration_seconds = durationSeconds;
   }
@@ -213,6 +232,7 @@ function buildAudioTrackingPayload(data: FalTrackingData): ReveniumPayload {
     inputTokenCount: null,
     outputTokenCount: null,
     totalTokenCount: null,
+    billingUnit: toMeteringBillingUnit(billingUnit),
     durationSeconds,
     characterCount,
     attributes,

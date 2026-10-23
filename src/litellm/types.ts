@@ -96,6 +96,13 @@ export interface TokenUsage {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_creation?: CacheCreationTtlBuckets;
+  cost?: ProviderReportedCost;
+}
+
+export interface ProviderReportedCost {
+  input_tokens_cost?: number;
+  output_tokens_cost?: number;
+  total_cost?: number;
 }
 
 export interface LiteLLMChatCompletionResponse {

@@ -1,7 +1,9 @@
-import Anthropic from "@anthropic-ai/sdk";
+import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
+import { Stream } from "@anthropic-ai/sdk/streaming";
 import { randomUUID } from "crypto";
 import { getLogger, getConfig } from "../_core/config/manager.js";
-import { Config } from "../_core/types/index.js";
+import { Config, ReveniumConfig } from "../_core/types/index.js";
+import { runWithCallConfig } from "../_core/config/call-config.js";
 import { shouldCapturePrompts } from "../_core/prompt/extraction.js";
 import {
   trackUsageAsync,
@@ -10,6 +12,7 @@ import {
   detectVisionContent,
   reconstructResponseFromChunks,
   AnthropicTrackingData,
+  AnthropicUsageCounts,
 } from "./middleware.js";
 import { AnthropicProvider, detectAnthropicProvider } from "./provider-detection.js";
 
@@ -17,15 +20,31 @@ type AnthropicConfigExtras = Config & { anthropicApiKey?: string };
 
 interface PatchingContext {
   originalMethods: Record<string, any>;
+  messagesPrototype?: any;
+  betaMessagesPrototype?: any;
   isPatched: boolean;
-  patchedInstances: WeakSet<object>;
+}
+
+interface AnthropicCallContext {
+  requestId: string;
+  requestModel: string;
+  metadata: any;
+  requestTime: Date;
+  startTime: number;
+  requestBody: any;
+  provider: AnthropicProvider;
+  config: ReveniumConfig | null;
 }
 
 const patchingContext: PatchingContext = {
   originalMethods: {},
   isPatched: false,
-  patchedInstances: new WeakSet(),
 };
+
+function resolveAnthropicApiKey(): string | undefined {
+  const config = getConfig();
+  return (config as AnthropicConfigExtras)?.anthropicApiKey ?? process.env.ANTHROPIC_API_KEY;
+}
 
 function getMessagesPrototype(): any {
   try {
@@ -34,9 +53,7 @@ function getMessagesPrototype(): any {
     const anthropicConstructor = Anthropic as any;
     if (anthropicConstructor?._Messages) return anthropicConstructor._Messages.prototype;
 
-    const config = getConfig();
-    const apiKey =
-      (config as AnthropicConfigExtras)?.anthropicApiKey ?? process.env.ANTHROPIC_API_KEY;
+    const apiKey = resolveAnthropicApiKey();
 
     if (!apiKey) {
       throw new Error(
@@ -53,6 +70,19 @@ function getMessagesPrototype(): any {
         error instanceof Error ? error.message : String(error)
       }`,
     );
+  }
+}
+
+function getBetaMessagesPrototype(): any {
+  try {
+    if ((Anthropic as any)?.Beta?.Messages) return (Anthropic as any).Beta.Messages.prototype;
+
+    const apiKey = resolveAnthropicApiKey();
+    if (!apiKey) return undefined;
+
+    return Object.getPrototypeOf(new Anthropic({ apiKey }).beta.messages);
+  } catch {
+    return undefined;
   }
 }
 
@@ -84,6 +114,20 @@ export function patchAnthropic(): void {
     };
   }
 
+  patchingContext.messagesPrototype = messagesPrototype;
+
+  const betaMessagesPrototype = getBetaMessagesPrototype();
+
+  if (betaMessagesPrototype?.create) {
+    patchingContext.betaMessagesPrototype = betaMessagesPrototype;
+    patchingContext.originalMethods.betaCreate = betaMessagesPrototype.create;
+    betaMessagesPrototype.create = function (this: any, params: any, options?: any): any {
+      return patchedBetaCreateMethod.call(this, params, options);
+    };
+  } else {
+    logger.debug("Anthropic beta messages surface unavailable, metering regular messages only");
+  }
+
   patchingContext.isPatched = true;
   logger.info("Anthropic SDK patched successfully");
 }
@@ -93,22 +137,24 @@ export function unpatchAnthropic(): void {
 
   if (!patchingContext.isPatched) return;
 
-  try {
-    const messagesPrototype = getMessagesPrototype();
+  const { messagesPrototype, betaMessagesPrototype, originalMethods } = patchingContext;
 
-    if (messagesPrototype && patchingContext.originalMethods.create) {
-      messagesPrototype.create = patchingContext.originalMethods.create;
-    }
+  if (messagesPrototype && originalMethods.create) {
+    messagesPrototype.create = originalMethods.create;
+  }
 
-    if (messagesPrototype && patchingContext.originalMethods.stream) {
-      messagesPrototype.stream = patchingContext.originalMethods.stream;
-    }
-  } catch {
-    // Ignore errors during unpatch
+  if (messagesPrototype && originalMethods.stream) {
+    messagesPrototype.stream = originalMethods.stream;
+  }
+
+  if (betaMessagesPrototype && originalMethods.betaCreate) {
+    betaMessagesPrototype.create = originalMethods.betaCreate;
   }
 
   patchingContext.isPatched = false;
   patchingContext.originalMethods = {};
+  patchingContext.messagesPrototype = undefined;
+  patchingContext.betaMessagesPrototype = undefined;
   logger.info("Anthropic SDK unpatched successfully");
 }
 
@@ -116,189 +162,375 @@ export function isAnthropicPatched(): boolean {
   return patchingContext.isPatched;
 }
 
-async function handleStreamingResponse(
-  stream: any,
-  context: {
-    requestId: string;
-    requestModel: string;
-    metadata: any;
-    requestTime: Date;
-    startTime: number;
-    requestBody: any;
-    provider: AnthropicProvider;
+function createCallContext(resource: any, params: any): AnthropicCallContext {
+  return {
+    requestId: randomUUID(),
+    requestModel: params.model,
+    metadata: params.usageMetadata || {},
+    requestTime: new Date(),
+    startTime: Date.now(),
+    requestBody: params,
+    provider: detectAnthropicProvider(resource._client?.baseURL),
+    config: getConfig(),
+  };
+}
+
+function buildTrackingData(
+  context: AnthropicCallContext,
+  usage: AnthropicUsageCounts,
+  details: {
+    model: string;
+    isStreamed: boolean;
+    response: any;
+    timeToFirstToken?: number;
   },
-) {
-  const { requestId, requestModel, metadata, requestTime, startTime, requestBody, provider } =
-    context;
+): AnthropicTrackingData {
+  return {
+    requestId: context.requestId,
+    model: details.model,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheCreationTokens: usage.cacheCreationTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheCreation5mTokens: usage.cacheCreation5mTokens,
+    cacheCreation1hTokens: usage.cacheCreation1hTokens,
+    reasoningTokens: usage.reasoningTokens,
+    duration: Date.now() - context.startTime,
+    isStreamed: details.isStreamed,
+    stopReason: usage.stopReason,
+    metadata: context.metadata,
+    requestTime: context.requestTime,
+    responseTime: new Date(),
+    timeToFirstToken: details.timeToFirstToken,
+    hasVisionContent: detectVisionContent(context.requestBody),
+    requestBody: context.requestBody,
+    response: details.response,
+    provider: context.provider,
+  };
+}
 
-  async function* trackingStream() {
-    const chunks: any[] = [];
-    let firstTokenTime: number | undefined;
-    let resolvedModel: string | undefined;
+function meterMessage(response: any, context: AnthropicCallContext): any {
+  runWithCallConfig(context.config, () =>
+    trackUsageAsync(
+      buildTrackingData(context, extractUsageFromResponse(response), {
+        model: response?.model ?? context.requestModel,
+        isStreamed: false,
+        response,
+      }),
+    ),
+  );
+  return response;
+}
 
-    try {
-      for await (const chunk of stream) {
-        if (!firstTokenTime && chunk.type === "content_block_delta") {
-          firstTokenTime = Date.now();
-        }
-        if (!resolvedModel && chunk.type === "message_start" && chunk.message?.model) {
-          resolvedModel = chunk.message.model;
-        }
-        chunks.push(chunk);
-        yield chunk;
-      }
+function meterUnstartedRequest(
+  context: AnthropicCallContext,
+  isStreamed: boolean,
+  error: any,
+): void {
+  runWithCallConfig(context.config, () =>
+    trackUsageAsync(
+      buildTrackingData(
+        context,
+        {
+          inputTokens: 0,
+          outputTokens: 0,
+          stopReason: isAbortError(error) ? "cancelled" : "error",
+        },
+        { model: context.requestModel, isStreamed, response: undefined },
+      ),
+    ),
+  );
+}
 
-      const duration = Date.now() - startTime;
-      const timeToFirstToken = firstTokenTime ? firstTokenTime - startTime : undefined;
-      const model = resolvedModel ?? requestModel;
+function meterStreamChunks(
+  chunks: any[],
+  context: AnthropicCallContext,
+  details: {
+    model: string;
+    timeToFirstToken?: number;
+    fallbackStopReason?: string;
+    forcedStopReason?: string;
+  },
+): void {
+  const usage = extractUsageFromStream(chunks);
 
-      const usage = extractUsageFromStream(chunks);
+  runWithCallConfig(context.config, () =>
+    trackUsageAsync(
+      buildTrackingData(
+        context,
+        {
+          ...usage,
+          stopReason: details.forcedStopReason ?? usage.stopReason ?? details.fallbackStopReason,
+        },
+        {
+          model: details.model,
+          isStreamed: true,
+          timeToFirstToken: details.timeToFirstToken,
+          response: shouldCapturePrompts(context.metadata)
+            ? reconstructResponseFromChunks(chunks, details.model)
+            : undefined,
+        },
+      ),
+    ),
+  );
+}
 
-      let reconstructedResponse = undefined;
-      if (shouldCapturePrompts(metadata)) {
-        reconstructedResponse = reconstructResponseFromChunks(chunks, model);
-      }
+interface StreamRecorder {
+  record(chunk: any): void;
+  meter(fallbackStopReason?: string): void;
+  meterError(): void;
+}
 
-      const trackingData: AnthropicTrackingData = {
-        requestId,
-        model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheCreationTokens: usage.cacheCreationTokens,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheCreation5mTokens: usage.cacheCreation5mTokens,
-        cacheCreation1hTokens: usage.cacheCreation1hTokens,
-        reasoningTokens: usage.reasoningTokens,
-        duration,
-        isStreamed: true,
-        stopReason: usage.stopReason,
-        metadata,
-        requestTime,
-        responseTime: new Date(),
-        timeToFirstToken,
-        requestBody,
-        response: reconstructedResponse,
-        hasVisionContent: detectVisionContent(requestBody),
-        provider,
-      };
+function createStreamRecorder(context: AnthropicCallContext): StreamRecorder {
+  const chunks: any[] = [];
+  let firstTokenTime: number | undefined;
+  let resolvedModel: string | undefined;
+  let metered = false;
 
-      trackUsageAsync(trackingData);
-    } catch (error) {
-      throw error;
-    }
+  function finalize(stopReasons: { fallback?: string; forced?: string }): void {
+    if (metered) return;
+    metered = true;
+
+    meterStreamChunks(chunks, context, {
+      model: resolvedModel ?? context.requestModel,
+      timeToFirstToken: firstTokenTime ? firstTokenTime - context.startTime : undefined,
+      fallbackStopReason: stopReasons.fallback,
+      forcedStopReason: stopReasons.forced,
+    });
   }
 
-  return trackingStream();
+  return {
+    record(chunk: any): void {
+      if (!firstTokenTime && chunk.type === "content_block_delta") {
+        firstTokenTime = Date.now();
+      }
+      if (!resolvedModel && chunk.type === "message_start" && chunk.message?.model) {
+        resolvedModel = chunk.message.model;
+      }
+      chunks.push(chunk);
+    },
+
+    meter(fallbackStopReason?: string): void {
+      finalize({ fallback: fallbackStopReason });
+    },
+
+    meterError(): void {
+      finalize({ forced: "error" });
+    },
+  };
+}
+
+function isAbortError(error: any): boolean {
+  return error instanceof APIUserAbortError || error?.name === "AbortError";
+}
+
+function wasStreamAborted(stream: any): boolean {
+  return stream?.controller?.signal?.aborted === true;
+}
+
+async function* createTrackingStream(stream: any, context: AnthropicCallContext) {
+  const recorder = createStreamRecorder(context);
+
+  try {
+    for await (const chunk of stream) {
+      recorder.record(chunk);
+      yield chunk;
+    }
+    recorder.meter(wasStreamAborted(stream) ? "cancelled" : undefined);
+  } catch (error) {
+    if (!isAbortError(error)) recorder.meterError();
+    throw error;
+  } finally {
+    recorder.meter("cancelled");
+  }
 }
 
 async function patchedCreateMethod(this: any, params: any, options?: any): Promise<any> {
-  const requestId = randomUUID();
-  const startTime = Date.now();
-  const requestTime = new Date();
-  const provider = detectAnthropicProvider(this._client?.baseURL);
+  const originalCreate = patchingContext.originalMethods.create;
+  if (!originalCreate) throw new Error("Original create method not available");
 
-  const metadata = params.usageMetadata || {};
+  const context = createCallContext(this, params);
   const { usageMetadata: _, ...cleanParams } = params;
 
+  let response: any;
   try {
-    const originalCreate = patchingContext.originalMethods.create;
-    if (!originalCreate) throw new Error("Original create method not available");
+    response = await originalCreate.call(this, cleanParams, options);
+  } catch (error) {
+    meterUnstartedRequest(context, !!params.stream, error);
+    throw error;
+  }
 
-    const response = await originalCreate.call(this, cleanParams, options);
-    const isStreaming = !!params.stream;
+  if (!params.stream) return meterMessage(response, context);
+
+  return createTrackingStream(response, context) as any;
+}
+
+function createMemberForwarder(target: any): (property: string | symbol) => any {
+  const boundMembers = new Map<string | symbol, any>();
+
+  return (property: string | symbol): any => {
+    const value = target[property];
+    if (typeof value !== "function") return value;
+
+    if (!boundMembers.has(property)) boundMembers.set(property, value.bind(target));
+    return boundMembers.get(property);
+  };
+}
+
+function instrumentBetaStream(stream: any, context: AnthropicCallContext): any {
+  const originalIterator = stream.iterator.bind(stream);
+
+  stream.iterator = () =>
+    createTrackingStream(
+      { [Symbol.asyncIterator]: originalIterator, controller: stream.controller },
+      context,
+    );
+
+  return stream;
+}
+
+interface BetaMetering {
+  instrument(value: any): any;
+  meterRawResponse(response: Response): Response;
+  recordFailure(error: any): void;
+}
+
+async function meterResponseClone(
+  response: Response,
+  context: AnthropicCallContext,
+  isStreaming: boolean,
+): Promise<void> {
+  try {
+    const clone = response.clone();
 
     if (!isStreaming) {
-      const duration = Date.now() - startTime;
-      const usage = extractUsageFromResponse(response);
-
-      const trackingData: AnthropicTrackingData = {
-        requestId,
-        model: response.model ?? params.model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheCreationTokens: usage.cacheCreationTokens,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheCreation5mTokens: usage.cacheCreation5mTokens,
-        cacheCreation1hTokens: usage.cacheCreation1hTokens,
-        reasoningTokens: usage.reasoningTokens,
-        duration,
-        isStreamed: false,
-        stopReason: usage.stopReason,
-        metadata,
-        requestTime,
-        responseTime: new Date(),
-        hasVisionContent: detectVisionContent(params),
-        requestBody: params,
-        response,
-        provider,
-      };
-
-      trackUsageAsync(trackingData);
-      return response;
+      meterMessage(await clone.json(), context);
+      return;
     }
 
-    return handleStreamingResponse(response, {
-      requestId,
-      requestModel: params.model,
-      metadata,
-      requestTime,
-      startTime,
-      requestBody: params,
-      provider,
-    }) as any;
+    const events = Stream.fromSSEResponse<any>(clone, new AbortController());
+    for await (const event of createTrackingStream(events, context)) {
+      void event;
+    }
   } catch (error) {
-    throw error;
+    getLogger().warn("Unable to meter Anthropic beta raw response", {
+      requestId: context.requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
-function meterStreamHelper(
-  stream: any,
-  context: { params: any; metadata: any; provider: AnthropicProvider },
-): void {
-  const { params, metadata, provider } = context;
-  const requestId = randomUUID();
-  const startTime = Date.now();
-  const requestTime = new Date();
-  const chunks: any[] = [];
-  let firstTokenTime: number | undefined;
+function createBetaMetering(context: AnthropicCallContext, isStreaming: boolean): BetaMetering {
+  let metered = false;
+  let instrumented: any;
 
-  stream.on("streamEvent", (event: any) => {
-    if (!firstTokenTime && event.type === "content_block_delta") {
-      firstTokenTime = Date.now();
-    }
-    chunks.push(event);
+  return {
+    instrument(value: any): any {
+      if (metered) return instrumented ?? value;
+
+      metered = true;
+      instrumented = isStreaming
+        ? instrumentBetaStream(value, context)
+        : meterMessage(value, context);
+      return instrumented;
+    },
+
+    meterRawResponse(response: Response): Response {
+      if (!metered) {
+        metered = true;
+        void meterResponseClone(response, context, isStreaming);
+      }
+      return response;
+    },
+
+    recordFailure(error: any): void {
+      if (metered) return;
+
+      metered = true;
+      meterUnstartedRequest(context, isStreaming, error);
+    },
+  };
+}
+
+function instrumentBetaPromise(apiPromise: any, metering: BetaMetering): any {
+  const forwardMember = createMemberForwarder(apiPromise);
+
+  const rethrowMetered = (error: any): never => {
+    metering.recordFailure(error);
+    throw error;
+  };
+
+  const proxy: any = new Proxy(apiPromise, {
+    get(target: any, property: string | symbol) {
+      switch (property) {
+        case "then":
+          return (onFulfilled?: any, onRejected?: any) =>
+            target
+              .then((value: any) => metering.instrument(value), rethrowMetered)
+              .then(onFulfilled, onRejected);
+        case "catch":
+          return (onRejected?: any) => proxy.then(undefined, onRejected);
+        case "finally":
+          return (onFinally?: any) => proxy.then().finally(onFinally);
+        case "asResponse":
+          return () =>
+            target
+              .asResponse()
+              .then((response: Response) => metering.meterRawResponse(response), rethrowMetered);
+        case "withResponse":
+          return () =>
+            target.withResponse().then(
+              (result: any) => ({
+                ...result,
+                data: metering.instrument(result.data),
+              }),
+              rethrowMetered,
+            );
+        case "_thenUnwrap":
+          return (transform: any) => {
+            const unwrapped = target._thenUnwrap((value: any, props: any) =>
+              transform(metering.instrument(value), props),
+            );
+            unwrapped.catch((error: any) => metering.recordFailure(error));
+            return unwrapped;
+          };
+        default:
+          return forwardMember(property);
+      }
+    },
   });
 
-  stream.on("finalMessage", (message: any) => {
-    const model = message?.model ?? params.model;
-    const usage = extractUsageFromStream(chunks);
+  return proxy;
+}
 
-    const trackingData: AnthropicTrackingData = {
-      requestId,
-      model,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cacheCreationTokens: usage.cacheCreationTokens,
-      cacheReadTokens: usage.cacheReadTokens,
-      cacheCreation5mTokens: usage.cacheCreation5mTokens,
-      cacheCreation1hTokens: usage.cacheCreation1hTokens,
-      reasoningTokens: usage.reasoningTokens,
-      duration: Date.now() - startTime,
-      isStreamed: true,
-      stopReason: usage.stopReason,
-      metadata,
-      requestTime,
-      responseTime: new Date(),
-      timeToFirstToken: firstTokenTime ? firstTokenTime - startTime : undefined,
-      hasVisionContent: detectVisionContent(params),
-      requestBody: params,
-      response: shouldCapturePrompts(metadata)
-        ? reconstructResponseFromChunks(chunks, model)
-        : undefined,
-      provider,
-    };
+function patchedBetaCreateMethod(this: any, params: any, options?: any): any {
+  const originalBetaCreate = patchingContext.originalMethods.betaCreate;
+  if (!originalBetaCreate) throw new Error("Original beta create method not available");
 
-    trackUsageAsync(trackingData);
+  const context = createCallContext(this, params);
+  const { usageMetadata: _, ...cleanParams } = params;
+
+  return instrumentBetaPromise(
+    originalBetaCreate.call(this, cleanParams, options),
+    createBetaMetering(context, !!params.stream),
+  );
+}
+
+function meterStreamHelper(stream: any, context: AnthropicCallContext): void {
+  const recorder = createStreamRecorder(context);
+
+  stream.on("streamEvent", (event: any) => recorder.record(event));
+  stream.on("finalMessage", () => recorder.meter());
+  stream.on("end", () => {
+    if (stream.aborted) {
+      recorder.meter("cancelled");
+      return;
+    }
+    if (stream.errored) {
+      recorder.meterError();
+      return;
+    }
+    recorder.meter();
   });
 }
 
@@ -306,7 +538,7 @@ function patchedStreamMethod(this: any, params: any, options?: any): any {
   const originalStream = patchingContext.originalMethods.stream;
   if (!originalStream) throw new Error("Original stream method not available");
 
-  const metadata = params.usageMetadata || {};
+  const context = createCallContext(this, params);
   const { usageMetadata: _, ...cleanParams } = params;
 
   const unpatchedResource = Object.create(this, {
@@ -314,11 +546,7 @@ function patchedStreamMethod(this: any, params: any, options?: any): any {
   });
   const stream = originalStream.call(unpatchedResource, cleanParams, options);
 
-  meterStreamHelper(stream, {
-    params,
-    metadata,
-    provider: detectAnthropicProvider(this._client?.baseURL),
-  });
+  meterStreamHelper(stream, context);
 
   return stream;
 }

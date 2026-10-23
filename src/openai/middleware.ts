@@ -7,6 +7,7 @@ import {
   buildPayload,
   buildImagePayload,
   buildAudioPayload,
+  type ImagePayloadExtra,
 } from "../_core/metering/payload-builder.js";
 import type {
   AudioOperationSubtype,
@@ -27,8 +28,13 @@ import {
   mapResponsesStatusToStopReason,
   TERMINAL_RESPONSE_EVENTS,
 } from "./responses-stop-reason.js";
-import { StreamingWrapper } from "./streaming.js";
-import { enforcePreCallRules } from "../_core/enforcement/evaluator.js";
+import { MeteredResponseLedger } from "./metered-response-ledger.js";
+import { isImageStreamRequest, isAsyncIterable, instrumentImageStream } from "./image-streaming.js";
+import { StreamingWrapper, type TrackUsageFn } from "./streaming.js";
+import { runProviderCall } from "../_core/metering/metering-context.js";
+import { runWithCallConfig } from "../_core/config/call-config.js";
+import { enforcePreCallRules, type EnforcementCriteria } from "../_core/enforcement/evaluator.js";
+import { resolveAgenticJobFields } from "../_core/metadata/metadata-builder.js";
 
 interface ResponsesAPIResult {
   id?: string;
@@ -37,23 +43,71 @@ interface ResponsesAPIResult {
     input_tokens?: number;
     output_tokens?: number;
     total_tokens?: number;
-    reasoning_tokens?: number;
     cached_tokens?: number;
     output_tokens_details?: { reasoning_tokens?: number };
     input_tokens_details?: { cached_tokens?: number };
   };
   status?: string;
+  created_at?: number;
+  completed_at?: number;
+  output_text?: string;
   incomplete_details?: { reason?: string } | null;
   [key: string]: unknown;
 }
 
+interface ResponsesUsageCounts {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+  cachedTokens?: number;
+}
+
+function extractResponsesUsage(response: ResponsesAPIResult | null): ResponsesUsageCounts {
+  const usage = response?.usage ?? {};
+
+  return {
+    promptTokens: usage.input_tokens || 0,
+    completionTokens: usage.output_tokens || 0,
+    totalTokens: usage.total_tokens || 0,
+    reasoningTokens: usage.output_tokens_details?.reasoning_tokens,
+    cachedTokens: usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens,
+  };
+}
+
+function epochSecondsToMillis(epochSeconds?: number): number | undefined {
+  return typeof epochSeconds === "number" && Number.isFinite(epochSeconds)
+    ? epochSeconds * 1000
+    : undefined;
+}
+
+function jobDuration(response: ResponsesAPIResult, retrieveDuration: number): number {
+  const startedAt = epochSecondsToMillis(response.created_at);
+  const completedAt = epochSecondsToMillis(response.completed_at);
+  if (startedAt === undefined || completedAt === undefined) return retrieveDuration;
+
+  return Math.max(0, completedAt - startedAt);
+}
+
+function withResponseIdempotencyKey(responseId: string, metadata?: UsageMetadata): UsageMetadata {
+  return {
+    ...metadata,
+    idempotencyKey: metadata?.idempotencyKey ?? `openai-response-${responseId}`,
+  };
+}
+
+type ResponsesStream = AsyncIterable<unknown> & { controller?: AbortController };
+
 interface OpenAIClientWithResponses {
   responses?: {
-    create(params: Record<string, unknown>): Promise<ResponsesAPIResult>;
+    create(params: Record<string, unknown>): Promise<ResponsesAPIResult | AsyncIterable<unknown>>;
+    retrieve?(responseID: string): Promise<ResponsesAPIResult>;
   };
 }
 
 const MIDDLEWARE_SOURCE = "revenium-openai-node";
+
+const skipTracking: TrackUsageFn = () => undefined;
 
 export function trackUsageAsync(trackingData: {
   requestId: string;
@@ -64,6 +118,7 @@ export function trackUsageAsync(trackingData: {
   reasoningTokens?: number;
   cachedTokens?: number;
   duration: number;
+  startTime?: number;
   finishReason: string | null;
   usageMetadata?: UsageMetadata;
   isStreamed?: boolean;
@@ -71,6 +126,7 @@ export function trackUsageAsync(trackingData: {
   providerInfo?: ProviderInfo;
   messages?: any[];
   responseContent?: string;
+  onDeliveryFailure?: () => void;
 }): void {
   const logger = getLogger();
 
@@ -88,7 +144,7 @@ export function trackUsageAsync(trackingData: {
           )
         : null;
 
-      const startTime = Date.now() - trackingData.duration;
+      const startTime = trackingData.startTime ?? Date.now() - trackingData.duration;
 
       return buildPayload({
         operationType: "CHAT",
@@ -125,6 +181,7 @@ export function trackUsageAsync(trackingData: {
       logger.warn("Usage tracking failed", {
         error: error instanceof Error ? error.message : String(error),
       });
+      trackingData.onDeliveryFailure?.();
     });
 }
 
@@ -183,6 +240,7 @@ export function trackImageUsageAsync(
   config: any,
   providerInfo: ProviderInfo,
   metadata?: UsageMetadata,
+  extra?: ImagePayloadExtra,
 ): void {
   const logger = getLogger();
   const providerMeta = getProviderMetadata(providerInfo);
@@ -199,6 +257,7 @@ export function trackImageUsageAsync(
         providerMeta.modelSource,
         MIDDLEWARE_SOURCE,
         metadata,
+        extra,
       );
       try {
         await sendToRevenium(payload);
@@ -252,6 +311,25 @@ export function trackAudioUsageAsync(
   })();
 }
 
+function enforcementCriteriaFor(
+  providerInfo: ProviderInfo,
+  model: string,
+  metadata?: UsageMetadata,
+): EnforcementCriteria {
+  const credential = metadata?.subscriber?.credential;
+  return {
+    subscriberId: metadata?.subscriber?.id,
+    subscriberEmail: metadata?.subscriber?.email,
+    productName: metadata?.productName || metadata?.productId,
+    model,
+    provider: getProviderMetadata(providerInfo).provider,
+    agent: metadata?.agent,
+    taskType: metadata?.taskType,
+    organizationName: metadata?.organizationName || metadata?.organizationId,
+    credential: credential?.name ?? credential?.value,
+  };
+}
+
 export class CompletionsInterface {
   constructor(
     private client: OpenAI,
@@ -263,20 +341,27 @@ export class CompletionsInterface {
     params: OpenAI.ChatCompletionCreateParamsNonStreaming,
     metadata?: UsageMetadata,
   ): Promise<OpenAI.ChatCompletion> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params, metadata));
+  }
+
+  private async meteredCreate(
+    params: OpenAI.ChatCompletionCreateParamsNonStreaming,
+    metadata?: UsageMetadata,
+  ): Promise<OpenAI.ChatCompletion> {
     const startTime = Date.now();
     const requestId = randomUUID();
-    const providerMeta = getProviderMetadata(this.providerInfo);
 
-    enforcePreCallRules({
-      subscriberId: metadata?.subscriber?.id,
-      subscriberEmail: metadata?.subscriber?.email,
-      productName: metadata?.productName,
-      model: params.model,
-      provider: providerMeta.provider,
-    });
+    enforcePreCallRules(enforcementCriteriaFor(this.providerInfo, params.model, metadata));
 
     try {
-      const response = await this.client.chat.completions.create(params);
+      const { result: response, meteredElsewhere } = await runProviderCall(
+        MIDDLEWARE_SOURCE,
+        metadata,
+        () => this.client.chat.completions.create(params),
+      );
+
+      if (meteredElsewhere) return response;
+
       const duration = Date.now() - startTime;
       const responseContent = response.choices[0]?.message?.content;
 
@@ -324,21 +409,25 @@ export class CompletionsInterface {
     params: OpenAI.ChatCompletionCreateParamsStreaming,
     metadata?: UsageMetadata,
   ): Promise<StreamingWrapper> {
-    const providerMeta = getProviderMetadata(this.providerInfo);
+    return runWithCallConfig(this.config, () => this.meteredCreateStreaming(params, metadata));
+  }
 
-    enforcePreCallRules({
-      subscriberId: metadata?.subscriber?.id,
-      subscriberEmail: metadata?.subscriber?.email,
-      productName: metadata?.productName,
-      model: params.model,
-      provider: providerMeta.provider,
-    });
+  private async meteredCreateStreaming(
+    params: OpenAI.ChatCompletionCreateParamsStreaming,
+    metadata?: UsageMetadata,
+  ): Promise<StreamingWrapper> {
+    enforcePreCallRules(enforcementCriteriaFor(this.providerInfo, params.model, metadata));
 
-    const stream = await this.client.chat.completions.create({
-      ...params,
-      stream: true,
-      stream_options: { include_usage: true },
-    });
+    const { result: stream, meteredElsewhere } = await runProviderCall(
+      MIDDLEWARE_SOURCE,
+      metadata,
+      () =>
+        this.client.chat.completions.create({
+          ...params,
+          stream: true,
+          stream_options: { include_usage: true },
+        }),
+    );
 
     return new StreamingWrapper(
       stream,
@@ -346,7 +435,7 @@ export class CompletionsInterface {
       this.providerInfo,
       params.model,
       params.messages,
-      trackUsageAsync,
+      meteredElsewhere ? skipTracking : trackUsageAsync,
       metadata,
     );
   }
@@ -375,28 +464,36 @@ export class EmbeddingsInterface {
     params: OpenAI.EmbeddingCreateParams,
     metadata?: UsageMetadata,
   ): Promise<OpenAI.CreateEmbeddingResponse> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params, metadata));
+  }
+
+  private async meteredCreate(
+    params: OpenAI.EmbeddingCreateParams,
+    metadata?: UsageMetadata,
+  ): Promise<OpenAI.CreateEmbeddingResponse> {
     const startTime = Date.now();
     const requestId = randomUUID();
 
-    try {
-      const response = await this.client.embeddings.create(params);
-      const duration = Date.now() - startTime;
+    const { result: response, meteredElsewhere } = await runProviderCall(
+      MIDDLEWARE_SOURCE,
+      metadata,
+      () => this.client.embeddings.create(params),
+    );
 
-      trackEmbeddingsUsageAsync({
-        transactionId: requestId,
-        model: response.model,
-        promptTokens: response.usage.prompt_tokens,
-        totalTokens: response.usage.total_tokens,
-        duration,
-        usageMetadata: metadata,
-        requestStartTime: startTime,
-        providerInfo: this.providerInfo,
-      });
+    if (meteredElsewhere) return response;
 
-      return response;
-    } catch (error) {
-      throw error;
-    }
+    trackEmbeddingsUsageAsync({
+      transactionId: requestId,
+      model: response.model,
+      promptTokens: response.usage.prompt_tokens,
+      totalTokens: response.usage.total_tokens,
+      duration: Date.now() - startTime,
+      usageMetadata: metadata,
+      requestStartTime: startTime,
+      providerInfo: this.providerInfo,
+    });
+
+    return response;
   }
 }
 
@@ -408,16 +505,33 @@ export class ImagesInterface {
   ) {}
 
   async generate(params: OpenAI.ImageGenerateParams): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredGenerate(params));
+  }
+
+  private async meteredGenerate(params: OpenAI.ImageGenerateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
     const startTime = Date.now();
     const response = await this.originalImages.generate(cleanParams);
-    const duration = Date.now() - startTime;
+
+    if (isImageStreamRequest(params) && isAsyncIterable(response)) {
+      return instrumentImageStream(
+        response,
+        "generation",
+        params,
+        startTime,
+        this.config,
+        this.providerInfo,
+        metadata,
+        trackImageUsageAsync,
+      );
+    }
+
     trackImageUsageAsync(
       "generation",
       response,
       params,
       startTime,
-      duration,
+      Date.now() - startTime,
       this.config,
       this.providerInfo,
       metadata,
@@ -426,16 +540,33 @@ export class ImagesInterface {
   }
 
   async edit(params: OpenAI.ImageEditParams): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredEdit(params));
+  }
+
+  private async meteredEdit(params: OpenAI.ImageEditParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
     const startTime = Date.now();
     const response = await this.originalImages.edit(cleanParams);
-    const duration = Date.now() - startTime;
+
+    if (isImageStreamRequest(params) && isAsyncIterable(response)) {
+      return instrumentImageStream(
+        response,
+        "edit",
+        params,
+        startTime,
+        this.config,
+        this.providerInfo,
+        metadata,
+        trackImageUsageAsync,
+      );
+    }
+
     trackImageUsageAsync(
       "edit",
       response,
       params,
       startTime,
-      duration,
+      Date.now() - startTime,
       this.config,
       this.providerInfo,
       metadata,
@@ -444,6 +575,10 @@ export class ImagesInterface {
   }
 
   async createVariation(params: OpenAI.ImageCreateVariationParams): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredCreateVariation(params));
+  }
+
+  private async meteredCreateVariation(params: OpenAI.ImageCreateVariationParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
     const startTime = Date.now();
     const response = await this.originalImages.createVariation(cleanParams);
@@ -470,6 +605,10 @@ export class AudioTranscriptionsInterface {
   ) {}
 
   async create(params: OpenAI.Audio.TranscriptionCreateParams): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params));
+  }
+
+  private async meteredCreate(params: OpenAI.Audio.TranscriptionCreateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
     const startTime = Date.now();
     const response = await this.originalTranscriptions.create(
@@ -498,6 +637,10 @@ export class AudioTranslationsInterface {
   ) {}
 
   async create(params: OpenAI.Audio.TranslationCreateParams): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params));
+  }
+
+  private async meteredCreate(params: OpenAI.Audio.TranslationCreateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
     const startTime = Date.now();
     const response = await this.originalTranslations.create(cleanParams);
@@ -524,6 +667,10 @@ export class AudioSpeechInterface {
   ) {}
 
   async create(params: OpenAI.Audio.SpeechCreateParams): Promise<any> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params));
+  }
+
+  private async meteredCreate(params: OpenAI.Audio.SpeechCreateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
     const startTime = Date.now();
     const response = await this.originalSpeech.create(cleanParams);
@@ -543,6 +690,8 @@ export class AudioSpeechInterface {
 }
 
 export class ResponsesInterface {
+  private readonly ledger = new MeteredResponseLedger();
+
   constructor(
     private client: OpenAI,
     private config: Config,
@@ -555,48 +704,160 @@ export class ResponsesInterface {
       : [{ role: "user" as const, content: params.input }];
   }
 
+  create(
+    params: Record<string, unknown> & { stream: true },
+    metadata?: UsageMetadata,
+  ): Promise<ResponsesStream>;
+  create(
+    params: Record<string, unknown> & { stream?: false | null },
+    metadata?: UsageMetadata,
+  ): Promise<ResponsesAPIResult>;
+  create(
+    params: Record<string, unknown> & { stream: boolean },
+    metadata?: UsageMetadata,
+  ): Promise<ResponsesAPIResult | ResponsesStream>;
   async create(
     params: Record<string, unknown>,
     metadata?: UsageMetadata,
-  ): Promise<ResponsesAPIResult> {
+  ): Promise<ResponsesAPIResult | ResponsesStream> {
+    return runWithCallConfig(this.config, () => this.meteredCreate(params, metadata));
+  }
+
+  private async meteredCreate(
+    params: Record<string, unknown>,
+    metadata?: UsageMetadata,
+  ): Promise<ResponsesAPIResult | ResponsesStream> {
     const startTime = Date.now();
     const requestId = randomUUID();
+    const isStreamed = Boolean(params.stream);
     const responsesAPI = (this.client as unknown as OpenAIClientWithResponses).responses;
     if (!responsesAPI?.create) {
       throw new Error("Responses API not available in this OpenAI SDK version");
     }
 
     try {
-      const response = await responsesAPI.create(params);
-      const usage = response.usage ?? {};
+      const result = await responsesAPI.create(params);
 
-      if (isTerminalResponseStatus(response.status)) {
-        trackUsageAsync({
-          requestId: response.id || requestId,
-          model: response.model || (params.model as string),
-          promptTokens: usage.input_tokens || 0,
-          completionTokens: usage.output_tokens || 0,
-          totalTokens: usage.total_tokens || 0,
-          reasoningTokens: usage.reasoning_tokens,
-          cachedTokens: usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens,
-          duration: Date.now() - startTime,
-          finishReason: mapResponsesStatusToStopReason(
-            response.status,
-            response.incomplete_details?.reason,
-            getLogger(),
-          ),
-          usageMetadata: metadata,
-          isStreamed: false,
-          providerInfo: this.providerInfo,
-          messages: this.inputMessages(params),
-        });
+      if (isStreamed) {
+        return this.instrumentStream(
+          result as ResponsesStream,
+          params,
+          startTime,
+          requestId,
+          metadata,
+        );
       }
+
+      const response = result as ResponsesAPIResult;
+
+      if (!isTerminalResponseStatus(response.status)) {
+        this.deferToCollection(response, params, metadata);
+        return response;
+      }
+
+      this.meterTerminalResponse({
+        response,
+        responseId: response.id || requestId,
+        model: response.model || (params.model as string),
+        duration: Date.now() - startTime,
+        metadata,
+        messages: this.inputMessages(params),
+      });
 
       return response;
     } catch (error) {
-      this.trackFailure(params, requestId, startTime, false, metadata);
+      this.trackFailure(params, requestId, startTime, isStreamed, metadata);
       throw error;
     }
+  }
+
+  async retrieve(responseId: string, metadata?: UsageMetadata): Promise<ResponsesAPIResult> {
+    return runWithCallConfig(this.config, () => this.meteredRetrieve(responseId, metadata));
+  }
+
+  private async meteredRetrieve(
+    responseId: string,
+    metadata?: UsageMetadata,
+  ): Promise<ResponsesAPIResult> {
+    const startTime = Date.now();
+    const responsesAPI = (this.client as unknown as OpenAIClientWithResponses).responses;
+    if (!responsesAPI?.retrieve) {
+      throw new Error("Responses API not available in this OpenAI SDK version");
+    }
+
+    const response = await responsesAPI.retrieve(responseId);
+    if (!isTerminalResponseStatus(response.status)) return response;
+
+    const collectedResponseId = response.id || responseId;
+    const pending = this.ledger.contextFor(collectedResponseId);
+    const collectionMetadata = { ...pending?.metadata, ...metadata };
+    this.meterTerminalResponse({
+      response,
+      responseId: collectedResponseId,
+      model: response.model ?? "",
+      duration: jobDuration(response, Date.now() - startTime),
+      startTime: epochSecondsToMillis(response.created_at),
+      metadata: collectionMetadata,
+      messages: pending?.messages ?? [],
+      responseContent:
+        response.output_text && shouldCapturePrompts(collectionMetadata)
+          ? sanitizeCredentials(response.output_text)
+          : undefined,
+    });
+
+    return response;
+  }
+
+  private deferToCollection(
+    response: ResponsesAPIResult,
+    params: Record<string, unknown>,
+    metadata?: UsageMetadata,
+  ): void {
+    if (response.id) {
+      this.ledger.rememberContext(response.id, {
+        metadata: { ...resolveAgenticJobFields(metadata), ...metadata },
+        messages: shouldCapturePrompts(metadata) ? this.inputMessages(params) : undefined,
+      });
+    }
+
+    getLogger().info("Background response not metered until collected", {
+      responseId: response.id,
+      status: response.status,
+      collectWith: "responses().retrieve(id)",
+    });
+  }
+
+  private meterTerminalResponse(metering: {
+    response: ResponsesAPIResult;
+    responseId: string;
+    model: string;
+    duration: number;
+    startTime?: number;
+    metadata?: UsageMetadata;
+    messages: unknown[];
+    responseContent?: string;
+  }): void {
+    const { response, responseId } = metering;
+    if (!this.ledger.claim(responseId)) return;
+
+    trackUsageAsync({
+      requestId: responseId,
+      model: metering.model,
+      ...extractResponsesUsage(response),
+      duration: metering.duration,
+      startTime: metering.startTime,
+      finishReason: mapResponsesStatusToStopReason(
+        response.status,
+        response.incomplete_details?.reason,
+        getLogger(),
+      ),
+      usageMetadata: withResponseIdempotencyKey(responseId, metering.metadata),
+      isStreamed: false,
+      providerInfo: this.providerInfo,
+      messages: metering.messages,
+      responseContent: metering.responseContent,
+      onDeliveryFailure: () => this.ledger.release(responseId),
+    });
   }
 
   private trackFailure(
@@ -624,91 +885,113 @@ export class ResponsesInterface {
   async createStreaming(
     params: Record<string, unknown>,
     metadata?: UsageMetadata,
-  ): Promise<AsyncIterable<unknown>> {
-    const startTime = Date.now();
-    const requestId = randomUUID();
-    // eslint-disable-next-line @typescript-eslint/no-this-alias
-    const self = this;
+  ): Promise<ResponsesStream> {
+    return this.create({ ...params, stream: true }, metadata);
+  }
 
-    const responsesAPI = (this.client as unknown as OpenAIClientWithResponses).responses;
-    if (!responsesAPI?.create) {
-      throw new Error("Responses API not available in this OpenAI SDK version");
+  private instrumentStream(
+    stream: ResponsesStream,
+    params: Record<string, unknown>,
+    startTime: number,
+    requestId: string,
+    metadata?: UsageMetadata,
+  ): ResponsesStream {
+    const providerStream = stream as { iterator?: () => AsyncIterator<unknown> };
+
+    if (typeof providerStream.iterator !== "function") {
+      return this.meterResponseStream(stream, params, startTime, requestId, metadata);
     }
 
-    let stream: unknown;
-    try {
-      stream = await responsesAPI.create({ ...params, stream: true });
-    } catch (error) {
-      this.trackFailure(params, requestId, startTime, true, metadata);
-      throw error;
-    }
+    const originalIterator = providerStream.iterator.bind(providerStream);
+    let instrumented = false;
+    providerStream.iterator = () => {
+      if (instrumented) return originalIterator();
+      instrumented = true;
+      return this.meterResponseStream(
+        { [Symbol.asyncIterator]: originalIterator },
+        params,
+        startTime,
+        requestId,
+        metadata,
+      );
+    };
 
-    return (async function* () {
-      let fullContent = "";
-      let finalResponse: ResponsesAPIResult | null = null;
-      let metered = false;
-      let firstTokenTime: number | undefined;
-      const capturePrompts = shouldCapturePrompts(metadata);
+    return stream;
+  }
 
-      const track = (finishReason: string | null) => {
-        const usage = finalResponse?.usage ?? {};
+  private async *meterResponseStream(
+    stream: AsyncIterable<unknown>,
+    params: Record<string, unknown>,
+    startTime: number,
+    requestId: string,
+    metadata?: UsageMetadata,
+  ): AsyncGenerator<unknown> {
+    let fullContent = "";
+    let finalResponse: ResponsesAPIResult | null = null;
+    let metered = false;
+    let firstTokenTime: number | undefined;
+    const capturePrompts = runWithCallConfig(this.config, () => shouldCapturePrompts(metadata));
+    const maxPromptSize = runWithCallConfig(this.config, getMaxPromptSize);
+
+    const track = (finishReason: string | null) =>
+      runWithCallConfig(this.config, () => {
+        const responseId = finalResponse?.id;
+        if (responseId && !this.ledger.claim(responseId)) return;
+
         trackUsageAsync({
           timeToFirstToken: firstTokenTime ? firstTokenTime - startTime : undefined,
-          requestId: finalResponse?.id || requestId,
+          requestId: responseId || requestId,
           model: finalResponse?.model || (params.model as string),
-          promptTokens: usage.input_tokens || 0,
-          completionTokens: usage.output_tokens || 0,
-          totalTokens: usage.total_tokens || 0,
-          reasoningTokens: usage.output_tokens_details?.reasoning_tokens,
-          cachedTokens: usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens,
+          ...extractResponsesUsage(finalResponse),
           duration: Date.now() - startTime,
           finishReason,
-          usageMetadata: metadata,
+          usageMetadata: responseId ? withResponseIdempotencyKey(responseId, metadata) : metadata,
           isStreamed: true,
-          providerInfo: self.providerInfo,
-          messages: self.inputMessages(params),
+          providerInfo: this.providerInfo,
+          messages: this.inputMessages(params),
           responseContent: fullContent ? sanitizeCredentials(fullContent) : undefined,
+          onDeliveryFailure: responseId ? () => this.ledger.release(responseId) : undefined,
         });
-      };
+      });
 
-      const appendOutput = (delta: string) => {
-        const maxSize = getMaxPromptSize();
-        if (fullContent.length >= maxSize) return;
+    const appendOutput = (delta: string) => {
+      if (fullContent.length >= maxPromptSize) return;
 
-        fullContent += delta;
-        if (fullContent.length > maxSize) {
-          fullContent = sanitizeCredentials(fullContent).slice(0, maxSize);
-        }
-      };
-
-      const terminalStopReason = () =>
-        mapResponsesStatusToStopReason(
-          finalResponse?.status,
-          finalResponse?.incomplete_details?.reason,
-          getLogger(),
-        );
-
-      try {
-        for await (const chunk of stream as unknown as AsyncIterable<Record<string, unknown>>) {
-          if (chunk.type === "response.output_text.delta" && chunk.delta) {
-            firstTokenTime ??= Date.now();
-            if (capturePrompts) appendOutput(chunk.delta as string);
-          }
-          if (TERMINAL_RESPONSE_EVENTS.has(chunk.type as string) && chunk.response) {
-            finalResponse = chunk.response as ResponsesAPIResult;
-          }
-          yield chunk;
-        }
-
-        metered = true;
-        track(terminalStopReason());
-      } catch (error) {
-        metered = true;
-        track("error");
-        throw error;
-      } finally {
-        if (!metered) track(finalResponse ? terminalStopReason() : "cancelled");
+      fullContent += delta;
+      if (fullContent.length > maxPromptSize) {
+        fullContent = sanitizeCredentials(fullContent).slice(0, maxPromptSize);
       }
-    })();
+    };
+
+    const resolvedStopReason = () =>
+      finalResponse
+        ? mapResponsesStatusToStopReason(
+            finalResponse.status,
+            finalResponse.incomplete_details?.reason,
+            getLogger(),
+          )
+        : "cancelled";
+
+    try {
+      for await (const chunk of stream as AsyncIterable<Record<string, unknown>>) {
+        if (chunk.type === "response.output_text.delta" && chunk.delta) {
+          firstTokenTime ??= Date.now();
+          if (capturePrompts) appendOutput(chunk.delta as string);
+        }
+        if (TERMINAL_RESPONSE_EVENTS.has(chunk.type as string) && chunk.response) {
+          finalResponse = chunk.response as ResponsesAPIResult;
+        }
+        yield chunk;
+      }
+
+      metered = true;
+      track(resolvedStopReason());
+    } catch (error) {
+      metered = true;
+      track("error");
+      throw error;
+    } finally {
+      if (!metered) track(resolvedStopReason());
+    }
   }
 }

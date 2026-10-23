@@ -1,5 +1,8 @@
 import { GoogleGenAI, Chat } from "@google/genai";
-import { getLogger } from "../../_core/config/manager.js";
+import { getConfig, getLogger } from "../../_core/config/manager.js";
+import { resolveConfig, runWithCallConfig } from "../../_core/config/call-config.js";
+import { getErrorMessage } from "../../_core/resilience/error-handler.js";
+import { ensureGoogleConfig } from "../config.js";
 import {
   GoogleUsageMetadata,
   IGoogleResponse,
@@ -15,7 +18,13 @@ import {
   IVideoExtendRequest,
   IVideoUpscaleRequest,
 } from "../types.js";
-import { trackGoogleUsageAsync, generateTransactionId } from "../utils.js";
+import {
+  trackGoogleUsageAsync,
+  generateTransactionId,
+  mergeStreamedGoogleResponse,
+  countGoogleEmbeddingTokens,
+  buildGoogleEmbeddingResponse,
+} from "../utils.js";
 
 export class GoogleGenAIService {
   private client: GoogleGenAI;
@@ -23,6 +32,7 @@ export class GoogleGenAIService {
 
   constructor(model: string) {
     this.model = model ?? this.model;
+    ensureGoogleConfig();
     this.client = new GoogleGenAI({
       apiKey: process.env.GOOGLE_API_KEY ?? "",
     });
@@ -55,149 +65,180 @@ export class GoogleGenAIService {
   public createChat = async (
     prompts: string[],
     usageMetadata?: GoogleUsageMetadata,
-  ): Promise<IGoogleResponseChat> => {
-    const logger = getLogger();
-    const chat = this.client.chats.create({ model: this.model });
-    const result: IGoogleResponse[] = [];
+  ): Promise<IGoogleResponseChat> =>
+    runWithCallConfig(getConfig(), async () => {
+      const logger = getLogger();
+      const chat = this.client.chats.create({ model: this.model });
+      const result: IGoogleResponse[] = [];
 
-    for (const prompt of prompts) {
-      const startTime = new Date();
-      const transactionId = generateTransactionId();
-      const response = await chat.sendMessage({ message: prompt });
-      const endTime = new Date();
+      for (const prompt of prompts) {
+        const startTime = new Date();
+        const transactionId = generateTransactionId();
 
-      result.push(this.buildResponseObject(response));
+        const meterChat = (response: any, error?: unknown): void => {
+          void trackGoogleUsageAsync({
+            transactionId,
+            model: this.model,
+            startTime,
+            endTime: new Date(),
+            response,
+            operationType: "CHAT",
+            isStreaming: false,
+            modelSource: "GOOGLE",
+            usageMetadata,
+            prompts: [prompt],
+            error,
+          }).catch((e) => logger.warn("Metering send failed", { error: getErrorMessage(e) }));
+        };
 
-      void trackGoogleUsageAsync({
-        transactionId,
-        model: this.model,
-        startTime,
-        endTime,
-        response,
-        operationType: "CHAT",
-        isStreaming: false,
-        modelSource: "GOOGLE",
-        usageMetadata,
-        prompts: [prompt],
-      }).catch((error) =>
-        logger.warn("Metering send failed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
-    }
+        let response;
+        try {
+          response = await chat.sendMessage({ message: prompt });
+        } catch (error) {
+          meterChat(null, error);
+          throw error;
+        }
 
-    const histories = this.extractHistories(chat);
-    return { histories, responses: result };
-  };
+        meterChat(response);
+        result.push(this.buildResponseObject(response));
+      }
+
+      const histories = this.extractHistories(chat);
+      return { histories, responses: result };
+    });
 
   public createStreaming = async (
     prompts: string[],
     usageMetadata?: GoogleUsageMetadata,
-  ): Promise<IGoogleStreamingResponse> => {
-    const logger = getLogger();
-    const startTime = new Date();
-    const transactionId = generateTransactionId();
+  ): Promise<IGoogleStreamingResponse> =>
+    runWithCallConfig(getConfig(), async () => {
+      const logger = getLogger();
+      const startTime = new Date();
+      const transactionId = generateTransactionId();
 
-    const originalStream = await this.client.models.generateContentStream({
-      model: this.model,
-      contents: prompts.join("\n"),
-    });
+      const model = this.model;
 
-    const model = this.model;
+      const callConfig = resolveConfig();
 
-    const wrappedStream: AsyncIterable<any> = {
-      [Symbol.asyncIterator]: async function* () {
-        let firstTokenTime: Date | undefined;
-        let lastResponse: any = null;
-
-        try {
-          for await (const chunk of originalStream) {
-            if (!firstTokenTime) {
-              firstTokenTime = new Date();
-            }
-            lastResponse = chunk;
-            yield chunk;
-          }
-        } finally {
-          const timeToFirstToken = firstTokenTime
-            ? firstTokenTime.getTime() - startTime.getTime()
-            : undefined;
-
-          void trackGoogleUsageAsync({
+      const meterStream = (
+        response: any,
+        timeToFirstToken: number | undefined,
+        error?: unknown,
+      ): void => {
+        void runWithCallConfig(callConfig, () =>
+          trackGoogleUsageAsync({
             transactionId,
             model,
             startTime,
             endTime: new Date(),
-            response: lastResponse,
+            response,
             operationType: "CHAT",
             isStreaming: true,
             modelSource: "GOOGLE",
             usageMetadata,
             prompts,
             timeToFirstToken,
-          }).catch((error) =>
-            logger.warn("Streaming metering failed", {
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          );
-        }
-      },
-    };
+            error,
+          }),
+        ).catch((e) => logger.warn("Streaming metering failed", { error: getErrorMessage(e) }));
+      };
 
-    return {
-      stream: wrappedStream,
-      length: prompts.length,
-      isStreaming: true,
-    };
-  };
+      let originalStream;
+      try {
+        originalStream = await this.client.models.generateContentStream({
+          model: this.model,
+          contents: prompts.join("\n"),
+        });
+      } catch (error) {
+        meterStream(null, undefined, error);
+        throw error;
+      }
+
+      let metered = false;
+
+      const wrappedStream: AsyncIterable<any> = {
+        [Symbol.asyncIterator]: async function* () {
+          let firstTokenTime: Date | undefined;
+          let lastResponse: any = null;
+
+          const meterOnce = (error?: unknown) => {
+            if (metered) return;
+            metered = true;
+            meterStream(
+              lastResponse,
+              firstTokenTime ? firstTokenTime.getTime() - startTime.getTime() : undefined,
+              error,
+            );
+          };
+
+          try {
+            for await (const chunk of originalStream) {
+              if (!firstTokenTime) {
+                firstTokenTime = new Date();
+              }
+              lastResponse = mergeStreamedGoogleResponse(lastResponse, chunk);
+              yield chunk;
+            }
+          } catch (error) {
+            meterOnce(error);
+            throw error;
+          } finally {
+            meterOnce();
+          }
+        },
+      };
+
+      return {
+        stream: wrappedStream,
+        length: prompts.length,
+        isStreaming: true,
+      };
+    });
 
   public createEmbedding = async (
     prompt: string,
     usageMetadata?: GoogleUsageMetadata,
-  ): Promise<IGoogleEmbeddingResponse> => {
-    const logger = getLogger();
-    const startTime = new Date();
-    const transactionId = generateTransactionId();
+  ): Promise<IGoogleEmbeddingResponse> =>
+    runWithCallConfig(getConfig(), async () => {
+      const logger = getLogger();
+      const startTime = new Date();
+      const transactionId = generateTransactionId();
 
-    const response = await this.client.models.embedContent({
-      model: this.model,
-      contents: prompt,
+      const meterEmbedding = (response: any, error?: unknown): void => {
+        void trackGoogleUsageAsync({
+          transactionId,
+          model: this.model,
+          startTime,
+          endTime: new Date(),
+          response,
+          operationType: "EMBED",
+          isStreaming: false,
+          modelSource: "GOOGLE",
+          usageMetadata,
+          prompts: [prompt],
+          resolveInputTokens: () =>
+            countGoogleEmbeddingTokens(() =>
+              this.client.models.countTokens({ model: this.model, contents: prompt }),
+            ),
+          error,
+        }).catch((e) => logger.warn("Embedding metering failed", { error: getErrorMessage(e) }));
+      };
+
+      let response;
+      try {
+        response = await this.client.models.embedContent({
+          model: this.model,
+          contents: prompt,
+        });
+      } catch (error) {
+        meterEmbedding(null, error);
+        throw error;
+      }
+
+      meterEmbedding(response);
+
+      return buildGoogleEmbeddingResponse(response);
     });
-
-    const endTime = new Date();
-
-    void trackGoogleUsageAsync({
-      transactionId,
-      model: this.model,
-      startTime,
-      endTime,
-      response,
-      operationType: "EMBED",
-      isStreaming: false,
-      modelSource: "GOOGLE",
-      usageMetadata,
-      prompts: [prompt],
-    }).catch((error) =>
-      logger.warn("Embedding metering failed", {
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-
-    const extendedResponse = response as typeof response & {
-      modelVersion?: string;
-      usageMetadata?: { totalTokenCount?: number; promptTokenCount?: number };
-    };
-    return {
-      embedding: {
-        embedding: response.embeddings?.[0]?.values ?? [],
-        modelVersion: extendedResponse.modelVersion ?? "",
-        usageMetadata: {
-          totalTokenCount: extendedResponse.usageMetadata?.totalTokenCount ?? 0,
-          promptTokenCount: extendedResponse.usageMetadata?.promptTokenCount ?? 0,
-        },
-      },
-    };
-  };
 
   public generateImage = async (
     _request: IImageGenerationRequest,

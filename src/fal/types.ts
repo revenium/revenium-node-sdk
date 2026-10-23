@@ -40,6 +40,7 @@ export interface FalImageResult {
 export interface FalVideoResult {
   video?: { url: string; content_type?: string; file_name?: string; file_size?: number };
   file_url?: string;
+  duration?: number | string;
   timings?: Record<string, number>;
 }
 
@@ -47,8 +48,9 @@ export interface FalAudioResult {
   audio_url?: string;
   audio?: { url: string; content_type?: string };
   file_url?: string;
-  duration?: number;
+  duration?: number | string;
   text?: string;
+  chunks?: Array<{ timestamp?: [number | null, number | null]; text?: string }>;
   timings?: Record<string, number>;
 }
 

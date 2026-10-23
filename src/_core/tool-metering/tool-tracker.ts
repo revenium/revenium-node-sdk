@@ -3,6 +3,17 @@ import { ToolMetadata, ToolCallReport, ToolEventPayload } from "../types/tool-me
 import { getToolContext } from "./tool-context.js";
 import { sendToolEvent } from "./tool-api-client.js";
 import { getLogger } from "../config/manager.js";
+import { resolveAgenticJobFields } from "../metadata/metadata-builder.js";
+
+interface ToolEventPayloadInput {
+  toolId: string;
+  durationMs: number;
+  success: boolean;
+  middlewareSource: string;
+  errorMessage?: string;
+  timestamp?: string;
+  fields?: ToolMetadata;
+}
 
 function isPromise<T>(value: unknown): value is Promise<T> {
   return (
@@ -21,32 +32,53 @@ function extractOutputFields(result: unknown, fields: string[]): Record<string, 
   return extracted;
 }
 
-function buildToolEventPayload(
-  toolId: string,
-  durationMs: number,
-  success: boolean,
-  middlewareSource: string,
-  metadata?: ToolMetadata,
-  errorMessage?: string,
-): ToolEventPayload {
+function resolveAgenticJobId(fields?: ToolMetadata): string | undefined {
+  const perCallJobId = fields?.agenticJobId || fields?.usageMetadata?.agenticJobId;
+
+  return resolveAgenticJobFields({
+    agenticJobId: perCallJobId ? String(perCallJobId) : undefined,
+  }).agenticJobId;
+}
+
+function resolveCostUsd(costUsd?: number): number | undefined {
+  if (costUsd === undefined) return undefined;
+
+  if (!Number.isFinite(costUsd) || costUsd < 0) {
+    getLogger().warn("costUsd is not a non-negative finite number. Dropping it.", { costUsd });
+    return undefined;
+  }
+
+  return costUsd;
+}
+
+function buildToolEventPayload({
+  toolId,
+  durationMs,
+  success,
+  middlewareSource,
+  errorMessage,
+  timestamp,
+  fields,
+}: ToolEventPayloadInput): ToolEventPayload {
   const context = getToolContext();
-  const transactionId = metadata?.transactionId ?? context.transactionId ?? randomUUID();
 
   return {
-    transactionId,
+    transactionId: fields?.transactionId ?? context.transactionId ?? randomUUID(),
     toolId,
-    operation: metadata?.operation,
+    operation: fields?.operation,
     durationMs,
     success,
-    timestamp: new Date().toISOString(),
+    timestamp: timestamp ?? new Date().toISOString(),
     errorMessage,
-    usageMetadata: metadata?.usageMetadata,
-    agent: metadata?.agent ?? context.agent,
-    organizationName: metadata?.organizationName ?? context.organizationName,
-    productName: metadata?.productName ?? context.productName,
-    subscriberCredential: metadata?.subscriberCredential ?? context.subscriberCredential,
-    workflowId: metadata?.workflowId ?? context.workflowId,
-    traceId: metadata?.traceId ?? context.traceId,
+    usageMetadata: fields?.usageMetadata,
+    agent: fields?.agent ?? context.agent,
+    organizationName: fields?.organizationName ?? context.organizationName,
+    productName: fields?.productName ?? context.productName,
+    subscriberCredential: fields?.subscriberCredential ?? context.subscriberCredential,
+    workflowId: fields?.workflowId ?? context.workflowId,
+    traceId: fields?.traceId ?? context.traceId,
+    agenticJobId: resolveAgenticJobId(fields),
+    costUsd: resolveCostUsd(fields?.costUsd),
     middlewareSource,
   };
 }
@@ -89,29 +121,30 @@ export function meterTool<T>(
       };
     }
 
-    const payload = buildToolEventPayload(
-      toolId,
-      durationMs,
-      true,
-      middlewareSource,
-      finalMetadata,
+    dispatchToolEvent(
+      buildToolEventPayload({
+        toolId,
+        durationMs,
+        success: true,
+        middlewareSource,
+        fields: finalMetadata,
+      }),
     );
-    dispatchToolEvent(payload);
     return result;
   };
 
   const handleError = (error: unknown): never => {
     const durationMs = Math.round(performance.now() - startTime);
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const payload = buildToolEventPayload(
-      toolId,
-      durationMs,
-      false,
-      middlewareSource,
-      metadata,
-      errorMessage,
+    dispatchToolEvent(
+      buildToolEventPayload({
+        toolId,
+        durationMs,
+        success: false,
+        middlewareSource,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        fields: metadata,
+      }),
     );
-    dispatchToolEvent(payload);
     throw error;
   };
 
@@ -131,26 +164,15 @@ export function reportToolCall(
   report: ToolCallReport,
   middlewareSource: string = "revenium-node",
 ): void {
-  const context = getToolContext();
-  const transactionId = report.transactionId ?? context.transactionId ?? randomUUID();
-
-  const payload: ToolEventPayload = {
-    transactionId,
-    toolId,
-    operation: report.operation,
-    durationMs: report.durationMs,
-    success: report.success,
-    timestamp: report.timestamp ?? new Date().toISOString(),
-    errorMessage: report.errorMessage,
-    usageMetadata: report.usageMetadata,
-    agent: report.agent ?? context.agent,
-    organizationName: report.organizationName ?? context.organizationName,
-    productName: report.productName ?? context.productName,
-    subscriberCredential: report.subscriberCredential ?? context.subscriberCredential,
-    workflowId: report.workflowId ?? context.workflowId,
-    traceId: report.traceId ?? context.traceId,
-    middlewareSource,
-  };
-
-  dispatchToolEvent(payload);
+  dispatchToolEvent(
+    buildToolEventPayload({
+      toolId,
+      durationMs: report.durationMs,
+      success: report.success,
+      middlewareSource,
+      errorMessage: report.errorMessage,
+      timestamp: report.timestamp,
+      fields: report,
+    }),
+  );
 }

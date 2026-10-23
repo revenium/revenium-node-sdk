@@ -1,5 +1,6 @@
 import { UsageMetadata, ReveniumPayload } from "../_core/types/index.js";
-import { getConfig, getLogger } from "../_core/config/manager.js";
+import { getLogger } from "../_core/config/manager.js";
+import { resolveConfig } from "../_core/config/call-config.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import { buildPayload } from "../_core/metering/payload-builder.js";
 import {
@@ -157,7 +158,7 @@ function extractAnthropicThinkingTokens(
   return usage?.output_tokens_details?.thinking_tokens ?? undefined;
 }
 
-export function extractUsageFromResponse(response: any): {
+export interface AnthropicUsageCounts {
   inputTokens: number;
   outputTokens: number;
   cacheCreationTokens?: number;
@@ -166,30 +167,67 @@ export function extractUsageFromResponse(response: any): {
   cacheCreation1hTokens?: number;
   reasoningTokens?: number;
   stopReason?: string;
-} {
-  const usage = response?.usage || {};
-  const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(usage);
-  return {
-    inputTokens: usage.input_tokens || 0,
-    outputTokens: usage.output_tokens || 0,
-    cacheCreationTokens,
-    cacheReadTokens,
-    ...extractCacheCreationSplit(usage),
-    reasoningTokens: extractAnthropicThinkingTokens(usage),
-    stopReason: response?.stop_reason,
-  };
 }
 
-export function extractUsageFromStream(chunks: any[]): {
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens?: number;
-  cacheReadTokens?: number;
-  cacheCreation5mTokens?: number;
-  cacheCreation1hTokens?: number;
-  reasoningTokens?: number;
-  stopReason?: string;
-} {
+function addReportedTokens(total: number | undefined, additional: unknown): number | undefined {
+  if (typeof additional !== "number" || !Number.isFinite(additional) || additional === 0) {
+    return total;
+  }
+  return (total ?? 0) + additional;
+}
+
+function addCompactionIterationTokens(
+  counts: AnthropicUsageCounts,
+  iterations: unknown,
+): AnthropicUsageCounts {
+  if (!Array.isArray(iterations)) return counts;
+
+  return iterations
+    .filter((iteration: any) => iteration?.type === "compaction")
+    .reduce(
+      (total: AnthropicUsageCounts, iteration: any) => ({
+        ...total,
+        inputTokens: total.inputTokens + (iteration.input_tokens || 0),
+        outputTokens: total.outputTokens + (iteration.output_tokens || 0),
+        cacheCreationTokens: addReportedTokens(
+          total.cacheCreationTokens,
+          iteration.cache_creation_input_tokens,
+        ),
+        cacheReadTokens: addReportedTokens(
+          total.cacheReadTokens,
+          iteration.cache_read_input_tokens,
+        ),
+        cacheCreation5mTokens: addReportedTokens(
+          total.cacheCreation5mTokens,
+          iteration.cache_creation?.ephemeral_5m_input_tokens,
+        ),
+        cacheCreation1hTokens: addReportedTokens(
+          total.cacheCreation1hTokens,
+          iteration.cache_creation?.ephemeral_1h_input_tokens,
+        ),
+      }),
+      counts,
+    );
+}
+
+export function extractUsageFromResponse(response: any): AnthropicUsageCounts {
+  const usage = response?.usage || {};
+  const { cacheReadTokens, cacheCreationTokens } = extractCacheTokenCounts(usage);
+  return addCompactionIterationTokens(
+    {
+      inputTokens: usage.input_tokens || 0,
+      outputTokens: usage.output_tokens || 0,
+      cacheCreationTokens,
+      cacheReadTokens,
+      ...extractCacheCreationSplit(usage),
+      reasoningTokens: extractAnthropicThinkingTokens(usage),
+      stopReason: response?.stop_reason,
+    },
+    usage.iterations,
+  );
+}
+
+export function extractUsageFromStream(chunks: any[]): AnthropicUsageCounts {
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheCreationTokens: number | undefined;
@@ -198,6 +236,7 @@ export function extractUsageFromStream(chunks: any[]): {
   let cacheCreation1hTokens: number | undefined;
   let reasoningTokens: number | undefined;
   let stopReason: string | undefined;
+  let iterations: unknown;
 
   for (const chunk of chunks) {
     let usage = null;
@@ -236,18 +275,24 @@ export function extractUsageFromStream(chunks: any[]): {
     if (chunk?.delta?.stop_reason) {
       stopReason = chunk.delta.stop_reason;
     }
+    if (Array.isArray(usage?.iterations)) {
+      iterations = usage.iterations;
+    }
   }
 
-  return {
-    inputTokens,
-    outputTokens,
-    cacheCreationTokens,
-    cacheReadTokens,
-    cacheCreation5mTokens,
-    cacheCreation1hTokens,
-    reasoningTokens,
-    stopReason,
-  };
+  return addCompactionIterationTokens(
+    {
+      inputTokens,
+      outputTokens,
+      cacheCreationTokens,
+      cacheReadTokens,
+      cacheCreation5mTokens,
+      cacheCreation1hTokens,
+      reasoningTokens,
+      stopReason,
+    },
+    iterations,
+  );
 }
 
 export function reconstructResponseFromChunks(chunks: any[], model: string): any {
@@ -299,7 +344,7 @@ export function reconstructResponseFromChunks(chunks: any[], model: string): any
 }
 
 export function trackUsageAsync(data: AnthropicTrackingData): void {
-  const config = getConfig();
+  const config = resolveConfig();
   const logger = getLogger();
 
   if (!config) {

@@ -68,7 +68,7 @@ describe("OpenAI multimodal operationSubtype", () => {
     expect(payload.operationType).toBe("AUDIO");
     expect(payload.operationSubtype).toBe("tts");
     expect(payload.characterCount).toBe(5);
-    expect(payload.attributes?.billing_unit).toBe("per_character");
+    expect(payload.billingUnit).toBe("PER_CHARACTER");
   });
 
   it("lets caller metadata override the speech subtype", async () => {
@@ -96,18 +96,59 @@ describe("OpenAI multimodal operationSubtype", () => {
     expect(meteredPayload().operationSubtype).toBe("tts");
   });
 
-  it("meters a transcription call as transcription", async () => {
-    const create = jest.fn().mockResolvedValue({ text: "hello", duration: 12 });
+  async function meterTranscription(model: string, response: unknown): Promise<ReveniumPayload> {
+    const create = jest.fn().mockResolvedValue(response);
     const transcriptions = new middleware.AudioTranscriptionsInterface(
       { create } as never,
       {} as never,
       providerInfo,
     );
 
-    await transcriptions.create({ model: "whisper-1", file: {} } as never);
+    await transcriptions.create({ model, file: {} } as never);
     await flushPromises();
 
-    expect(meteredPayload().operationSubtype).toBe("transcription");
+    return meteredPayload();
+  }
+
+  it("meters a transcription call as transcription", async () => {
+    const payload = await meterTranscription("whisper-1", { text: "hello", duration: 12 });
+
+    expect(payload.operationSubtype).toBe("transcription");
+  });
+
+  it("meters a whisper transcription with the seconds and billing unit the platform prices", async () => {
+    const payload = await meterTranscription("whisper-1", {
+      text: "hello",
+      usage: { type: "duration", seconds: 2 },
+    });
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(2);
+  });
+
+  it("meters a token-billed transcription with its audio input tokens", async () => {
+    const payload = await meterTranscription("gpt-4o-mini-transcribe", {
+      text: "hello",
+      usage: {
+        type: "tokens",
+        total_tokens: 26,
+        input_tokens: 19,
+        input_token_details: { text_tokens: 0, audio_tokens: 19 },
+        output_tokens: 7,
+      },
+    });
+
+    expect(payload.billingUnit).toBe("PER_TOKEN");
+    expect(payload.inputAudioTokenCount).toBe(19);
+    expect(payload.inputTokenCount).toBe(19);
+    expect(payload.outputTokenCount).toBe(7);
+  });
+
+  it("meters a plain-text transcription response without throwing", async () => {
+    const payload = await meterTranscription("whisper-1", "hello");
+
+    expect(payload.billingUnit).toBe("PER_SECOND");
+    expect(payload.durationSeconds).toBe(0);
   });
 
   it.each([

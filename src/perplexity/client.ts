@@ -2,8 +2,10 @@ import OpenAI from "openai";
 import { Config } from "../_core/types/index.js";
 import { getConfig, setConfig, initializeConfig } from "../_core/config/manager.js";
 import { validateConfig } from "../_core/config/validator.js";
+import { snapshotClientConfig } from "../_core/config/client-config.js";
 import { DEFAULT_REVENIUM_BASE_URL } from "../_core/constants.js";
 import { ChatInterface } from "./middleware.js";
+import { resetMeteringWarnings } from "../_core/metering/metering-context.js";
 
 const DEFAULT_PERPLEXITY_BASE_URL = "https://api.perplexity.ai";
 
@@ -17,15 +19,16 @@ export class ReveniumPerplexity {
   private config: PerplexityConfig;
 
   constructor(config: PerplexityConfig) {
-    this.config = config;
+    this.config = snapshotClientConfig(config);
+    validateConfig(this.config);
     this.client = new OpenAI({
-      apiKey: config.perplexityApiKey,
-      baseURL: config.perplexityBaseUrl || DEFAULT_PERPLEXITY_BASE_URL,
+      apiKey: this.config.perplexityApiKey,
+      baseURL: this.config.perplexityBaseUrl || DEFAULT_PERPLEXITY_BASE_URL,
     });
   }
 
   chat(): ChatInterface {
-    return new ChatInterface(this.client);
+    return new ChatInterface(this.client, this.config);
   }
 
   getUnderlyingClient(): OpenAI {
@@ -95,6 +98,7 @@ export function IsInitialized(): boolean {
 }
 
 export function Reset(): void {
+  resetMeteringWarnings();
   globalClient = null;
 }
 

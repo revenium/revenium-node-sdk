@@ -15,6 +15,7 @@ const perPersonRule: EnforcementRule = {
   action: "BLOCK",
   breached: true,
   shadowMode: false,
+  filters: [],
   groupBy: "SUBSCRIBER",
   groupBreakdown: [
     { groupValue: "alice@example.com", currentValue: 7.5, breached: true },
@@ -30,6 +31,7 @@ const departmentRule: EnforcementRule = {
   action: "BLOCK",
   breached: true,
   shadowMode: false,
+  filters: [],
   groupBy: "SUBSCRIBER",
   departmentId: 173,
 };
@@ -42,6 +44,7 @@ const pooledRule: EnforcementRule = {
   action: "BLOCK",
   breached: true,
   shadowMode: false,
+  filters: [],
 };
 
 function snapshotOf(rules: EnforcementRule[], departments?: Partial<EnforcementSnapshot>): void {
@@ -219,5 +222,93 @@ describe("enforcePreCallRules", () => {
     snapshotOf([]);
 
     expect(() => enforcePreCallRules({ subscriberEmail: "alice@example.com" })).not.toThrow();
+  });
+
+  it("skips a breached rule whose filters do not cover the call", () => {
+    snapshotOf([
+      {
+        ...pooledRule,
+        filters: [{ dimension: "PROVIDER", operator: "IS", value: "anthropic", values: [] }],
+      },
+    ]);
+
+    expect(() => enforcePreCallRules({ provider: "OpenAI" })).not.toThrow();
+  });
+
+  it("acts on a breached rule whose filters cover the call", () => {
+    snapshotOf([
+      {
+        ...pooledRule,
+        filters: [{ dimension: "PROVIDER", operator: "IS", value: "openai", values: [] }],
+      },
+    ]);
+
+    expect(() => enforcePreCallRules({ provider: "OpenAI" })).toThrow(CostLimitExceeded);
+  });
+
+  it("still blocks a department-scoped rule that carries filters", () => {
+    snapshotOf(
+      [
+        {
+          ...departmentRule,
+          filters: [{ dimension: "DEPARTMENT", operator: "IS", value: "173", values: [] }],
+        },
+      ],
+      {
+        departmentBlocks: new Map([["bob@example.com", 301]]),
+        departmentBlockBalances: new Map([["bob@example.com", 6.25]]),
+      },
+    );
+
+    expect(() => enforcePreCallRules({ subscriberEmail: "bob@example.com" })).toThrow(
+      "Cost limit exceeded: $6.25 of $5.00 daily limit reached",
+    );
+  });
+
+  it("applies the evaluable filters of a department-scoped rule", () => {
+    snapshotOf(
+      [
+        {
+          ...departmentRule,
+          filters: [
+            { dimension: "DEPARTMENT", operator: "IS", value: "173", values: [] },
+            { dimension: "PROVIDER", operator: "IS", value: "anthropic", values: [] },
+          ],
+        },
+      ],
+      {
+        departmentBlocks: new Map([["bob@example.com", 301]]),
+        departmentBlockBalances: new Map([["bob@example.com", 6.25]]),
+      },
+    );
+
+    expect(() =>
+      enforcePreCallRules({ subscriberEmail: "bob@example.com", provider: "OpenAI" }),
+    ).not.toThrow();
+    expect(() =>
+      enforcePreCallRules({ subscriberEmail: "bob@example.com", provider: "Anthropic" }),
+    ).toThrow("Cost limit exceeded: $6.25 of $5.00 daily limit reached");
+  });
+
+  it("blocks nobody on a department-scoped rule carrying a row it cannot evaluate", () => {
+    snapshotOf(
+      [
+        {
+          ...departmentRule,
+          filters: [
+            { dimension: "DEPARTMENT", operator: "IS", value: "173", values: [] },
+            { dimension: "WORKSPACE", operator: "IS", value: "w1", values: [] },
+          ],
+        },
+      ],
+      {
+        departmentBlocks: new Map([["bob@example.com", 301]]),
+        departmentBlockBalances: new Map([["bob@example.com", 6.25]]),
+      },
+    );
+
+    expect(() =>
+      enforcePreCallRules({ subscriberEmail: "bob@example.com", provider: "OpenAI" }),
+    ).not.toThrow();
   });
 });

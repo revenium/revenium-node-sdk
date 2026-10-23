@@ -152,9 +152,68 @@ describe("extractUsageFromResponse", () => {
 
     expect(result.reasoningTokens).toBeUndefined();
   });
+
+  it("adds compaction iteration tokens that the top-level usage excludes", () => {
+    const result = extractUsageFromResponse({
+      usage: {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_creation_input_tokens: 25,
+        cache_read_input_tokens: 15,
+        iterations: [
+          { type: "message", input_tokens: 100, output_tokens: 50 },
+          {
+            type: "compaction",
+            input_tokens: 2000,
+            output_tokens: 300,
+            cache_creation_input_tokens: 40,
+            cache_read_input_tokens: 10,
+            cache_creation: { ephemeral_5m_input_tokens: 40, ephemeral_1h_input_tokens: 0 },
+          },
+        ],
+      },
+    });
+
+    expect(result.inputTokens).toBe(2100);
+    expect(result.outputTokens).toBe(350);
+    expect(result.cacheCreationTokens).toBe(65);
+    expect(result.cacheReadTokens).toBe(25);
+    expect(result.cacheCreation5mTokens).toBe(40);
+  });
+
+  it("leaves usage untouched when no compaction iteration is reported", () => {
+    const result = extractUsageFromResponse({
+      usage: {
+        input_tokens: 100,
+        output_tokens: 50,
+        iterations: [{ type: "message", input_tokens: 100, output_tokens: 50 }],
+      },
+    });
+
+    expect(result.inputTokens).toBe(100);
+    expect(result.outputTokens).toBe(50);
+    expect(result.cacheCreationTokens).toBeUndefined();
+  });
 });
 
 describe("extractUsageFromStream", () => {
+  it("adds compaction iteration tokens reported on the message_delta usage", () => {
+    const result = extractUsageFromStream([
+      { type: "message_start", message: { usage: { input_tokens: 100, output_tokens: 1 } } },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: {
+          output_tokens: 50,
+          iterations: [{ type: "compaction", input_tokens: 2000, output_tokens: 300 }],
+        },
+      },
+    ]);
+
+    expect(result.inputTokens).toBe(2100);
+    expect(result.outputTokens).toBe(350);
+  });
+
   it("extracts cache tokens from message_start chunk", () => {
     const chunks = [
       {

@@ -56,7 +56,7 @@ describe("ReveniumFal.run", () => {
     };
     mockRun.mockResolvedValue(expectedResult);
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     const result = await client.run("fal-ai/flux/dev", { input: { prompt: "a cat" } });
 
     expect(result).toEqual(expectedResult);
@@ -72,7 +72,7 @@ describe("ReveniumFal.run", () => {
       requestId: "req-456",
     });
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     await client.run("fal-ai/flux/dev", { input: { prompt: "test" } });
 
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -90,7 +90,7 @@ describe("ReveniumFal.run", () => {
       requestId: "req-789",
     });
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     const result = await client.run("fal-ai/flux/dev", { input: {} });
 
     expect(result.requestId).toBe("req-789");
@@ -108,7 +108,7 @@ describe("ReveniumFal.subscribe", () => {
     };
     mockSubscribe.mockResolvedValue(expectedResult);
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     const result = await client.subscribe("fal-ai/kling-video/v2/master/text-to-video", {
       input: { prompt: "a horse running", duration: 5 },
     });
@@ -125,7 +125,7 @@ describe("ReveniumFal.subscribe", () => {
       requestId: "req-video-2",
     });
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     await client.subscribe("fal-ai/kling-video/v2/master/text-to-video", {
       input: { prompt: "test", duration: 10 },
     });
@@ -154,7 +154,7 @@ describe("ReveniumFal.stream", () => {
     };
     mockStream.mockResolvedValue(mockFalStream);
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     const stream = await client.stream("openrouter/router", {
       input: { prompt: "test", model: "google/gemini-2.5-flash" },
     });
@@ -176,7 +176,7 @@ describe("ReveniumFal.stream", () => {
     };
     mockStream.mockResolvedValue(mockFalStream);
 
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     await client.stream("openrouter/router", {
       input: { prompt: "test", model: "google/gemini-2.5-flash" },
     });
@@ -198,14 +198,36 @@ describe("ReveniumFal.stream", () => {
 
 describe("ReveniumFal passthrough APIs", () => {
   it("exposes queue, realtime, storage from underlying client", () => {
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     expect(client.queue).toBeDefined();
     expect(client.realtime).toBeDefined();
     expect(client.storage).toBeDefined();
   });
 
   it("exposes underlying client via getUnderlyingClient", () => {
-    const client = new ReveniumFal({ reveniumApiKey: "test-key" });
+    const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
     expect(client.getUnderlyingClient()).toBeDefined();
+  });
+});
+
+describe("ReveniumFal organization isolation", () => {
+  it("sends usage under the client key while the process holds another", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    setConfig(createReveniumConfig({ reveniumApiKey: "hak_org_b_2222222222" }));
+    mockRun.mockResolvedValue({
+      data: { images: [{ url: "a.png", width: 512, height: 512 }] },
+      requestId: "req-org-a",
+    });
+
+    const client = new ReveniumFal({
+      reveniumApiKey: "hak_org_a_1111111111",
+      reveniumBaseUrl: "https://api.revenium.ai",
+    });
+    await client.run("fal-ai/flux/dev", { input: { prompt: "a cat" } });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockFetch.mock.calls[0][1].headers["x-api-key"]).toBe("hak_org_a_1111111111");
   });
 });

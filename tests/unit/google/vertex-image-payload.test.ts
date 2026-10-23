@@ -28,6 +28,8 @@ describe("Vertex image metering payload", () => {
         baseArgs.middlewareSource,
       );
 
+      expect(payload.resolution).toBe("768x1024");
+      expect(payload.quality).toBe("standard");
       expect(payload.attributes!.resolution).toBe("768x1024");
       expect(payload.attributes!.quality).toBe("standard");
       expect(payload.model).toBe("imagen-3.0-generate-002");
@@ -51,8 +53,8 @@ describe("Vertex image metering payload", () => {
         baseArgs.middlewareSource,
       );
 
-      expect(payload.attributes!.resolution).toBe("1024x1024");
-      expect(payload.attributes!.quality).toBe("standard");
+      expect(payload.resolution).toBe("1024x1024");
+      expect(payload.quality).toBe("standard");
     });
 
     it.each([
@@ -77,16 +79,16 @@ describe("Vertex image metering payload", () => {
         baseArgs.middlewareSource,
       );
 
-      expect(payload.attributes!.resolution).toBe(expectedResolution);
+      expect(payload.resolution).toBe(expectedResolution);
     });
   });
 
-  describe("editImage", () => {
-    it("sends resolution 1024x1024", () => {
+  describe("edit payload", () => {
+    it("sends no top-level resolution when the request carries no size", () => {
       const payload = buildImagePayload(
         "edit",
         { data: [{ bytesBase64Encoded: "abc" }] },
-        { n: 1, model: "imagen-3.0-capability-001", size: "1024x1024", quality: "standard" },
+        { n: 1, model: "imagen-3.0-capability-001", quality: "standard" },
         baseArgs.startTime,
         baseArgs.duration,
         baseArgs.provider,
@@ -94,13 +96,13 @@ describe("Vertex image metering payload", () => {
         baseArgs.middlewareSource,
       );
 
-      expect(payload.attributes!.resolution).toBe("1024x1024");
+      expect(payload.resolution).toBeUndefined();
       expect(payload.model).toBe("imagen-3.0-capability-001");
     });
   });
 
   describe("upscaleImage", () => {
-    it("sends default resolution 1024x1024 and the upscale subtype", () => {
+    it("sends no top-level resolution and the upscale subtype", () => {
       const payload = buildImagePayload(
         "upscale",
         { data: [{ bytesBase64Encoded: "abc" }] },
@@ -112,7 +114,7 @@ describe("Vertex image metering payload", () => {
         baseArgs.middlewareSource,
       );
 
-      expect(payload.attributes!.resolution).toBe("1024x1024");
+      expect(payload.resolution).toBeUndefined();
       expect(payload.model).toBe("imagen-3.0-generate-002");
       expect(payload.operationSubtype).toBe("upscale");
     });

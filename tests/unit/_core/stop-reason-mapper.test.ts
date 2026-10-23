@@ -37,6 +37,7 @@ describe("mapStopReason", () => {
     ["pause_turn", "END"],
     ["refusal", "ERROR"],
     ["model_context_window_exceeded", "TOKEN_LIMIT"],
+    ["compaction", "END"],
   ])("maps '%s' to '%s'", (input, expected) => {
     expect(mapStopReason(input)).toBe(expected);
   });
@@ -57,6 +58,12 @@ describe("mapStopReason", () => {
   it("returns END for null/undefined", () => {
     expect(mapStopReason(null)).toBe("END");
     expect(mapStopReason(undefined)).toBe("END");
+  });
+
+  it("maps the beta-only compaction reason without warning", () => {
+    const warn = jest.fn();
+    expect(mapStopReason("compaction", { warn })).toBe("END");
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("returns END for unknown reasons and warns", () => {

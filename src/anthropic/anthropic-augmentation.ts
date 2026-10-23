@@ -15,3 +15,17 @@ declare module "@anthropic-ai/sdk/resources/messages" {
     usageMetadata?: UsageMetadata;
   }
 }
+
+declare module "@anthropic-ai/sdk/resources/beta/messages/messages" {
+  interface MessageCreateParamsBase {
+    usageMetadata?: UsageMetadata;
+  }
+
+  interface MessageCreateParamsNonStreaming {
+    usageMetadata?: UsageMetadata;
+  }
+
+  interface MessageCreateParamsStreaming {
+    usageMetadata?: UsageMetadata;
+  }
+}

@@ -1,5 +1,9 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ReveniumConfig, SummaryFormat } from "../types/index.js";
 import { DEFAULT_REVENIUM_BASE_URL, ENV_VARS } from "../constants.js";
+import { parseEnvFile } from "./env-file.js";
+import { getLogger } from "./manager.js";
 
 function parsePrintSummaryValue(value: string | undefined): boolean | SummaryFormat {
   if (!value) return false;
@@ -11,31 +15,32 @@ function parsePrintSummaryValue(value: string | undefined): boolean | SummaryFor
 
 let envFilesLoaded = false;
 
-function loadEnvFiles(): void {
+const ENV_FILES = [".env.local", ".env"];
+
+function applyEnvFile(path: string): void {
+  if (!existsSync(path)) return;
+
+  for (const [key, value] of Object.entries(parseEnvFile(readFileSync(path, "utf-8")))) {
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+export function loadEnvFiles(): void {
   if (envFilesLoaded) return;
+  envFilesLoaded = true;
 
   try {
-    const { config: loadDotenv } = require("dotenv");
-    const { existsSync } = require("fs");
-    const { join } = require("path");
-
-    const envFiles = [".env.local", ".env"];
     const cwd = process.cwd();
-    const searchDirs = [cwd, join(cwd, "..")];
-
-    for (const dir of searchDirs) {
-      for (const envFile of envFiles) {
-        const envPath = join(dir, envFile);
-        if (existsSync(envPath)) {
-          loadDotenv({ path: envPath });
-        }
-      }
+    for (const envFile of ENV_FILES) {
+      applyEnvFile(join(cwd, envFile));
     }
-  } catch {
-    // dotenv not available, rely on process.env
+  } catch (error) {
+    getLogger().warn(
+      `Could not load .env files: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-
-  envFilesLoaded = true;
 }
 
 export type EnvReveniumConfig = ReveniumConfig & { reveniumBaseUrl: string };

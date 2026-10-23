@@ -19,22 +19,22 @@ A professional-grade Node.js middleware that integrates with OpenAI, Azure OpenA
 - **Fire-and-Forget** - Metering never blocks your application flow
 - **Streaming Support** - Handles regular and streaming requests for all providers
 - **ESM + CJS** - Dual output with full TypeScript type definitions
-- **Automatic .env Loading** - Loads environment variables automatically
+- **Automatic .env Loading** - Reads `.env.local` and `.env` from your application's working directory, with no extra dependency. Real environment variables always win; files outside the working directory are never read
 
 ## Supported Providers
 
-| Provider         | Sub-Path Import                      | API Pattern                                               |
-| ---------------- | ------------------------------------ | --------------------------------------------------------- |
-| OpenAI           | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()`                            |
-| Azure OpenAI     | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()` (auto-detected)            |
-| Anthropic        | `@revenium/middleware/anthropic`     | `initialize()` / `configure()` / auto-init on import      |
-| Foundry          | `@revenium/middleware/anthropic`     | Same as Anthropic (auto-detected from the base URL)       |
-| Google GenAI     | `@revenium/middleware/google/genai`  | `GoogleGenAIController` / `GoogleGenAIService`            |
-| Google Vertex AI | `@revenium/middleware/google/vertex` | `VertexAIController` / `VertexAIService`                  |
-| Perplexity       | `@revenium/middleware/perplexity`    | `Initialize()` / `GetClient()`                            |
-| LiteLLM          | `@revenium/middleware/litellm`       | `initialize()` / `configure()` / `enable()` / `disable()` |
-| fal.ai           | `@revenium/middleware/fal`           | `Initialize()` / `GetClient()`                            |
-| Tool Metering    | `@revenium/middleware/tools`         | `meterTool()` / `reportToolCall()`                        |
+| Provider         | Sub-Path Import                      | API Pattern                                                 |
+| ---------------- | ------------------------------------ | ----------------------------------------------------------- |
+| OpenAI           | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()`                              |
+| Azure OpenAI     | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()` (auto-detected)              |
+| Anthropic        | `@revenium/middleware/anthropic`     | `initialize()` / `configure()` / auto-init on import        |
+| Foundry          | `@revenium/middleware/anthropic`     | Same as Anthropic (auto-detected from the base URL)         |
+| Google GenAI     | `@revenium/middleware/google/genai`  | `GoogleGenAIController` / `configure()` / init on first use |
+| Google Vertex AI | `@revenium/middleware/google/vertex` | `VertexAIController` / `configure()` / init on first use    |
+| Perplexity       | `@revenium/middleware/perplexity`    | `Initialize()` / `GetClient()`                              |
+| LiteLLM          | `@revenium/middleware/litellm`       | `initialize()` / `configure()` / `enable()` / `disable()`   |
+| fal.ai           | `@revenium/middleware/fal`           | `Initialize()` / `GetClient()`                              |
+| Tool Metering    | `@revenium/middleware/tools`         | `meterTool()` / `reportToolCall()`                          |
 
 ## Getting Started
 
@@ -58,7 +58,9 @@ CI runs the unit suite on Node 22 against `openai` 7.x, `@anthropic-ai/sdk` 0.12
 
 ### Configuration
 
-Create a `.env` file in your project root. See [`.env.example`](https://github.com/revenium/revenium-node-sdk/blob/HEAD/.env.example) for all available options.
+Create a `.env` file in the directory your process is started from. See [`.env.example`](https://github.com/revenium/revenium-node-sdk/blob/HEAD/.env.example) for all available options.
+
+The middleware reads `.env.local` and then `.env` from `process.cwd()` only. A `.env` sitting at the root of a monorepo is not read when the process starts in a workspace package, and no parent directory is ever searched. Values already present in the real environment are never overwritten, and `.env.local` takes precedence over `.env`.
 
 Minimum required:
 
@@ -100,17 +102,14 @@ const response = await client.messages.create({
 
 ### Quick Start - Google GenAI
 
+Ensure `GOOGLE_API_KEY` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
+
 ```typescript
 import { GoogleGenAIController } from "@revenium/middleware/google/genai";
 
-const controller = new GoogleGenAIController({
-  reveniumApiKey: process.env.REVENIUM_METERING_API_KEY!,
-});
+const controller = new GoogleGenAIController();
 
-const response = await controller.generateContent({
-  model: "gemini-2.0-flash",
-  contents: "Hello!",
-});
+const response = await controller.createChat(["Hello!"], "gemini-2.0-flash-001");
 ```
 
 ### Quick Start - Azure OpenAI
@@ -131,17 +130,14 @@ Azure is auto-detected when `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` a
 
 ### Quick Start - Google Vertex AI
 
+Ensure `GOOGLE_CLOUD_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
+
 ```typescript
 import { VertexAIController } from "@revenium/middleware/google/vertex";
 
-const controller = new VertexAIController({
-  reveniumApiKey: process.env.REVENIUM_METERING_API_KEY!,
-});
+const controller = new VertexAIController();
 
-const response = await controller.generateContent({
-  model: "gemini-2.0-flash",
-  contents: "Hello!",
-});
+const response = await controller.createChat(["Hello!"], "gemini-2.0-flash-001");
 ```
 
 ### Quick Start - Perplexity
@@ -221,6 +217,31 @@ Go-aligned client pattern with Azure auto-detection:
 | `IsInitialized()`     | Check if middleware is initialized                        |
 | `Reset()`             | Reset the global client (useful for testing)              |
 
+#### Responses API — background mode
+
+A Responses call created with `background: true` returns while the job is still `queued` or
+`in_progress`, so no tokens exist yet and no usage record is emitted. Collect the finished job
+with `client.responses().retrieve(id)`: once the status is terminal the wrapper emits exactly one
+usage record carrying the job's input, output, reasoning and cached tokens, with the provider
+response id as the transaction id and the job's wall time (`completed_at - created_at`) as the
+request duration, falling back to the collection latency when the job carries no timestamps.
+Polling `retrieve` while the job is unfinished meters nothing.
+
+Metadata passed to `create`, the agentic job active at that moment, and the captured input are
+reused by the later `retrieve` on the same client instance; metadata passed to `retrieve` overrides
+it field by field. Up to 1000 pending jobs are remembered per client instance, so pass the metadata
+again at collection when the job is collected by a different process or client, or when more than
+1000 jobs are created before they are collected.
+
+Collecting the same response again emits no further record: the most recent 1000 metered response
+ids are remembered per client instance — collected jobs, synchronous calls and streams alike — and
+every record sends a deterministic `Idempotency-Key` derived from the response id, so a collection
+beyond that window, or from a different process, is deduplicated by Revenium instead for as long as
+its idempotency store retains the key (24 hours by default). That also covers a `retrieve` on a
+response already metered by its own `create` or by its own stream. A job ending `failed` or
+`cancelled` is recorded once with that outcome; a transport failure on `retrieve` is rethrown and
+records nothing, and a failed delivery to Revenium leaves the id collectable again.
+
 ### Anthropic
 
 Auto-initializes on import. Manual control available:
@@ -235,11 +256,20 @@ Auto-initializes on import. Manual control available:
 | `getStatus()`        | Get detailed status including circuit breaker state |
 | `reset()`            | Reset middleware and circuit breaker                |
 
-Claude served through Microsoft Foundry is detected from the Anthropic client's `baseURL`: the
-`services.ai.azure.com` host, or any subdomain of it, meters as `provider: "Foundry"`, every other
-host as `"Anthropic"`. A Foundry endpoint reached through a proxy or gateway hostname meters as
-`"Anthropic"`, since only the configured `baseURL` is visible to the client. `modelSource` is
-`ANTHROPIC` either way, and no other payload field changes.
+The host serving Claude is detected from the Anthropic client's `baseURL`: `services.ai.azure.com`
+and its subdomains meter as `provider: "Foundry"`, the AWS Bedrock runtime hosts used by
+`AnthropicBedrock` as `"AWS"`, the Vertex AI `aiplatform.googleapis.com` hosts used by
+`AnthropicVertex` as `"Google"`, and every other host as `"Anthropic"`. A Foundry, Bedrock or
+Vertex AI endpoint reached through a proxy or gateway hostname meters as `"Anthropic"`, since only
+the configured `baseURL` is visible to the client. `modelSource` is `ANTHROPIC` in every case, and
+no other payload field changes.
+
+`client.beta.messages` emits the same usage records as `client.messages`: `create` (streamed or
+not), `stream`, `parse` and `toolRunner` each produce exactly one record per model call, whether
+the result is awaited, iterated, split with `tee()`, converted with `toReadableStream()` or read
+as a raw `Response` through `asResponse()`. Compaction iterations reported under
+`usage.iterations` are added to the metered token counts, since the Anthropic beta API excludes
+them from the top-level `usage` fields.
 
 ### Google GenAI / Vertex AI
 
@@ -251,6 +281,8 @@ Controller and service pattern:
 | `GoogleGenAIService` / `VertexAIService`       | Service implementation                |
 | `trackGoogleUsageAsync()`                      | Manual usage tracking                 |
 | `mapGoogleFinishReason()`                      | Map finish reasons to standard format |
+
+Google accepts the same per-call `usageMetadata` as every other provider, including `subscriber`, `environment`, `region`, `ticketId`, the trace fields and the skill fields. See [Metadata Fields](#metadata-fields). The flat `subscriberId`, `subscriberEmail`, `subscriberCredential` and `subscriberCredentialName` fields remain supported and are folded into `subscriber`; when both forms are present, `subscriber` wins field by field.
 
 ### Perplexity
 
@@ -367,6 +399,8 @@ LiteLLM calls made inside a `JobContext` are tagged with that job, as with every
 
 Track custom tool and external API calls. Available from any provider sub-path or directly via `@revenium/middleware/tools`.
 
+Tool calls made inside a `JobContext` are tagged with that job, with the same precedence as completions: the per-call `agenticJobId` field (or `usageMetadata.agenticJobId`) wins over the active job context, and the job context wins over the `REVENIUM_AGENTIC_JOB_ID` environment variable. A job id the metering API would reject is dropped with a warning and the next source in that order is used. As with completions, prefer `JobContext.run()` over `JobContext.start()` in a shared-process server.
+
 ```typescript
 import { meterTool, setToolContext } from "@revenium/middleware/tools";
 
@@ -412,30 +446,37 @@ const result = await meterTool(
 | `subscriberCredential` | Subscriber credential string (inherited from context) |
 | `workflowId`           | Workflow identifier (inherited from context)          |
 | `transactionId`        | Transaction identifier (inherited from context)       |
+| `agenticJobId`         | Agentic job the tool call belongs to                  |
+| `costUsd`              | Cost in US dollars; overrides the configured price    |
 
 ## Metadata Fields
 
 All fields are optional and can be set per-request via `usageMetadata`:
 
-| Field                    | Type   | Description                                            |
-| ------------------------ | ------ | ------------------------------------------------------ |
-| `traceId`                | string | Unique identifier for session or conversation tracking |
-| `taskType`               | string | Type of AI task (e.g., "chat", "embedding")            |
-| `agent`                  | string | AI agent or bot identifier                             |
-| `organizationName`       | string | Organization or company name                           |
-| `productName`            | string | Product or feature name                                |
-| `subscriptionId`         | string | Subscription plan identifier                           |
-| `responseQualityScore`   | number | Custom quality rating (0.0-1.0)                        |
-| `subscriber.id`          | string | Unique user identifier                                 |
-| `subscriber.email`       | string | User email address                                     |
-| `subscriber.credential`  | object | Authentication credential (`name` and `value`)         |
-| `skillName`              | string | Name of the skill that produced the request            |
-| `skillSource`            | string | Where the skill came from (e.g., "projectSettings")    |
-| `skillKind`              | string | Kind of skill (e.g., "workflow")                       |
-| `skillPluginName`        | string | Plugin that provides the skill                         |
-| `skillMarketplaceName`   | string | Marketplace the skill plugin came from                 |
-| `skillInvocationTrigger` | string | How the skill was invoked (e.g., "user-slash")         |
-| `operationSubtype`       | string | Overrides the detected image/audio/video subtype       |
+| Field                    | Type   | Description                                              |
+| ------------------------ | ------ | -------------------------------------------------------- |
+| `traceId`                | string | Unique identifier for session or conversation tracking   |
+| `taskType`               | string | Type of AI task (e.g., "chat", "embedding")              |
+| `agent`                  | string | AI agent or bot identifier                               |
+| `organizationName`       | string | Organization or company name                             |
+| `productName`            | string | Product or feature name                                  |
+| `subscriptionId`         | string | Subscription plan identifier                             |
+| `environment`            | string | Deployment environment, overrides `REVENIUM_ENVIRONMENT` |
+| `region`                 | string | Cloud region, overrides the detected region              |
+| `ticketId`               | string | Ticket or work item the request belongs to               |
+| `responseQualityScore`   | number | Custom quality rating (0.0-1.0)                          |
+| `subscriber.id`          | string | Unique user identifier                                   |
+| `subscriber.email`       | string | User email address                                       |
+| `subscriber.credential`  | object | Authentication credential (`name` and `value`)           |
+| `skillName`              | string | Name of the skill that produced the request              |
+| `skillSource`            | string | Where the skill came from (e.g., "projectSettings")      |
+| `skillKind`              | string | Kind of skill (e.g., "workflow")                         |
+| `skillPluginName`        | string | Plugin that provides the skill                           |
+| `skillMarketplaceName`   | string | Marketplace the skill plugin came from                   |
+| `skillInvocationTrigger` | string | How the skill was invoked (e.g., "user-slash")           |
+| `operationSubtype`       | string | Overrides the detected image/audio/video subtype         |
+
+A field set to an empty string is sent as an empty string and overrides its environment-variable fallback, so `environment: ""` records an empty environment instead of `REVENIUM_ENVIRONMENT`. The same applies to `region`, `credentialAlias`, `traceType`, `traceName`, `ticketId`, `parentTransactionId` and `transactionName`. Omit the field to keep the fallback.
 
 Accepted `operationSubtype` values, by operation type. Any other value is logged as a warning and ignored, and the detected subtype is sent instead. The earlier literals `speech_synthesis` and `audio_generation` are still accepted and sent as `tts` and `synthesis`:
 
@@ -476,15 +517,18 @@ Per-call enforcement blocks outgoing provider requests when a subscriber has a b
 
 `Initialize()` (from `@revenium/middleware/openai`) calls `startEnforcementPolling()`, which boots a background poller on `/profitstream/v2/api/ai/enforcement-rules/{teamId}` every 30s with ±20% jitter. Fetched cost controls are cached in memory; a `204 No Content` response caches an empty set. A `4xx` response leaves the cache untouched and logs a warning on every poll, naming the requested URL and status and stating whether previously loaded cost controls are still blocking calls or nothing is loaded; a `429` additionally backs polling off for the `Retry-After` window (capped at 60s). The poll timer is `unref`'d so it never prevents process exit.
 
-Before every chat completion (sync and streaming), the middleware builds enforcement criteria from the request — `subscriberId` and `subscriberEmail` from `metadata.subscriber`, `model` from request params, `productName` from metadata, `provider` from the detected provider — and calls `enforcePreCallRules(criteria)`. The evaluator resolves the caller to the subscriber id and the normalized email, then:
+Before every chat completion (sync and streaming), the middleware builds enforcement criteria from the request — `subscriberId` and `subscriberEmail` from `metadata.subscriber`, `credential` from the subscriber credential's alias name (its secret value is used only when no name field was supplied at all), `model` from request params, `agent` and `taskType` from metadata, `productName` and `organizationName` from metadata (each falling back to its deprecated `*Id` spelling the way the metered record does), `provider` from the detected provider — and calls `enforcePreCallRules(criteria)`. The evaluator resolves the caller to the subscriber id and the normalized email, then:
 
+- acts on a cost control only when its `filters[]` cover the call. Filter rows compose with AND, a row with no value constrains nothing, and a cost control with no filters covers every call. The dimensions the SDK evaluates are `MODEL`, `PROVIDER`, `AGENT`, `PRODUCT`, `TASK_TYPE`, `ORGANIZATION`, `SUBSCRIBER` and `CREDENTIAL`; `PROVIDER` compares ignoring letter case, `SUBSCRIBER` ignores case only when the caller supplied an email, and the rest compare exactly. A row the SDK cannot evaluate — any other dimension, including `DEPARTMENT` outside the department path below, or an operator outside `IS` / `IS_NOT` / `IN` / `CONTAINS` / `STARTS_WITH` / `ENDS_WITH` — makes the cost control cover nothing client-side and leaves it to the platform, which enforces it server-side regardless;
 - on a per-person cost control (`groupBy` set), looks the caller up in `groupBreakdown` and acts only on their own row: someone who has not crossed the limit passes even while a teammate is blocked, and the error reports the blocked person's own figure. A grouped cost control the server sent no breakdown for (its metric is not cost) blocks nobody;
-- on a department-scoped cost control, acts only when the caller is named in `departmentBudgetBlocks`, reporting the balance from `departmentBudgetBlockBalances`;
+- on a department-scoped cost control, acts only when the caller is named in `departmentBudgetBlocks`, reporting the balance from `departmentBudgetBlockBalances`. The server has already resolved the `DEPARTMENT` row by naming the caller, so that row is skipped and the cost control's other filter rows are applied as usual: a department cap scoped to one provider or model covers only that traffic;
 - on a team-wide cost control, skips it where `breached === false` and otherwise acts on the rule-level `currentValue`;
 - logs a warning and continues past cost controls where `shadowMode === true` or `action ∈ {WARN_ONLY, THROTTLE}` — these are observation-only client-side; the server still enforces server-side throttling;
 - throws `CostLimitExceeded` on the first matching `BLOCK` cost control.
 
 A caller carrying neither a subscriber id nor an email cannot be matched against a per-person or department-scoped cost control, so those pass; team-wide cost controls still block it.
+
+A `MODEL` or `PROVIDER` filter is matched against what the request asks for, because the gate runs before the provider replies, while the metered record carries what the response reports. The two differ on three known paths: on Azure the request names the deployment and the record the provider model; on a streamed OpenAI chat the request names the alias (`gpt-4o`) and the record the dated model the chunks report (`gpt-4o-2024-08-06`); and on a call proxied through LiteLLM the gate sees the transport provider (`OpenAI`) where the record names the upstream one (`Anthropic`). A cost control written from what Revenium reporting shows therefore may not block client-side on those paths. The platform's own evaluation is authoritative and still enforces the cap server-side.
 
 The engine fails open: missing team ID, network outages, an unreachable Revenium API, or a parse error all leave the cache untouched and `enforcePreCallRules` becomes a no-op (the request passes). Enforcement errors never bubble to user code as metering failures.
 
@@ -651,6 +695,37 @@ await ctx.amendOutcome({ reason: "Value correction", outcomeValue: 175 });
 
 See [`.env.example`](https://github.com/revenium/revenium-node-sdk/blob/HEAD/.env.example) for the complete list with all optional configuration.
 
+### Metering several Revenium organizations from one process
+
+`Initialize()` and `Configure()` set the process-wide configuration. To meter more than one organization from a single process, build a client per organization instead and keep using that client for its own calls:
+
+```typescript
+import { ReveniumOpenAI, Provider } from "@revenium/middleware/openai";
+
+const orgA = new ReveniumOpenAI(
+  { reveniumApiKey: "hak_org_a...", openaiApiKey: process.env.OPENAI_API_KEY },
+  Provider.OPENAI,
+);
+const orgB = new ReveniumOpenAI(
+  { reveniumApiKey: "hak_org_b...", openaiApiKey: process.env.OPENAI_API_KEY },
+  Provider.OPENAI,
+);
+```
+
+Every usage record raised through a client carries that client's API key, base URL and prompt-capture setting, resolved when the call starts. Reconfiguring the process while a call or a stream is in flight does not change where that call is reported.
+
+Settings the client leaves out fall back to the process configuration, so a client built with only `reveniumApiKey` keeps the `reveniumBaseUrl`, prompt-capture, retry and summary settings installed by `Initialize()`. A client metering under its own key does not inherit the process `reveniumTeamId`, since a team belongs to the organization that owns the key; set `reveniumTeamId` on the client to report under a team. The constructor validates the resulting configuration and throws on a missing or malformed Revenium API key.
+
+Supported per client: OpenAI, Azure OpenAI, Perplexity and fal.ai.
+
+Process-wide, and therefore following the last `Initialize()`/`Configure()` call:
+
+- **Anthropic** — the SDK is instrumented by patching the shared `Messages` prototype, so one key per process.
+- **Google GenAI and Google Vertex AI**, and the **LiteLLM** proxy.
+- **Cost controls / enforcement** — rules are polled under the process configuration, and those rules decide every call, including calls made through a per-organization client.
+- **Jobs and outcomes API** — outcomes are reported under the process configuration.
+- **Tool metering** — `meterTool()` and `reportToolCall()` are not bound to a client. They report under the configuration of the call they run inside, and under the process configuration when there is none.
+
 ## Troubleshooting
 
 ### No tracking data appears
@@ -663,7 +738,7 @@ See [`.env.example`](https://github.com/revenium/revenium-node-sdk/blob/HEAD/.en
 ### Client not initialized error
 
 - Make sure you call `Initialize()` before `GetClient()`
-- Check that your `.env` file is in the project root
+- Check that your `.env` file is in the directory the process is started from (`process.cwd()`), or set the variables in the real environment
 - Verify `REVENIUM_METERING_API_KEY` is set
 
 ### Azure OpenAI not working

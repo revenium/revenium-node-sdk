@@ -24,7 +24,7 @@ We will review and respond to security reports in a timely manner.
 When using this middleware:
 
 1. **API Keys**: Never commit API keys to version control
-2. **Environment Variables**: Store sensitive configuration in `.env` files and load them in your application (e.g., via `dotenv`). The middleware reads its configuration from `process.env` at runtime
+2. **Environment Variables**: Store sensitive configuration in `.env.local` or `.env` in the directory your process is started from. The middleware reads those two files with a built-in parser, requiring no third-party install, and never reads a `.env` from a parent directory. Real environment variables always take precedence over file values
 3. **Prompt Capture**: Off by default. When enabled via `REVENIUM_CAPTURE_PROMPTS=true`, automatic PII sanitization is applied
 4. **Network Security**: All connections use HTTPS
 5. **Updates**: Keep the package updated to the latest version

@@ -363,7 +363,6 @@ describe("LiteLLM initialize", () => {
     );
 
     jest.resetModules();
-    jest.doMock("dotenv", () => jest.requireActual("dotenv"));
 
     try {
       process.chdir(workingDir);
@@ -376,9 +375,45 @@ describe("LiteLLM initialize", () => {
 
       litellm.reset();
     } finally {
-      jest.dontMock("dotenv");
       process.chdir(originalCwd);
       rmSync(workingDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not pick up the README setup from a .env above the working directory", async () => {
+    const { mkdirSync, mkdtempSync, writeFileSync, rmSync } = await import("fs");
+    const { join } = await import("path");
+    const { tmpdir } = await import("os");
+
+    const root = mkdtempSync(join(tmpdir(), "litellm-dotenv-parent-"));
+    const workingDir = join(root, "app");
+    mkdirSync(workingDir);
+    const originalCwd = process.cwd();
+
+    delete process.env.REVENIUM_METERING_API_KEY;
+    delete process.env.REVENIUM_METERING_BASE_URL;
+
+    writeFileSync(
+      join(root, ".env"),
+      "REVENIUM_METERING_API_KEY=hak_parent_key\nREVENIUM_METERING_BASE_URL=https://api.revenium.ai\n",
+    );
+
+    jest.resetModules();
+
+    try {
+      process.chdir(workingDir);
+
+      const litellm = await import("../../../src/litellm/index");
+      const manager = await import("../../../src/_core/config/manager");
+
+      expect(litellm.initialize()).toBe(false);
+      expect(manager.getConfig()).toBeNull();
+      expect(process.env.REVENIUM_METERING_API_KEY).toBeUndefined();
+
+      litellm.reset();
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

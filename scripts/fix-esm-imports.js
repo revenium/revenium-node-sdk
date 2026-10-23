@@ -45,10 +45,17 @@ function fixImportsInDirectory(dirPath) {
   }
 }
 
+function writeModuleTypeManifest(dirPath) {
+  const manifestPath = path.join(dirPath, 'package.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ type: 'module' }, null, 2) + '\n');
+  console.log(`Wrote module type manifest: ${manifestPath}`);
+}
+
 const esmDir = path.join(__dirname, '..', 'dist', 'esm');
 if (fs.existsSync(esmDir)) {
   console.log('Fixing ESM imports...');
   fixImportsInDirectory(esmDir);
+  writeModuleTypeManifest(esmDir);
   console.log('ESM imports fixed!');
 } else {
   console.log('ESM directory not found');
