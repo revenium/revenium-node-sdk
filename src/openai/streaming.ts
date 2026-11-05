@@ -8,11 +8,15 @@ import {
   getMaxPromptSize,
 } from "../_core/prompt/extraction.js";
 import { runWithCallConfig } from "../_core/config/call-config.js";
+import type { EnforcementCriteria } from "../_core/enforcement/evaluator.js";
 
 export type TrackUsageFn = (data: any) => void;
 
 const isPrimaryChoice = (choice: { index?: number | null }): boolean =>
   choice.index === 0 || choice.index === undefined || choice.index === null;
+
+const isUsageOnlyChunk = (chunk: OpenAI.ChatCompletionChunk): boolean =>
+  chunk.choices.length === 0 && Boolean(chunk.usage);
 
 export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChunk> {
   private stream: AsyncIterable<OpenAI.ChatCompletionChunk>;
@@ -31,6 +35,8 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
   private trackFn: TrackUsageFn;
   private capturePrompts: boolean;
   private maxPromptSize: number;
+  private forwardUsageChunk: boolean;
+  private enforcementScope?: EnforcementCriteria;
 
   constructor(
     stream: AsyncIterable<OpenAI.ChatCompletionChunk>,
@@ -40,6 +46,9 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
     messages: any[],
     trackFn: TrackUsageFn,
     metadata?: UsageMetadata,
+    forwardUsageChunk: boolean = true,
+    startTime: number = Date.now(),
+    enforcementScope?: EnforcementCriteria,
   ) {
     this.stream = stream;
     this.config = config;
@@ -48,7 +57,9 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
     this.messages = messages;
     this.trackFn = trackFn;
     this.metadata = metadata;
-    this.startTime = Date.now();
+    this.forwardUsageChunk = forwardUsageChunk;
+    this.startTime = startTime;
+    this.enforcementScope = enforcementScope;
     this.requestId = randomUUID();
     this.capturePrompts = runWithCallConfig(config, () => shouldCapturePrompts(metadata));
     this.maxPromptSize = runWithCallConfig(config, getMaxPromptSize);
@@ -79,6 +90,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
       responseContent: this.accumulatedContent
         ? sanitizeCredentials(this.accumulatedContent)
         : undefined,
+      enforcementScope: this.enforcementScope,
     };
   }
 
@@ -107,7 +119,7 @@ export class StreamingWrapper implements AsyncIterable<OpenAI.ChatCompletionChun
         if (chunk.id) this.requestId = chunk.id;
         if (!this.responseModel && chunk.model) this.responseModel = chunk.model;
 
-        yield chunk;
+        if (this.forwardUsageChunk || !isUsageOnlyChunk(chunk)) yield chunk;
       }
 
       completed = true;

@@ -1,3 +1,5 @@
+import type { CircuitState } from "./circuit-breaker.js";
+
 export class ReveniumError extends Error {
   public readonly code: string;
   public readonly context?: Record<string, unknown>;
@@ -61,6 +63,23 @@ export class StreamProcessingError extends ReveniumError {
   }
 }
 
+export interface CostLimitDirective {
+  ruleName: string | null;
+  message: string | null;
+}
+
+function describeCostLimit(
+  threshold: number,
+  currentValue: number,
+  periodType: string,
+  directive?: CostLimitDirective,
+): string {
+  if (directive) {
+    return directive.message || `Cost limit exceeded: ${directive.ruleName || "unnamed rule"}`;
+  }
+  return `Cost limit exceeded: $${currentValue.toFixed(2)} of $${threshold.toFixed(2)} ${periodType.toLowerCase()} limit reached`;
+}
+
 export class CostLimitExceeded extends ReveniumError {
   // Field names mirror the server's CompiledEnforcementRule (threshold,
   // currentValue, periodType) so SDK + UI + backend parse the same wire
@@ -69,6 +88,7 @@ export class CostLimitExceeded extends ReveniumError {
   public readonly threshold: number;
   public readonly currentValue: number;
   public readonly periodType: string;
+  public readonly ruleName?: string;
 
   constructor(
     ruleId: string,
@@ -76,9 +96,10 @@ export class CostLimitExceeded extends ReveniumError {
     currentValue: number,
     periodType: string,
     context?: Record<string, unknown>,
+    directive?: CostLimitDirective,
   ) {
     super(
-      `Cost limit exceeded: $${currentValue.toFixed(2)} of $${threshold.toFixed(2)} ${periodType.toLowerCase()} limit reached`,
+      describeCostLimit(threshold, currentValue, periodType, directive),
       "COST_LIMIT_EXCEEDED",
       context,
     );
@@ -87,7 +108,15 @@ export class CostLimitExceeded extends ReveniumError {
     this.threshold = threshold;
     this.currentValue = currentValue;
     this.periodType = periodType;
+    this.ruleName = directive?.ruleName ?? undefined;
   }
+}
+
+export function isCostLimitRefusal(error: unknown): boolean {
+  return (
+    error instanceof CostLimitExceeded ||
+    (error instanceof Error && (error as { cause?: unknown }).cause instanceof CostLimitExceeded)
+  );
 }
 
 export class EnforcementRequestRejectedError extends ReveniumError {
@@ -107,6 +136,25 @@ export class EnforcementRequestRejectedError extends ReveniumError {
     this.status = status;
     this.statusText = statusText;
     this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+export class CircuitBreakerOpenError extends ReveniumError {
+  public readonly state: CircuitState;
+
+  constructor(state: CircuitState) {
+    super(`Circuit breaker is ${state} - failing fast`, "CIRCUIT_BREAKER_OPEN", { state });
+    this.name = "CircuitBreakerOpenError";
+    this.state = state;
+  }
+}
+
+export class MeteringTimeoutError extends ReveniumError {
+  constructor(timeoutMs: number) {
+    super(`Revenium metering request timed out after ${timeoutMs} ms`, "METERING_TIMEOUT", {
+      timeoutMs,
+    });
+    this.name = "MeteringTimeoutError";
   }
 }
 

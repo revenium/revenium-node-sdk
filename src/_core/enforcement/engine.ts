@@ -6,12 +6,12 @@ import {
   ENFORCEMENT_CONFIG,
   API_ENDPOINTS,
   ENV_VARS,
+  HTTP_TOO_MANY_REQUESTS,
   RETRY_CONFIG,
-  RETRYABLE_STATUSES,
 } from "../constants.js";
 import { executeWithEnforcementCircuitBreaker } from "../resilience/circuit-breaker.js";
 import { EnforcementRequestRejectedError } from "../resilience/error-handler.js";
-import { parseRetryAfter } from "../resilience/retry.js";
+import { isRequestRejection, parseRetryAfter } from "../resilience/retry.js";
 import {
   EnforcementGroupEntry,
   EnforcementRule,
@@ -20,22 +20,21 @@ import {
   setRules,
   clearCache,
   getRules,
+  getRulesAgeMs,
+  isFreshRuleAge,
 } from "./cache.js";
 import { unevaluableFilters, type EnforcementFilter } from "./filters.js";
 import { normalizeIdentityKey } from "./identity.js";
-
-const TOO_MANY_REQUESTS = 429;
+import { clearMeteringBlocks, liftBlocksNotReportedBy } from "./metering-blocks.js";
 
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let polling = false;
 let warnedMissingTeamId = false;
 let backoffDelayMs: number | null = null;
 let reportedUnevaluableFilters: ReadonlySet<string> = new Set();
+let initialLoad: Promise<void> = Promise.resolve();
 
-function isRequestRejection(status: number): boolean {
-  if (status < 400 || status >= 500) return false;
-  return status === TOO_MANY_REQUESTS || !RETRYABLE_STATUSES.has(status);
-}
+const MAX_RULE_AGE_SECONDS = ENFORCEMENT_CONFIG.MAX_RULE_AGE / 1000;
 
 export function buildEnforcementRulesUrl(baseUrl: string, reveniumTeamId: string): string {
   const host = stripReveniumServicePrefix(baseUrl);
@@ -231,20 +230,22 @@ export function parseEnforcementRulesResponse(data: unknown): EnforcementSnapsho
 export function startEnforcementPolling(): void {
   const logger = getLogger();
 
+  initialLoad = fetchRules().catch(reportFetchFailure);
+
   if (polling) {
-    logger.debug("Enforcement polling already running");
+    logger.debug(
+      "Enforcement polling already running; cost controls refetched for the current config",
+    );
     return;
   }
 
   polling = true;
 
-  fetchRules()
-    .catch(reportFetchFailure)
-    .finally(() => {
-      if (polling) {
-        scheduleNextPoll();
-      }
-    });
+  initialLoad.finally(() => {
+    if (polling) {
+      scheduleNextPoll();
+    }
+  });
 
   logger.debug("Enforcement polling started", {
     intervalMs: ENFORCEMENT_CONFIG.POLL_INTERVAL,
@@ -252,6 +253,7 @@ export function startEnforcementPolling(): void {
 }
 
 export function stopEnforcementPolling(): void {
+  clearMeteringBlocks();
   if (!polling) return;
 
   polling = false;
@@ -260,6 +262,7 @@ export function stopEnforcementPolling(): void {
     pollTimer = null;
   }
   clearCache();
+  initialLoad = Promise.resolve();
   warnedMissingTeamId = false;
   backoffDelayMs = null;
   reportedUnevaluableFilters = new Set();
@@ -268,6 +271,10 @@ export function stopEnforcementPolling(): void {
 
 export function isPolling(): boolean {
   return polling;
+}
+
+export function waitForInitialRules(): Promise<void> {
+  return initialLoad;
 }
 
 function scheduleNextPoll(): void {
@@ -292,16 +299,32 @@ function scheduleNextPoll(): void {
   }
 }
 
+function applySnapshot(
+  reveniumApiKey: string,
+  snapshot: EnforcementSnapshot,
+  fetchStartedAt: number,
+): void {
+  setRules(snapshot);
+  liftBlocksNotReportedBy(reveniumApiKey, snapshot, fetchStartedAt);
+}
+
 function reportFetchFailure(error: unknown): void {
-  getLogger().warn("Enforcement rules fetch failed", {
+  getLogger().warn(`Enforcement rules fetch failed; ${describeCacheImpact()}.`, {
     error: error instanceof Error ? error.message : String(error),
   });
 }
 
 function describeCacheImpact(): string {
+  const ageMs = getRulesAgeMs();
+  if (ageMs === null) return "cost controls are not loaded and provider calls pass through";
+
+  const refreshed = `the cost controls refreshed ${Math.ceil(ageMs / 1000)} s ago`;
+  if (!isFreshRuleAge(ageMs)) {
+    return `${refreshed} are older than ${MAX_RULE_AGE_SECONDS} s and no longer applied, so provider calls pass through`;
+  }
   return getRules().length > 0
-    ? "the cost controls loaded by an earlier poll remain in use"
-    : "cost controls are not loaded and provider calls pass through";
+    ? `${refreshed} remain in use until they are ${MAX_RULE_AGE_SECONDS} s old`
+    : `${refreshed} hold no rules, so provider calls pass through`;
 }
 
 function reportRejectedRequest(error: EnforcementRequestRejectedError): void {
@@ -311,7 +334,7 @@ function reportRejectedRequest(error: EnforcementRequestRejectedError): void {
     statusText: error.statusText,
   };
 
-  if (error.status === TOO_MANY_REQUESTS) {
+  if (error.status === HTTP_TOO_MANY_REQUESTS) {
     getLogger().warn(
       `Enforcement rules endpoint is rate limiting the SDK; ${describeCacheImpact()}. Polling backs off until the limit clears.`,
       context,
@@ -345,7 +368,9 @@ async function fetchRules(): Promise<void> {
   if (!config.reveniumTeamId) {
     if (!warnedMissingTeamId) {
       warnedMissingTeamId = true;
-      logger.warn("reveniumTeamId not set (env REVENIUM_TEAM_ID); enforcement rules fetch skipped");
+      logger.warn(
+        `No team id configured, so cost controls are off and provider calls pass through. Set ${ENV_VARS.TEAM_ID} or pass reveniumTeamId (teamId on fal.ai) in config.`,
+      );
     }
     return;
   }
@@ -362,6 +387,7 @@ async function fetchRules(): Promise<void> {
 
   try {
     await executeWithEnforcementCircuitBreaker(async () => {
+      const fetchStartedAt = performance.now();
       const response = await fetch(url, {
         method: "GET",
         headers: {
@@ -372,7 +398,7 @@ async function fetchRules(): Promise<void> {
       });
 
       if (response.status === 204) {
-        setRules(emptyEnforcementSnapshot());
+        applySnapshot(config.reveniumApiKey, emptyEnforcementSnapshot(), fetchStartedAt);
         logger.debug("Enforcement rules: no rules configured (204)");
         return;
       }
@@ -392,13 +418,13 @@ async function fetchRules(): Promise<void> {
 
       const data: unknown = await response.json();
       const snapshot = parseEnforcementRulesResponse(data);
-      setRules(snapshot);
+      applySnapshot(config.reveniumApiKey, snapshot, fetchStartedAt);
       logger.debug("Enforcement rules updated", { ruleCount: snapshot.rules.length });
     });
   } catch (error) {
     if (!(error instanceof EnforcementRequestRejectedError)) throw error;
 
-    if (error.status === TOO_MANY_REQUESTS) {
+    if (error.status === HTTP_TOO_MANY_REQUESTS) {
       applyBackoff(error.retryAfterSeconds);
     }
     reportRejectedRequest(error);

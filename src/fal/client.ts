@@ -1,18 +1,28 @@
+import { randomUUID } from "crypto";
 import { createFalClient } from "@fal-ai/client";
 import type { FalClient } from "@fal-ai/client";
 import { getLogger } from "../_core/config/manager.js";
 import { validateConfig } from "../_core/config/validator.js";
 import { runWithCallConfig } from "../_core/config/call-config.js";
+import { enforceCostControls } from "../_core/enforcement/evaluator.js";
+import { MeteredRequestLedger } from "../_core/metering/metered-request-ledger.js";
 import type { ReveniumConfig } from "../_core/types/index.js";
-import { toClientReveniumConfig } from "./config.js";
-import { detectMediaType } from "./media-type-detector.js";
-import { trackFalUsageAsync } from "./tracking.js";
+import { toClientReveniumConfig, withConfigDefaults } from "./config.js";
+import {
+  createMeteredQueue,
+  meterQueuedResult,
+  type MeteredFalQueue,
+  type PendingFalJob,
+} from "./metered-queue.js";
+import { buildFalEnforcementScope, trackFalResult } from "./tracking.js";
 import type { FalConfig, FalUsageMetadata } from "./types.js";
 
 export class ReveniumFal {
   private client: FalClient;
   private falConfig: FalConfig;
   private reveniumConfig: ReveniumConfig;
+  private readonly ledger = new MeteredRequestLedger<PendingFalJob>();
+  private readonly meteredQueue: MeteredFalQueue;
 
   constructor(config: FalConfig, falClientConfig?: Parameters<typeof createFalClient>[0]) {
     this.falConfig = config;
@@ -22,14 +32,11 @@ export class ReveniumFal {
       ...(config.falApiKey ? { credentials: config.falApiKey } : {}),
       ...falClientConfig,
     });
-  }
-
-  private mergeConfigDefaults(metadata?: FalUsageMetadata): FalUsageMetadata | undefined {
-    if (!this.falConfig.organizationName && !this.falConfig.organizationId) return metadata;
-    return {
-      organizationName: this.falConfig.organizationName || this.falConfig.organizationId,
-      ...metadata,
-    };
+    this.meteredQueue = createMeteredQueue(this.client.queue, {
+      ledger: this.ledger,
+      falConfig: this.falConfig,
+      reveniumConfig: this.reveniumConfig,
+    });
   }
 
   async run<T = any>(
@@ -47,22 +54,22 @@ export class ReveniumFal {
     options: Record<string, any>,
     usageMetadata?: FalUsageMetadata,
   ): Promise<{ data: T; requestId: string }> {
+    const metadata = withConfigDefaults(this.falConfig, usageMetadata);
+    const enforcementScope = buildFalEnforcementScope(endpointId, options.input, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
 
     const result = await this.client.run(endpointId, options);
-    const duration = Date.now() - startTime;
-    const operationType = detectMediaType(endpointId, result.data);
 
-    trackFalUsageAsync({
+    trackFalResult({
       endpointId,
-      operationType,
       startTime,
-      duration,
-      input: (options.input as Record<string, unknown>) || {},
-      result: (result.data as Record<string, unknown>) || {},
+      input: options.input,
+      result: result.data,
       isStreamed: false,
       requestId: result.requestId,
-      usageMetadata: this.mergeConfigDefaults(usageMetadata),
+      usageMetadata: metadata,
+      enforcementScope,
     });
 
     return result as { data: T; requestId: string };
@@ -83,22 +90,22 @@ export class ReveniumFal {
     options: Record<string, any>,
     usageMetadata?: FalUsageMetadata,
   ): Promise<{ data: T; requestId: string }> {
+    const metadata = withConfigDefaults(this.falConfig, usageMetadata);
+    const enforcementScope = buildFalEnforcementScope(endpointId, options.input, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
 
     const result = await this.client.subscribe(endpointId, options);
-    const duration = Date.now() - startTime;
-    const operationType = detectMediaType(endpointId, result.data);
 
-    trackFalUsageAsync({
+    meterQueuedResult(this.ledger, {
       endpointId,
-      operationType,
       startTime,
-      duration,
-      input: (options.input as Record<string, unknown>) || {},
-      result: (result.data as Record<string, unknown>) || {},
+      input: options.input,
+      result: result.data,
       isStreamed: false,
-      requestId: result.requestId,
-      usageMetadata: this.mergeConfigDefaults(usageMetadata),
+      requestId: result.requestId || randomUUID(),
+      usageMetadata: metadata,
+      enforcementScope,
     });
 
     return result as { data: T; requestId: string };
@@ -119,30 +126,30 @@ export class ReveniumFal {
     options: Record<string, any>,
     usageMetadata?: FalUsageMetadata,
   ): Promise<any> {
+    const metadata = withConfigDefaults(this.falConfig, usageMetadata);
+    const enforcementScope = buildFalEnforcementScope(endpointId, options.input, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const logger = getLogger();
 
     const falStream = await this.client.stream(endpointId, options);
 
     falStream.on("done", (finalResult: T) => {
-      const duration = Date.now() - startTime;
       const rawResult = finalResult as Record<string, unknown>;
       const resultData =
         rawResult?.data && typeof rawResult.data === "object"
           ? (rawResult.data as Record<string, unknown>)
           : rawResult;
-      const operationType = detectMediaType(endpointId, resultData);
 
       runWithCallConfig(this.reveniumConfig, () =>
-        trackFalUsageAsync({
+        trackFalResult({
           endpointId,
-          operationType,
           startTime,
-          duration,
-          input: (options.input as Record<string, unknown>) || {},
-          result: resultData || {},
+          input: options.input,
+          result: resultData,
           isStreamed: true,
-          usageMetadata: this.mergeConfigDefaults(usageMetadata),
+          usageMetadata: metadata,
+          enforcementScope,
         }),
       );
     });
@@ -157,8 +164,8 @@ export class ReveniumFal {
     return falStream;
   }
 
-  get queue() {
-    return this.client.queue;
+  get queue(): MeteredFalQueue {
+    return this.meteredQueue;
   }
 
   get realtime() {

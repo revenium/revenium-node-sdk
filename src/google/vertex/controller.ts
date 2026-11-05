@@ -1,5 +1,3 @@
-import { loadEnvFiles } from "../../_core/config/loader.js";
-import { getLogger } from "../../_core/config/manager.js";
 import {
   GoogleUsageMetadata,
   IGoogleResponseChat,
@@ -16,25 +14,6 @@ import {
 } from "../types.js";
 import { VertexAIService } from "./service.js";
 
-function verifyVertexAIEnvironment(): void {
-  loadEnvFiles();
-  const logger = getLogger();
-
-  if (!process.env.GOOGLE_CLOUD_PROJECT) {
-    throw new Error("GOOGLE_CLOUD_PROJECT environment variable is required for Vertex AI.");
-  }
-
-  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    throw new Error(
-      "GOOGLE_APPLICATION_CREDENTIALS environment variable is required for Vertex AI.",
-    );
-  }
-
-  if (!process.env.GOOGLE_CLOUD_LOCATION) {
-    logger.warn("GOOGLE_CLOUD_LOCATION not set, defaulting to us-central1");
-  }
-}
-
 export class VertexAIController {
   private validateModel(model: string): void {
     if (!model || model.trim() === "") {
@@ -49,7 +28,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleResponseChat> => {
-    verifyVertexAIEnvironment();
     this.validateModel(model);
     const service = new VertexAIService(model, projectId, location);
     return service.createChat(prompts, usageMetadata);
@@ -62,7 +40,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleStreamingResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(model);
     const service = new VertexAIService(model, projectId, location);
     return service.createStreaming(prompts, usageMetadata);
@@ -75,7 +52,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleEmbeddingResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(model);
     const service = new VertexAIService(model, projectId, location);
     return service.createEmbedding(input, usageMetadata);
@@ -87,7 +63,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleImageResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(request.model);
     const service = new VertexAIService(request.model, projectId, location);
     return service.generateImage(request, usageMetadata);
@@ -99,7 +74,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleImageResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(request.model);
     const service = new VertexAIService(request.model, projectId, location);
     return service.editImage(request, usageMetadata);
@@ -111,7 +85,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleImageResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(request.model);
     const service = new VertexAIService(request.model, projectId, location);
     return service.upscaleImage(request, usageMetadata);
@@ -123,7 +96,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleVideoResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(request.model);
     const service = new VertexAIService(request.model, projectId, location);
     return service.generateVideo(request, usageMetadata);
@@ -135,7 +107,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleVideoResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(request.model);
     const service = new VertexAIService(request.model, projectId, location);
     return service.extendVideo(request, usageMetadata);
@@ -147,7 +118,6 @@ export class VertexAIController {
     projectId?: string,
     location?: string,
   ): Promise<IGoogleVideoResponse> => {
-    verifyVertexAIEnvironment();
     this.validateModel(request.model);
     const service = new VertexAIService(request.model, projectId, location);
     return service.upscaleVideo(request, usageMetadata);

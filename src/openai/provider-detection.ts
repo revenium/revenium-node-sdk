@@ -61,10 +61,7 @@ export function validateAzureConfig(config: AzureConfig): {
 
   if (!config.endpoint) missingFields.push("endpoint");
   if (!config.apiKey) missingFields.push("apiKey");
-
-  if (!config.apiVersion) {
-    warnings.push("API version not specified - using default");
-  }
+  if (!(config.apiVersion || process.env.OPENAI_API_VERSION)) missingFields.push("apiVersion");
 
   if (config.endpoint) {
     try {

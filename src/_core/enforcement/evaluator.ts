@@ -1,13 +1,16 @@
 import { getLogger } from "../config/manager.js";
 import { CostLimitExceeded } from "../resilience/error-handler.js";
+import type { UsageMetadata } from "../types/index.js";
 import {
   CachedEnforcementRule,
   CachedEnforcementSnapshot,
   EnforcementRule,
   getSnapshot,
 } from "./cache.js";
+import { waitForInitialRules } from "./engine.js";
 import { ruleCovers, ruleCoversBeyondDepartment } from "./filters.js";
 import { normalizeIdentityKey } from "./identity.js";
+import { costLimitContext, enforceMeteringBlock } from "./metering-blocks.js";
 
 export interface EnforcementCriteria {
   subscriberId?: string;
@@ -80,13 +83,13 @@ function applyDecision(
 
   if (rule.action !== "BLOCK") return;
 
-  throw new CostLimitExceeded(String(rule.ruleId), rule.threshold, currentValue, rule.periodType, {
-    subscriberId: criteria.subscriberId,
-    subscriberEmail: criteria.subscriberEmail,
-    productName: criteria.productName,
-    model: criteria.model,
-    provider: criteria.provider,
-  });
+  throw new CostLimitExceeded(
+    String(rule.ruleId),
+    rule.threshold,
+    currentValue,
+    rule.periodType,
+    costLimitContext(criteria),
+  );
 }
 
 function enforceDepartmentBlock(
@@ -114,7 +117,7 @@ function enforceDepartmentBlock(
   }
 }
 
-export function enforcePreCallRules(criteria: EnforcementCriteria): void {
+function enforceCachedRules(criteria: EnforcementCriteria): void {
   const snapshot = getSnapshot();
   if (snapshot.rules.length === 0) return;
 
@@ -130,4 +133,33 @@ export function enforcePreCallRules(criteria: EnforcementCriteria): void {
 
     applyDecision(cached.rule, currentValue, criteria);
   }
+}
+
+export function enforcePreCallRules(criteria: EnforcementCriteria): void {
+  enforceCachedRules(criteria);
+  enforceMeteringBlock(criteria);
+}
+
+export function buildEnforcementCriteria(
+  metadata: UsageMetadata | undefined,
+  model: string | undefined,
+  provider: string,
+): EnforcementCriteria {
+  const credential = metadata?.subscriber?.credential;
+  return {
+    subscriberId: metadata?.subscriber?.id,
+    subscriberEmail: metadata?.subscriber?.email,
+    productName: metadata?.productName || metadata?.productId,
+    model,
+    provider,
+    agent: metadata?.agent,
+    taskType: metadata?.taskType,
+    organizationName: metadata?.organizationName || metadata?.organizationId,
+    credential: credential?.name ?? credential?.value,
+  };
+}
+
+export async function enforceCostControls(criteria: EnforcementCriteria): Promise<void> {
+  await waitForInitialRules();
+  enforcePreCallRules(criteria);
 }

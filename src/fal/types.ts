@@ -1,4 +1,5 @@
 import type { UsageMetadata, OperationType } from "../_core/types/index.js";
+import type { EnforcementCriteria } from "../_core/enforcement/evaluator.js";
 
 export interface FalConfig {
   falApiKey?: string;
@@ -14,6 +15,7 @@ export interface FalConfig {
   maxPromptSize?: number;
   failSilent?: boolean;
   maxRetries?: number;
+  bufferMaxSize?: number;
 }
 
 export type FalUsageMetadata = UsageMetadata;
@@ -28,6 +30,9 @@ export interface FalTrackingData {
   isStreamed: boolean;
   requestId?: string;
   usageMetadata?: FalUsageMetadata;
+  enforcementScope?: EnforcementCriteria;
+  onDelivered?: () => void;
+  onDeliveryFailure?: () => void;
 }
 
 export interface FalImageResult {

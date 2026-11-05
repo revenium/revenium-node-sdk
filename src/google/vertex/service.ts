@@ -1,8 +1,13 @@
 import { GoogleGenAI } from "@google/genai";
 import { GoogleAuth } from "google-auth-library";
+import { loadEnvFiles } from "../../_core/config/loader.js";
 import { getConfig, getLogger } from "../../_core/config/manager.js";
-import { resolveConfig, runWithCallConfig } from "../../_core/config/call-config.js";
+import { runWithCallConfig } from "../../_core/config/call-config.js";
 import { getErrorMessage } from "../../_core/resilience/error-handler.js";
+import {
+  enforceCostControls,
+  type EnforcementCriteria,
+} from "../../_core/enforcement/evaluator.js";
 import { sendToRevenium } from "../../_core/metering/api-client.js";
 import {
   buildImagePayload,
@@ -32,19 +37,76 @@ import {
   IVideoUpscaleRequest,
 } from "../types.js";
 import {
-  trackGoogleUsageAsync,
   generateTransactionId,
   mapGoogleUsageMetadata,
   mapAspectRatioToResolution,
-  mergeStreamedGoogleResponse,
-  countGoogleEmbeddingTokens,
   buildGoogleEmbeddingResponse,
   withGoogleErrorReason,
+  buildGoogleEnforcementCriteria,
+  GOOGLE_PROVIDER,
 } from "../utils.js";
 
 const MIDDLEWARE_SOURCE = "revenium-google-node";
 
 const RETRYABLE_POLL_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+const vertexAuthByCredentials = new Map<string, GoogleAuth>();
+const vertexClientByTarget = new Map<string, GoogleGenAI>();
+
+function getOrCreate<T>(cache: Map<string, T>, key: string, create: () => T): T {
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const created = create();
+  cache.set(key, created);
+  return created;
+}
+
+function sharedVertexAuth(keyFilename: string | undefined): GoogleAuth {
+  return getOrCreate(
+    vertexAuthByCredentials,
+    keyFilename ?? "",
+    () =>
+      new GoogleAuth({
+        keyFilename,
+        scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+      }),
+  );
+}
+
+function sharedVertexClient(
+  projectId: string,
+  location: string,
+  keyFilename: string | undefined,
+): GoogleGenAI {
+  return getOrCreate(
+    vertexClientByTarget,
+    `${projectId}|${location}|${keyFilename ?? ""}`,
+    () =>
+      new GoogleGenAI({
+        vertexai: true,
+        project: projectId,
+        location,
+        googleAuthOptions: { keyFilename },
+      }),
+  );
+}
+
+function resolveVertexProjectId(projectId?: string): string {
+  const resolved = projectId || process.env.GOOGLE_CLOUD_PROJECT;
+  if (!resolved) {
+    throw new Error(
+      "A Google Cloud project id is required for Vertex AI: pass projectId or set GOOGLE_CLOUD_PROJECT.",
+    );
+  }
+  return resolved;
+}
+
+function resolveVertexLocation(location?: string): string {
+  const resolved = location || process.env.GOOGLE_CLOUD_LOCATION;
+  if (resolved) return resolved;
+  getLogger().warn("GOOGLE_CLOUD_LOCATION not set, defaulting to us-central1");
+  return "us-central1";
+}
 
 type VideoOperationOutcome =
   | { ok: true; operationName?: string; samples: any[] }
@@ -91,23 +153,14 @@ export class VertexAIService {
 
   constructor(model: string, projectId?: string, location?: string) {
     ensureGoogleConfig();
+    loadEnvFiles();
     this.model = model ?? this.model;
-    this.projectId = projectId ?? process.env.GOOGLE_CLOUD_PROJECT ?? "";
-    this.location = location ?? process.env.GOOGLE_CLOUD_LOCATION ?? "us-central1";
+    this.projectId = resolveVertexProjectId(projectId);
+    this.location = resolveVertexLocation(location);
 
-    this.client = new GoogleGenAI({
-      vertexai: true,
-      project: this.projectId,
-      location: this.location,
-      googleAuthOptions: {
-        keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-      },
-    } as any);
-
-    this.auth = new GoogleAuth({
-      keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-      scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-    });
+    const keyFilename = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    this.client = sharedVertexClient(this.projectId, this.location, keyFilename);
+    this.auth = sharedVertexAuth(keyFilename);
   }
 
   private async getAccessToken(): Promise<string> {
@@ -119,11 +172,15 @@ export class VertexAIService {
     return accessToken.token;
   }
 
-  private dispatch(payload: ReveniumPayload, label: string): void {
+  private dispatch(
+    payload: ReveniumPayload,
+    label: string,
+    enforcementScope: EnforcementCriteria,
+  ): void {
     const logger = getLogger();
     void (async () => {
       try {
-        await sendToRevenium(payload);
+        await sendToRevenium(payload, enforcementScope);
       } finally {
         printUsageSummary(payload);
       }
@@ -146,6 +203,7 @@ export class VertexAIService {
     startTime: number,
     predictions: any[],
     usageMetadata: GoogleUsageMetadata | undefined,
+    enforcementScope: EnforcementCriteria,
     error?: unknown,
   ): void {
     this.dispatch(
@@ -155,13 +213,14 @@ export class VertexAIService {
         request,
         startTime,
         Date.now() - startTime,
-        "Google",
+        GOOGLE_PROVIDER,
         "GOOGLE_VERTEX_AI",
         MIDDLEWARE_SOURCE,
         this.resolveUsageMetadata(usageMetadata, error),
-        { failed: error !== undefined },
+        { failed: error !== undefined, region: this.location },
       ),
       `Image ${subtype}`,
+      enforcementScope,
     );
   }
 
@@ -171,6 +230,7 @@ export class VertexAIService {
     startTime: number,
     extra: Omit<VideoPayloadExtra, "failed">,
     usageMetadata: GoogleUsageMetadata | undefined,
+    enforcementScope: EnforcementCriteria,
     error?: unknown,
   ): void {
     this.dispatch(
@@ -179,13 +239,14 @@ export class VertexAIService {
         { model },
         startTime,
         Date.now() - startTime,
-        "Google",
+        GOOGLE_PROVIDER,
         "GOOGLE_VERTEX_AI",
         MIDDLEWARE_SOURCE,
         this.resolveUsageMetadata(usageMetadata, error),
         { ...extra, failed: error !== undefined },
       ),
       `Video ${subtype}`,
+      enforcementScope,
     );
   }
 
@@ -199,10 +260,12 @@ export class VertexAIService {
     let operationName: string | undefined;
 
     try {
-      const token = await this.getAccessToken();
       const initResponse = await fetch(params.apiUrl, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${await this.getAccessToken()}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(params.requestBody),
       });
 
@@ -224,7 +287,7 @@ export class VertexAIService {
         pollDelay = Math.min(pollDelay * 1.5, 30000);
 
         const pollResponse = await fetch(pollUrl, {
-          headers: { Authorization: `Bearer ${token}` },
+          headers: { Authorization: `Bearer ${await this.getAccessToken()}` },
         });
         if (!pollResponse.ok) {
           if (RETRYABLE_POLL_STATUSES.has(pollResponse.status)) continue;
@@ -271,40 +334,11 @@ export class VertexAIService {
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleResponseChat> =>
     runWithCallConfig(getConfig(), async () => {
-      const logger = getLogger();
-      const chat = this.client.chats.create({ model: this.model });
-      const result: IGoogleResponse[] = [];
+      const chat = this.client.chats.create({ model: this.model, usageMetadata });
+      const responses: IGoogleResponse[] = [];
 
       for (const prompt of prompts) {
-        const startTime = new Date();
-        const transactionId = generateTransactionId();
-
-        const meterChat = (response: any, error?: unknown): void => {
-          void trackGoogleUsageAsync({
-            transactionId,
-            model: this.model,
-            startTime,
-            endTime: new Date(),
-            response,
-            operationType: "CHAT",
-            isStreaming: false,
-            modelSource: "GOOGLE_VERTEX_AI",
-            usageMetadata,
-            prompts: [prompt],
-            error,
-          }).catch((e) => logger.warn("Vertex metering failed", { error: getErrorMessage(e) }));
-        };
-
-        let response;
-        try {
-          response = await chat.sendMessage({ message: prompt });
-        } catch (error) {
-          meterChat(null, error);
-          throw error;
-        }
-
-        meterChat(response);
-        result.push(this.buildResponseObject(response));
+        responses.push(this.buildResponseObject(await chat.sendMessage({ message: prompt })));
       }
 
       const histories: string[] = [];
@@ -313,148 +347,44 @@ export class VertexAIService {
         histories.push(item?.parts?.[0]?.text ?? "");
       }
 
-      return { histories, responses: result };
+      return { histories, responses };
     });
 
   public createStreaming = async (
     prompts: string[],
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleStreamingResponse> =>
-    runWithCallConfig(getConfig(), async () => {
-      const logger = getLogger();
-      const startTime = new Date();
-      const transactionId = generateTransactionId();
-      const model = this.model;
-
-      const callConfig = resolveConfig();
-
-      const meterStream = (
-        response: any,
-        timeToFirstToken: number | undefined,
-        error?: unknown,
-      ): void => {
-        void runWithCallConfig(callConfig, () =>
-          trackGoogleUsageAsync({
-            transactionId,
-            model,
-            startTime,
-            endTime: new Date(),
-            response,
-            operationType: "CHAT",
-            isStreaming: true,
-            modelSource: "GOOGLE_VERTEX_AI",
-            usageMetadata,
-            prompts,
-            timeToFirstToken,
-            error,
-          }),
-        ).catch((e) =>
-          logger.warn("Vertex streaming metering failed", { error: getErrorMessage(e) }),
-        );
-      };
-
-      let originalStream;
-      try {
-        originalStream = await this.client.models.generateContentStream({
-          model: this.model,
-          contents: prompts.join("\n"),
-        });
-      } catch (error) {
-        meterStream(null, undefined, error);
-        throw error;
-      }
-
-      let metered = false;
-
-      const wrappedStream: AsyncIterable<any> = {
-        [Symbol.asyncIterator]: async function* () {
-          let firstTokenTime: Date | undefined;
-          let lastResponse: any = null;
-
-          const meterOnce = (error?: unknown) => {
-            if (metered) return;
-            metered = true;
-            meterStream(
-              lastResponse,
-              firstTokenTime ? firstTokenTime.getTime() - startTime.getTime() : undefined,
-              error,
-            );
-          };
-
-          try {
-            for await (const chunk of originalStream) {
-              if (!firstTokenTime) firstTokenTime = new Date();
-              lastResponse = mergeStreamedGoogleResponse(lastResponse, chunk);
-              yield chunk;
-            }
-          } catch (error) {
-            meterOnce(error);
-            throw error;
-          } finally {
-            meterOnce();
-          }
-        },
-      };
-
-      return {
-        stream: wrappedStream,
-        length: prompts.length,
-        isStreaming: true,
-      };
-    });
+    runWithCallConfig(getConfig(), async () => ({
+      stream: await this.client.models.generateContentStream({
+        model: this.model,
+        contents: prompts.join("\n"),
+        usageMetadata,
+      }),
+      length: prompts.length,
+      isStreaming: true,
+    }));
 
   public createEmbedding = async (
     input: string,
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleEmbeddingResponse> =>
-    runWithCallConfig(getConfig(), async () => {
-      const logger = getLogger();
-      const startTime = new Date();
-      const transactionId = generateTransactionId();
-
-      const meterEmbedding = (response: any, error?: unknown): void => {
-        void trackGoogleUsageAsync({
-          transactionId,
-          model: this.model,
-          startTime,
-          endTime: new Date(),
-          response,
-          operationType: "EMBED",
-          isStreaming: false,
-          modelSource: "GOOGLE_VERTEX_AI",
-          usageMetadata,
-          prompts: [input],
-          resolveInputTokens: () =>
-            countGoogleEmbeddingTokens(() =>
-              this.client.models.countTokens({ model: this.model, contents: input }),
-            ),
-          error,
-        }).catch((e) =>
-          logger.warn("Vertex embedding metering failed", { error: getErrorMessage(e) }),
-        );
-      };
-
-      let response;
-      try {
-        response = await this.client.models.embedContent({
+    runWithCallConfig(getConfig(), async () =>
+      buildGoogleEmbeddingResponse(
+        await this.client.models.embedContent({
           model: this.model,
           contents: input,
-        });
-      } catch (error) {
-        meterEmbedding(null, error);
-        throw error;
-      }
-
-      meterEmbedding(response);
-
-      return buildGoogleEmbeddingResponse(response);
-    });
+          usageMetadata,
+        }),
+      ),
+    );
 
   public generateImage = async (
     request: IImageGenerationRequest,
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleImageResponse> =>
     runWithCallConfig(getConfig(), async () => {
+      const enforcementScope = buildGoogleEnforcementCriteria(request.model, usageMetadata);
+      await enforceCostControls(enforcementScope);
       const startTime = Date.now();
       const transactionId = generateTransactionId();
 
@@ -499,11 +429,26 @@ export class VertexAIService {
 
         data = await response.json();
       } catch (error) {
-        this.meterImage("generation", imageRequest, startTime, [], usageMetadata, error);
+        this.meterImage(
+          "generation",
+          imageRequest,
+          startTime,
+          [],
+          usageMetadata,
+          enforcementScope,
+          error,
+        );
         throw error;
       }
 
-      this.meterImage("generation", imageRequest, startTime, data.predictions || [], usageMetadata);
+      this.meterImage(
+        "generation",
+        imageRequest,
+        startTime,
+        data.predictions || [],
+        usageMetadata,
+        enforcementScope,
+      );
 
       const images = (data.predictions || []).map((p: any) => ({
         bytesBase64Encoded: p.bytesBase64Encoded,
@@ -528,6 +473,8 @@ export class VertexAIService {
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleImageResponse> =>
     runWithCallConfig(getConfig(), async () => {
+      const enforcementScope = buildGoogleEnforcementCriteria(request.model, usageMetadata);
+      await enforceCostControls(enforcementScope);
       const startTime = Date.now();
       const transactionId = generateTransactionId();
 
@@ -573,11 +520,26 @@ export class VertexAIService {
 
         data = await response.json();
       } catch (error) {
-        this.meterImage("edit", imageRequest, startTime, [], usageMetadata, error);
+        this.meterImage(
+          "edit",
+          imageRequest,
+          startTime,
+          [],
+          usageMetadata,
+          enforcementScope,
+          error,
+        );
         throw error;
       }
 
-      this.meterImage("edit", imageRequest, startTime, data.predictions || [], usageMetadata);
+      this.meterImage(
+        "edit",
+        imageRequest,
+        startTime,
+        data.predictions || [],
+        usageMetadata,
+        enforcementScope,
+      );
 
       const images = (data.predictions || []).map((p: any) => ({
         bytesBase64Encoded: p.bytesBase64Encoded,
@@ -598,6 +560,8 @@ export class VertexAIService {
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleImageResponse> =>
     runWithCallConfig(getConfig(), async () => {
+      const enforcementScope = buildGoogleEnforcementCriteria(request.model, usageMetadata);
+      await enforceCostControls(enforcementScope);
       const startTime = Date.now();
       const transactionId = generateTransactionId();
 
@@ -632,11 +596,26 @@ export class VertexAIService {
 
         data = await response.json();
       } catch (error) {
-        this.meterImage("upscale", imageRequest, startTime, [], usageMetadata, error);
+        this.meterImage(
+          "upscale",
+          imageRequest,
+          startTime,
+          [],
+          usageMetadata,
+          enforcementScope,
+          error,
+        );
         throw error;
       }
 
-      this.meterImage("upscale", imageRequest, startTime, data.predictions || [], usageMetadata);
+      this.meterImage(
+        "upscale",
+        imageRequest,
+        startTime,
+        data.predictions || [],
+        usageMetadata,
+        enforcementScope,
+      );
 
       const images = (data.predictions || []).map((p: any) => ({
         bytesBase64Encoded: p.bytesBase64Encoded,
@@ -657,6 +636,8 @@ export class VertexAIService {
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleVideoResponse> =>
     runWithCallConfig(getConfig(), async () => {
+      const enforcementScope = buildGoogleEnforcementCriteria(request.model, usageMetadata);
+      await enforceCostControls(enforcementScope);
       const startTime = Date.now();
       const transactionId = generateTransactionId();
       const timeout = Math.min(request.timeout || 300000, 3600000);
@@ -700,12 +681,20 @@ export class VertexAIService {
           startTime,
           videoExtra,
           usageMetadata,
+          enforcementScope,
           operation.error,
         );
         throw operation.error;
       }
 
-      this.meterVideo("generation", request.model, startTime, videoExtra, usageMetadata);
+      this.meterVideo(
+        "generation",
+        request.model,
+        startTime,
+        videoExtra,
+        usageMetadata,
+        enforcementScope,
+      );
 
       const videos = toVideoFiles(operation.samples);
 
@@ -731,6 +720,8 @@ export class VertexAIService {
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleVideoResponse> =>
     runWithCallConfig(getConfig(), async () => {
+      const enforcementScope = buildGoogleEnforcementCriteria(request.model, usageMetadata);
+      await enforceCostControls(enforcementScope);
       const startTime = Date.now();
       const transactionId = generateTransactionId();
       const timeout = Math.min(request.timeout || 300000, 3600000);
@@ -776,12 +767,20 @@ export class VertexAIService {
           startTime,
           videoExtra,
           usageMetadata,
+          enforcementScope,
           operation.error,
         );
         throw operation.error;
       }
 
-      this.meterVideo("extend", request.model, startTime, videoExtra, usageMetadata);
+      this.meterVideo(
+        "extend",
+        request.model,
+        startTime,
+        videoExtra,
+        usageMetadata,
+        enforcementScope,
+      );
 
       const videos = toVideoFiles(operation.samples);
 
@@ -807,6 +806,8 @@ export class VertexAIService {
     usageMetadata?: GoogleUsageMetadata,
   ): Promise<IGoogleVideoResponse> =>
     runWithCallConfig(getConfig(), async () => {
+      const enforcementScope = buildGoogleEnforcementCriteria(request.model, usageMetadata);
+      await enforceCostControls(enforcementScope);
       const startTime = Date.now();
       const transactionId = generateTransactionId();
       const timeout = Math.min(request.timeout || 300000, 3600000);
@@ -839,12 +840,20 @@ export class VertexAIService {
           startTime,
           videoExtra,
           usageMetadata,
+          enforcementScope,
           operation.error,
         );
         throw operation.error;
       }
 
-      this.meterVideo("upscale", request.model, startTime, videoExtra, usageMetadata);
+      this.meterVideo(
+        "upscale",
+        request.model,
+        startTime,
+        videoExtra,
+        usageMetadata,
+        enforcementScope,
+      );
 
       const videos = toVideoFiles(operation.samples);
 

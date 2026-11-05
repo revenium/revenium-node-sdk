@@ -1,7 +1,10 @@
-import { createReveniumConfig } from "../../helpers/fixtures";
+import {
+  createReveniumConfig,
+  installRoutingFetch,
+  REVENIUM_BASE_URL,
+} from "../../helpers/fixtures";
 
 const BASE_URL = "https://api.anthropic.com";
-const REVENIUM_BASE_URL = "https://api.revenium.ai";
 const MODEL = "claude-3-5-sonnet-20241022";
 
 const MESSAGE_RESPONSE = {
@@ -104,18 +107,6 @@ const TOOL_USE_SSE_EVENTS = [
 function sequence(responses: (() => Response)[]): () => Response {
   let index = 0;
   return () => responses[Math.min(index++, responses.length - 1)]();
-}
-
-function installRoutingFetch(providerResponse: () => Response): Record<string, unknown>[] {
-  const meteringBodies: Record<string, unknown>[] = [];
-  global.fetch = jest.fn(async (url: unknown, init?: RequestInit) => {
-    if (String(url).startsWith(REVENIUM_BASE_URL)) {
-      meteringBodies.push(JSON.parse(String(init?.body)));
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-    }
-    return providerResponse();
-  }) as unknown as typeof fetch;
-  return meteringBodies;
 }
 
 async function waitForMetering(
@@ -505,5 +496,62 @@ describe("an SDK without a beta surface", () => {
     } finally {
       Object.defineProperty(Anthropic, "Beta", beta);
     }
+  });
+});
+
+describe("a BLOCK directive on the metering reply", () => {
+  const blockReply = {
+    enforcement: { action: "BLOCK", ruleName: "stub-cap", message: "Daily cap reached" },
+  };
+
+  function providerCallCount(): number {
+    return (global.fetch as jest.Mock).mock.calls.filter(
+      ([url]) => !String(url).startsWith(REVENIUM_BASE_URL),
+    ).length;
+  }
+
+  it("refuses the next messages.create for the same scope before the provider is called", async () => {
+    const bodies = installRoutingFetch(jsonResponse(), blockReply);
+    const client = createClient();
+
+    await client.messages.create(REQUEST as any);
+    await waitForMetering(bodies);
+    await settle();
+
+    await expect(client.messages.create(REQUEST as any)).rejects.toThrow("Daily cap reached");
+    await expect(
+      client.messages.create({ ...REQUEST, usageMetadata: { subscriber: { id: "other" } } } as any),
+    ).resolves.toBeDefined();
+    expect(providerCallCount()).toBe(2);
+  });
+
+  it("refuses the next messages.stream synchronously before the provider is called", async () => {
+    const bodies = installRoutingFetch(sseResponse, blockReply);
+    const client = createClient();
+
+    await drain(client.messages.stream(REQUEST as any) as unknown as AsyncIterable<unknown>);
+    await waitForMetering(bodies);
+    await settle();
+
+    expect(() => client.messages.stream(REQUEST as any)).toThrow("Daily cap reached");
+    expect(providerCallCount()).toBe(1);
+  });
+});
+
+describe("the wait for the first cost controls on messages.create", () => {
+  const RULES_WAIT_MS = 200;
+
+  it("is left out of the metered request duration", async () => {
+    const engine = await import("../../../src/_core/enforcement/engine");
+    jest
+      .spyOn(engine, "waitForInitialRules")
+      .mockReturnValue(new Promise((resolve) => setTimeout(resolve, RULES_WAIT_MS)));
+    const bodies = installRoutingFetch(jsonResponse());
+
+    await createClient().messages.create(REQUEST as any);
+    const body = await waitForMetering(bodies);
+
+    expect(engine.waitForInitialRules).toHaveBeenCalledTimes(1);
+    expect(body.requestDuration).toBeLessThan(RULES_WAIT_MS);
   });
 });

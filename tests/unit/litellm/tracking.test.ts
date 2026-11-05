@@ -395,6 +395,65 @@ describe("extractMetadataFromHeaders skill headers", () => {
   });
 });
 
+describe("extractMetadataFromHeaders prompt context headers", () => {
+  const promptContextHeaders = {
+    "x-revenium-effort": "high",
+    "x-revenium-prompt-id": "prompt-01",
+    "x-revenium-prompt-length": "412",
+    "x-revenium-query-source": "repl_main_thread:sdk",
+    "x-revenium-speed": "fast",
+    "x-revenium-subagent-type": "general-purpose",
+  };
+
+  const expectedPromptContext = {
+    effort: "high",
+    promptId: "prompt-01",
+    promptLength: 412,
+    querySource: "repl_main_thread:sdk",
+    speed: "fast",
+    subagentType: "general-purpose",
+  };
+
+  it("extracts all six prompt context headers with a numeric promptLength", () => {
+    expect(extractMetadataFromHeaders(promptContextHeaders)).toMatchObject(expectedPromptContext);
+  });
+
+  it.each(["long", "412.9", "123abc", "1e6"])(
+    "drops a malformed promptLength header %p with a warning",
+    async (promptLength) => {
+      const mockFetch = createMockFetch();
+      global.fetch = mockFetch;
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await sendReveniumMetrics({
+        ...baseMetrics,
+        usageMetadata: extractMetadataFromHeaders({
+          "x-revenium-prompt-length": promptLength,
+          "x-revenium-effort": "high",
+        }),
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body).not.toHaveProperty("promptLength");
+      expect(body).toHaveProperty("effort", "high");
+      expect(warn).toHaveBeenCalledWith(expect.any(String), { field: "promptLength" });
+    },
+  );
+
+  it("sends header-supplied prompt context on the metering body", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+
+    await sendReveniumMetrics({
+      ...baseMetrics,
+      usageMetadata: extractMetadataFromHeaders(promptContextHeaders),
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body).toMatchObject(expectedPromptContext);
+  });
+});
+
 describe("sendReveniumMetrics subscriber attribution", () => {
   it("emits a subscriber from the id alone", async () => {
     const mockFetch = createMockFetch();

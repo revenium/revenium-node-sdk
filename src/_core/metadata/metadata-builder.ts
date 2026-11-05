@@ -65,6 +65,53 @@ const SKILL_FIELD_MAX_LENGTHS: Record<string, number> = {
   skillInvocationTrigger: 32, // mirrors the backend skill invocation trigger column limit
 };
 
+interface PromptContextRule {
+  accepts: (value: unknown) => boolean;
+  description: string;
+}
+
+interface PromptContextField {
+  aliases: (keyof UsageMetadata)[];
+  rule: PromptContextRule;
+}
+
+const IDENTIFIER_CHARACTERS = "A-Za-z0-9_-";
+const QUALIFIED_IDENTIFIER_CHARACTERS = "A-Za-z0-9._:-";
+const PROMPT_TAG_MAX_LENGTH = 16;
+const PROMPT_ID_MAX_LENGTH = 64;
+const PROMPT_ORIGIN_MAX_LENGTH = 128;
+const PROMPT_LENGTH_MAX = 2_147_483_647;
+
+function tokenRule(characters: string, maxLength: number): PromptContextRule {
+  const pattern = new RegExp(`^[${characters}]{1,${maxLength}}$`);
+  return {
+    accepts: (value) => typeof value === "string" && pattern.test(value),
+    description: `a string matching ${pattern.source}`,
+  };
+}
+
+const PROMPT_TAG_RULE = tokenRule(IDENTIFIER_CHARACTERS, PROMPT_TAG_MAX_LENGTH);
+const PROMPT_ID_RULE = tokenRule(IDENTIFIER_CHARACTERS, PROMPT_ID_MAX_LENGTH);
+const PROMPT_ORIGIN_RULE = tokenRule(QUALIFIED_IDENTIFIER_CHARACTERS, PROMPT_ORIGIN_MAX_LENGTH);
+
+const PROMPT_LENGTH_RULE: PromptContextRule = {
+  accepts: (value) =>
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= PROMPT_LENGTH_MAX,
+  description: `an integer between 0 and ${PROMPT_LENGTH_MAX}`,
+};
+
+const PROMPT_CONTEXT_FIELDS: Record<string, PromptContextField> = {
+  effort: { aliases: ["effort"], rule: PROMPT_TAG_RULE },
+  promptId: { aliases: ["promptId", "prompt_id"], rule: PROMPT_ID_RULE },
+  promptLength: { aliases: ["promptLength", "prompt_length"], rule: PROMPT_LENGTH_RULE },
+  querySource: { aliases: ["querySource", "query_source"], rule: PROMPT_ORIGIN_RULE },
+  speed: { aliases: ["speed"], rule: PROMPT_TAG_RULE },
+  subagentType: { aliases: ["subagentType", "subagent_type"], rule: PROMPT_ORIGIN_RULE },
+};
+
 function truncateToLimit(value: unknown, maxLength: number): unknown {
   if (typeof value === "string" && value.length > maxLength) return value.slice(0, maxLength);
   return value;
@@ -143,6 +190,25 @@ export function resolveSkillFields(usageMetadata?: UsageMetadata): Record<string
         usageMetadata[alias],
         SKILL_FIELD_MAX_LENGTHS[targetField],
       );
+    }
+  }
+
+  return result;
+}
+
+export function resolvePromptContextFields(usageMetadata?: UsageMetadata): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  if (!usageMetadata) return result;
+
+  for (const [field, { aliases, rule }] of Object.entries(PROMPT_CONTEXT_FIELDS)) {
+    const alias = aliases.find((source) => usageMetadata[source] != null);
+    if (!alias) continue;
+
+    const value = usageMetadata[alias];
+    if (rule.accepts(value)) {
+      result[field] = value;
+    } else {
+      getLogger().warn(`${field} is not ${rule.description}. Dropping it.`, { field });
     }
   }
 

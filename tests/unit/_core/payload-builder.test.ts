@@ -12,6 +12,7 @@ import {
   type ImageOperationSubtype,
   type VideoOperationSubtype,
 } from "../../../src/_core/metering/operation-subtype";
+import { resetRegionCache } from "../../../src/_core/metadata/trace-fields";
 import { ReveniumPayload, UsageMetadata } from "../../../src/_core/types/index";
 
 const ENV_KEYS = [
@@ -49,14 +50,63 @@ function createParams(overrides: Partial<PayloadParams> = {}): PayloadParams {
   };
 }
 
-beforeEach(async () => {
-  jest.resetModules();
+const buildImage = (
+  subtype: ImageOperationSubtype,
+  usageMetadata?: UsageMetadata,
+  region?: string,
+) =>
+  buildImagePayload(
+    subtype,
+    { data: [{ url: "https://example.com/1.png" }] },
+    { n: 1, model: "dall-e-3", size: "1024x1024" },
+    Date.now() - 1000,
+    1000,
+    "OpenAI",
+    "OPENAI",
+    "revenium-openai-node",
+    usageMetadata,
+    { region },
+  );
+
+const buildAudio = (
+  subtype: Parameters<typeof buildAudioPayload>[0],
+  usageMetadata?: UsageMetadata,
+) =>
+  buildAudioPayload(
+    subtype,
+    { duration: 42 },
+    { model: "whisper-1", input: "hello", voice: "alloy" },
+    Date.now() - 1000,
+    1000,
+    "OpenAI",
+    "OPENAI",
+    "revenium-openai-node",
+    usageMetadata,
+  );
+
+const buildVideo = (
+  subtype: VideoOperationSubtype,
+  usageMetadata?: UsageMetadata,
+  region?: string,
+) =>
+  buildVideoPayload(
+    subtype,
+    { model: "veo-001" },
+    Date.now() - 1000,
+    1000,
+    "Google",
+    "GOOGLE_VERTEX_AI",
+    "revenium-google-node",
+    usageMetadata,
+    { videoDurationSeconds: 8, region },
+  );
+
+beforeEach(() => {
   savedEnv = {};
   for (const key of ENV_KEYS) {
     savedEnv[key] = process.env[key];
     delete process.env[key];
   }
-  const { resetRegionCache } = await import("../../../src/_core/metadata/trace-fields");
   resetRegionCache();
 });
 
@@ -175,48 +225,6 @@ describe("buildPayload precedence", () => {
 });
 
 describe("multimodal operationSubtype", () => {
-  const buildImage = (subtype: ImageOperationSubtype, usageMetadata?: UsageMetadata) =>
-    buildImagePayload(
-      subtype,
-      { data: [{ url: "https://example.com/1.png" }] },
-      { n: 1, model: "dall-e-3", size: "1024x1024" },
-      Date.now() - 1000,
-      1000,
-      "OpenAI",
-      "OPENAI",
-      "revenium-openai-node",
-      usageMetadata,
-    );
-
-  const buildAudio = (
-    subtype: Parameters<typeof buildAudioPayload>[0],
-    usageMetadata?: UsageMetadata,
-  ) =>
-    buildAudioPayload(
-      subtype,
-      { duration: 42 },
-      { model: "whisper-1", input: "hello", voice: "alloy" },
-      Date.now() - 1000,
-      1000,
-      "OpenAI",
-      "OPENAI",
-      "revenium-openai-node",
-      usageMetadata,
-    );
-
-  const buildVideo = (subtype: VideoOperationSubtype, usageMetadata?: UsageMetadata) =>
-    buildVideoPayload(
-      subtype,
-      { model: "veo-001" },
-      Date.now() - 1000,
-      1000,
-      "Google",
-      "GOOGLE_VERTEX_AI",
-      "revenium-google-node",
-      usageMetadata,
-      { videoDurationSeconds: 8 },
-    );
-
   function subtypeCases<T extends string>(
     operationType: string,
     accepted: readonly T[],
@@ -635,4 +643,101 @@ describe("pricing fields at the top level", () => {
     expect(payload.attributes?.resolution).toBe("1080p");
     expect(payload.attributes?.quality).toBe("high");
   });
+});
+
+describe("media payloads pick up environment defaults", () => {
+  const ENV_DEFAULTS = {
+    REVENIUM_ENVIRONMENT: "staging",
+    REVENIUM_REGION: "us-east-1",
+    REVENIUM_CREDENTIAL_ALIAS: "env-alias",
+    REVENIUM_TRACE_TYPE: "env-trace-type",
+    REVENIUM_TRACE_NAME: "env-trace-name",
+    REVENIUM_TICKET_ID: "ENG-123",
+    REVENIUM_PARENT_TRANSACTION_ID: "env-parent",
+    REVENIUM_TRANSACTION_NAME: "env-name",
+    REVENIUM_RETRY_NUMBER: "2",
+  };
+
+  const EXPECTED_ENV_FIELDS: Partial<ReveniumPayload> = {
+    environment: "staging",
+    credentialAlias: "env-alias",
+    traceType: "env-trace-type",
+    traceName: "env-trace-name",
+    ticketId: "ENG-123",
+    parentTransactionId: "env-parent",
+    transactionName: "env-name",
+    retryNumber: 2,
+  };
+
+  const ENV_FIELDS = Object.keys(EXPECTED_ENV_FIELDS) as Array<keyof ReveniumPayload>;
+
+  const pickEnvFields = (payload: ReveniumPayload) =>
+    Object.fromEntries(ENV_FIELDS.map((field) => [field, payload[field]]));
+
+  interface MediaCase {
+    record: string;
+    build: (usageMetadata?: UsageMetadata, region?: string) => ReveniumPayload;
+  }
+
+  const modelRegionCases: MediaCase[] = [
+    {
+      record: "image generation",
+      build: (usageMetadata, region) => buildImage("generation", usageMetadata, region),
+    },
+    {
+      record: "video generation",
+      build: (usageMetadata, region) => buildVideo("generation", usageMetadata, region),
+    },
+  ];
+
+  const mediaCases: MediaCase[] = [
+    ...modelRegionCases,
+    { record: "speech", build: (usageMetadata) => buildAudio("tts", usageMetadata) },
+    {
+      record: "transcription",
+      build: (usageMetadata) => buildAudio("transcription", usageMetadata),
+    },
+    { record: "translation", build: (usageMetadata) => buildAudio("translation", usageMetadata) },
+  ];
+
+  beforeEach(() => {
+    Object.assign(process.env, ENV_DEFAULTS);
+  });
+
+  it.each(mediaCases)(
+    "fills the $record record from the environment like a chat record, without the server region",
+    async ({ build }) => {
+      const payload = build();
+      const chatPayload = await buildPayload(createParams());
+
+      expect(pickEnvFields(payload)).toEqual(EXPECTED_ENV_FIELDS);
+      expect(pickEnvFields(payload)).toEqual(pickEnvFields(chatPayload));
+      expect(payload.region).toBeUndefined();
+    },
+  );
+
+  it.each(mediaCases)(
+    "keeps the caller's values and region on the $record record and fills the rest from the environment",
+    ({ build }) => {
+      const payload = build(
+        { ticketId: "FRONT-1", environment: "", retryNumber: 0, region: "asia-east1" },
+        "europe-west4",
+      );
+
+      expect(payload).toMatchObject({
+        ticketId: "FRONT-1",
+        environment: "",
+        retryNumber: 0,
+        region: "asia-east1",
+        traceName: "env-trace-name",
+      });
+    },
+  );
+
+  it.each(modelRegionCases)(
+    "reports the region the $record model ran in instead of the server region",
+    ({ build }) => {
+      expect(build(undefined, "europe-west4").region).toBe("europe-west4");
+    },
+  );
 });

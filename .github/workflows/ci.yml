@@ -14,7 +14,7 @@ jobs:
       matrix:
         include:
           - node-version: 18
-            provider-pins: openai@6 @google/genai@1
+            provider-pins: openai@6 @google/genai@1.17.0
           - node-version: 20
             provider-pins: openai@6
           - node-version: 22

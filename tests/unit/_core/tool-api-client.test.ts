@@ -1,9 +1,12 @@
-import { createReveniumConfig, createMockFetch } from "../../helpers/fixtures";
+import { createReveniumConfig, createMockFetch, createHungFetch } from "../../helpers/fixtures";
 import { ToolEventPayload } from "../../../src/_core/types/tool-metering";
+import { METERING_REQUEST_TIMEOUT_MS } from "../../../src/_core/constants";
 
 let sendToolEvent: typeof import("../../../src/_core/tool-metering/tool-api-client").sendToolEvent;
 let setConfig: typeof import("../../../src/_core/config/manager").setConfig;
 let resetConfig: typeof import("../../../src/_core/config/manager").resetConfig;
+let getBufferStats: typeof import("../../../src/_core/metering/buffer").getBufferStats;
+let resetMeteringBuffer: typeof import("../../../src/_core/metering/buffer").resetMeteringBuffer;
 
 function createToolEventPayload(overrides: Partial<ToolEventPayload> = {}): ToolEventPayload {
   return {
@@ -21,12 +24,17 @@ beforeEach(async () => {
   jest.resetModules();
   const manager = await import("../../../src/_core/config/manager");
   const client = await import("../../../src/_core/tool-metering/tool-api-client");
+  const buffer = await import("../../../src/_core/metering/buffer");
   sendToolEvent = client.sendToolEvent;
   setConfig = manager.setConfig;
   resetConfig = manager.resetConfig;
+  getBufferStats = buffer.getBufferStats;
+  resetMeteringBuffer = buffer.resetMeteringBuffer;
 });
 
 afterEach(() => {
+  resetMeteringBuffer();
+  jest.useRealTimers();
   resetConfig();
   jest.restoreAllMocks();
 });
@@ -113,11 +121,7 @@ describe("sendToolEvent", () => {
 
     const promise = sendToolEvent(createToolEventPayload());
 
-    for (let i = 0; i < 5; i++) {
-      await Promise.resolve();
-      jest.advanceTimersByTime(10_000);
-      await Promise.resolve();
-    }
+    await jest.advanceTimersByTimeAsync(50_000);
 
     await promise;
     expect(callCount).toBe(2);
@@ -125,7 +129,37 @@ describe("sendToolEvent", () => {
     const key1 = (global.fetch as jest.Mock).mock.calls[0][1].headers["Idempotency-Key"];
     const key2 = (global.fetch as jest.Mock).mock.calls[1][1].headers["Idempotency-Key"];
     expect(key1).toBe(key2);
-    jest.useRealTimers();
+  });
+
+  it("buffers a tool event that met a Revenium outage", async () => {
+    jest.useFakeTimers();
+    setConfig(createReveniumConfig());
+    global.fetch = createMockFetch({
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+    });
+
+    const outcome = expect(sendToolEvent(createToolEventPayload())).rejects.toThrow("503");
+    await jest.advanceTimersByTimeAsync(60_000);
+
+    await outcome;
+    expect(getBufferStats().totalBuffered).toBe(1);
+  });
+
+  it("fails a hung tool event at the metering timeout without an in-line retry and buffers it", async () => {
+    jest.useFakeTimers();
+    setConfig(createReveniumConfig());
+    global.fetch = createHungFetch();
+
+    const outcome = expect(sendToolEvent(createToolEventPayload())).rejects.toThrow(
+      `timed out after ${METERING_REQUEST_TIMEOUT_MS} ms`,
+    );
+    await jest.advanceTimersByTimeAsync(METERING_REQUEST_TIMEOUT_MS);
+
+    await outcome;
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(getBufferStats().totalBuffered).toBe(1);
   });
 
   it("fails fast on terminal 401", async () => {

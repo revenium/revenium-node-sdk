@@ -231,3 +231,46 @@ describe("ReveniumFal organization isolation", () => {
     expect(mockFetch.mock.calls[0][1].headers["x-api-key"]).toBe("hak_org_a_1111111111");
   });
 });
+
+describe("ReveniumFal cost limit directive", () => {
+  const blockReply = {
+    enforcement: { action: "BLOCK", ruleName: "stub-cap", message: "Daily cap reached" },
+  };
+  const imageResult = {
+    data: { images: [{ url: "https://example.com/1.png", width: 1024, height: 1024 }] },
+    requestId: "req-block",
+  };
+  const options = { input: { prompt: "a cat" } };
+  const metadata = { subscriber: { id: "sub-1" } };
+
+  async function waitForMetering(mockFetch: jest.Mock): Promise<void> {
+    for (let attempt = 0; attempt < 100 && mockFetch.mock.calls.length === 0; attempt++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  it.each([
+    ["run", mockRun],
+    ["subscribe", mockSubscribe],
+  ] as const)(
+    "refuses the next %s for the scope the record was metered under",
+    async (method, providerCall) => {
+      const mockFetch = createMockFetch({ status: 201, jsonBody: blockReply });
+      global.fetch = mockFetch;
+      providerCall.mockResolvedValue(imageResult);
+      const client = new ReveniumFal({ reveniumApiKey: "hak_test_key" });
+
+      await client[method]("fal-ai/flux/dev", options, metadata);
+      await waitForMetering(mockFetch);
+
+      await expect(client[method]("fal-ai/flux/dev", options, metadata)).rejects.toThrow(
+        "Daily cap reached",
+      );
+      await expect(client[method]("fal-ai/flux/schnell", options, metadata)).resolves.toEqual(
+        imageResult,
+      );
+      expect(providerCall).toHaveBeenCalledTimes(2);
+    },
+  );
+});

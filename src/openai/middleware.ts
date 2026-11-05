@@ -1,7 +1,26 @@
 import OpenAI from "openai";
+import type {
+  ChatCompletionParseParams,
+  ParsedChatCompletion,
+} from "openai/resources/chat/completions";
+import type {
+  ParsedResponse,
+  Response as OpenAIResponse,
+} from "openai/resources/responses/responses";
+import {
+  parseChatCompletion,
+  validateInputTools,
+  type ExtractParsedContentFromParams,
+} from "openai/lib/parser";
+import {
+  parseResponse,
+  type ExtractParsedContentFromParams as ExtractParsedResponseContent,
+  type ResponseCreateParamsWithTools,
+} from "openai/lib/ResponsesParser";
 import { randomUUID } from "crypto";
-import { Config, UsageMetadata, WithUsageMetadata } from "../_core/types/index.js";
+import { Config, ReveniumPayload, UsageMetadata, WithUsageMetadata } from "../_core/types/index.js";
 import { getLogger } from "../_core/config/manager.js";
+import { DEFAULT_IMAGE_MODEL } from "../_core/constants.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import {
   buildPayload,
@@ -28,13 +47,19 @@ import {
   mapResponsesStatusToStopReason,
   TERMINAL_RESPONSE_EVENTS,
 } from "./responses-stop-reason.js";
-import { MeteredResponseLedger } from "./metered-response-ledger.js";
+import { MeteredRequestLedger } from "../_core/metering/metered-request-ledger.js";
 import { isImageStreamRequest, isAsyncIterable, instrumentImageStream } from "./image-streaming.js";
 import { StreamingWrapper, type TrackUsageFn } from "./streaming.js";
 import { runProviderCall } from "../_core/metering/metering-context.js";
 import { runWithCallConfig } from "../_core/config/call-config.js";
-import { enforcePreCallRules, type EnforcementCriteria } from "../_core/enforcement/evaluator.js";
+import { isCostLimitRefusal } from "../_core/resilience/error-handler.js";
+import {
+  buildEnforcementCriteria,
+  enforceCostControls,
+  type EnforcementCriteria,
+} from "../_core/enforcement/evaluator.js";
 import { resolveAgenticJobFields } from "../_core/metadata/metadata-builder.js";
+import { getRegion } from "../_core/metadata/trace-fields.js";
 
 interface ResponsesAPIResult {
   id?: string;
@@ -63,7 +88,9 @@ interface ResponsesUsageCounts {
   cachedTokens?: number;
 }
 
-function extractResponsesUsage(response: ResponsesAPIResult | null): ResponsesUsageCounts {
+export function extractResponsesUsage(
+  response: Pick<ResponsesAPIResult, "usage"> | null,
+): ResponsesUsageCounts {
   const usage = response?.usage ?? {};
 
   return {
@@ -98,6 +125,12 @@ function withResponseIdempotencyKey(responseId: string, metadata?: UsageMetadata
 
 type ResponsesStream = AsyncIterable<unknown> & { controller?: AbortController };
 
+interface PendingResponseContext {
+  metadata?: UsageMetadata;
+  messages?: unknown[];
+  enforcementScope?: EnforcementCriteria;
+}
+
 interface OpenAIClientWithResponses {
   responses?: {
     create(params: Record<string, unknown>): Promise<ResponsesAPIResult | AsyncIterable<unknown>>;
@@ -105,11 +138,11 @@ interface OpenAIClientWithResponses {
   };
 }
 
-const MIDDLEWARE_SOURCE = "revenium-openai-node";
+export const MIDDLEWARE_SOURCE = "revenium-openai-node";
 
 const skipTracking: TrackUsageFn = () => undefined;
 
-export function trackUsageAsync(trackingData: {
+interface UsageTracking {
   requestId: string;
   model: string;
   promptTokens: number;
@@ -117,6 +150,7 @@ export function trackUsageAsync(trackingData: {
   totalTokens: number;
   reasoningTokens?: number;
   cachedTokens?: number;
+  cacheCreationTokens?: number;
   duration: number;
   startTime?: number;
   finishReason: string | null;
@@ -127,7 +161,21 @@ export function trackUsageAsync(trackingData: {
   messages?: any[];
   responseContent?: string;
   onDeliveryFailure?: () => void;
-}): void {
+  enforcementScope?: EnforcementCriteria;
+}
+
+type FailedCallTracking = Pick<
+  UsageTracking,
+  | "requestId"
+  | "model"
+  | "usageMetadata"
+  | "isStreamed"
+  | "providerInfo"
+  | "messages"
+  | "enforcementScope"
+> & { startTime: number };
+
+export function trackUsageAsync(trackingData: UsageTracking): void {
   const logger = getLogger();
 
   Promise.resolve()
@@ -162,6 +210,7 @@ export function trackUsageAsync(trackingData: {
           total_tokens: trackingData.totalTokens,
           reasoning_tokens: trackingData.reasoningTokens,
           cached_tokens: trackingData.cachedTokens,
+          cache_creation_tokens: trackingData.cacheCreationTokens,
         },
         stopReason: mapStopReason(trackingData.finishReason, logger),
         isStreamed: trackingData.isStreamed || false,
@@ -172,7 +221,7 @@ export function trackUsageAsync(trackingData: {
     })
     .then(async (payload) => {
       try {
-        await sendToRevenium(payload);
+        await sendToRevenium(payload, trackingData.enforcementScope);
       } finally {
         printUsageSummary(payload);
       }
@@ -185,6 +234,17 @@ export function trackUsageAsync(trackingData: {
     });
 }
 
+export function trackFailedCall({ startTime, ...call }: FailedCallTracking): void {
+  trackUsageAsync({
+    ...call,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    duration: Date.now() - startTime,
+    finishReason: "error",
+  });
+}
+
 export function trackEmbeddingsUsageAsync(trackingData: {
   transactionId: string;
   model: string;
@@ -194,6 +254,7 @@ export function trackEmbeddingsUsageAsync(trackingData: {
   usageMetadata?: UsageMetadata;
   requestStartTime: number;
   providerInfo?: ProviderInfo;
+  enforcementScope?: EnforcementCriteria;
 }): void {
   const logger = getLogger();
   const providerMeta = trackingData.providerInfo
@@ -219,7 +280,7 @@ export function trackEmbeddingsUsageAsync(trackingData: {
   })
     .then(async (payload) => {
       try {
-        await sendToRevenium(payload);
+        await sendToRevenium(payload, trackingData.enforcementScope);
       } finally {
         printUsageSummary(payload);
       }
@@ -229,6 +290,14 @@ export function trackEmbeddingsUsageAsync(trackingData: {
         error: error instanceof Error ? error.message : String(error),
       });
     });
+}
+
+async function withServerRegion(
+  payload: ReveniumPayload,
+  providerInfo: ProviderInfo,
+): Promise<ReveniumPayload> {
+  if (providerInfo.isAzure) return payload;
+  return { ...payload, region: payload.region ?? (await getRegion()) ?? undefined };
 }
 
 export function trackImageUsageAsync(
@@ -241,26 +310,30 @@ export function trackImageUsageAsync(
   providerInfo: ProviderInfo,
   metadata?: UsageMetadata,
   extra?: ImagePayloadExtra,
+  enforcementScope?: EnforcementCriteria,
 ): void {
   const logger = getLogger();
   const providerMeta = getProviderMetadata(providerInfo);
 
   void (async () => {
     try {
-      const payload = buildImagePayload(
-        operationSubtype,
-        response,
-        request,
-        startTime,
-        duration,
-        providerMeta.provider,
-        providerMeta.modelSource,
-        MIDDLEWARE_SOURCE,
-        metadata,
-        extra,
+      const payload = await withServerRegion(
+        buildImagePayload(
+          operationSubtype,
+          response,
+          request,
+          startTime,
+          duration,
+          providerMeta.provider,
+          providerMeta.modelSource,
+          MIDDLEWARE_SOURCE,
+          metadata,
+          extra,
+        ),
+        providerInfo,
       );
       try {
-        await sendToRevenium(payload);
+        await sendToRevenium(payload, enforcementScope);
       } finally {
         printUsageSummary(payload);
       }
@@ -281,25 +354,29 @@ export function trackAudioUsageAsync(
   config: any,
   providerInfo: ProviderInfo,
   metadata?: UsageMetadata,
+  enforcementScope?: EnforcementCriteria,
 ): void {
   const logger = getLogger();
   const providerMeta = getProviderMetadata(providerInfo);
 
   void (async () => {
     try {
-      const payload = buildAudioPayload(
-        operationSubtype,
-        response,
-        request,
-        startTime,
-        duration,
-        providerMeta.provider,
-        providerMeta.modelSource,
-        MIDDLEWARE_SOURCE,
-        metadata,
+      const payload = await withServerRegion(
+        buildAudioPayload(
+          operationSubtype,
+          response,
+          request,
+          startTime,
+          duration,
+          providerMeta.provider,
+          providerMeta.modelSource,
+          MIDDLEWARE_SOURCE,
+          metadata,
+        ),
+        providerInfo,
       );
       try {
-        await sendToRevenium(payload);
+        await sendToRevenium(payload, enforcementScope);
       } finally {
         printUsageSummary(payload);
       }
@@ -311,23 +388,20 @@ export function trackAudioUsageAsync(
   })();
 }
 
-function enforcementCriteriaFor(
+export function enforcementScopeFor(
   providerInfo: ProviderInfo,
-  model: string,
+  model: string | null | undefined,
   metadata?: UsageMetadata,
 ): EnforcementCriteria {
-  const credential = metadata?.subscriber?.credential;
-  return {
-    subscriberId: metadata?.subscriber?.id,
-    subscriberEmail: metadata?.subscriber?.email,
-    productName: metadata?.productName || metadata?.productId,
-    model,
-    provider: getProviderMetadata(providerInfo).provider,
-    agent: metadata?.agent,
-    taskType: metadata?.taskType,
-    organizationName: metadata?.organizationName || metadata?.organizationId,
-    credential: credential?.name ?? credential?.value,
-  };
+  return buildEnforcementCriteria(
+    metadata,
+    model ?? undefined,
+    getProviderMetadata(providerInfo).provider,
+  );
+}
+
+export function toInputMessages(input: unknown): unknown[] {
+  return Array.isArray(input) ? input : [{ role: "user" as const, content: input }];
 }
 
 export class CompletionsInterface {
@@ -344,14 +418,24 @@ export class CompletionsInterface {
     return runWithCallConfig(this.config, () => this.meteredCreate(params, metadata));
   }
 
+  async parse<
+    Params extends ChatCompletionParseParams,
+    ParsedT = ExtractParsedContentFromParams<Params>,
+  >(params: Params, metadata?: UsageMetadata): Promise<ParsedChatCompletion<ParsedT>> {
+    validateInputTools(params.tools);
+    const completion = await this.create(params, metadata);
+    return parseChatCompletion<Params, ParsedT>(completion, params);
+  }
+
   private async meteredCreate(
     params: OpenAI.ChatCompletionCreateParamsNonStreaming,
     metadata?: UsageMetadata,
   ): Promise<OpenAI.ChatCompletion> {
+    const enforcementScope = enforcementScopeFor(this.providerInfo, params.model, metadata);
+    await enforceCostControls(enforcementScope);
+
     const startTime = Date.now();
     const requestId = randomUUID();
-
-    enforcePreCallRules(enforcementCriteriaFor(this.providerInfo, params.model, metadata));
 
     try {
       const { result: response, meteredElsewhere } = await runProviderCall(
@@ -383,23 +467,22 @@ export class CompletionsInterface {
           responseContent && shouldCapturePrompts(metadata)
             ? sanitizeCredentials(responseContent)
             : undefined,
+        enforcementScope,
       });
 
       return response;
     } catch (error) {
-      const duration = Date.now() - startTime;
-      trackUsageAsync({
+      if (isCostLimitRefusal(error)) throw error;
+
+      trackFailedCall({
         requestId,
         model: params.model,
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-        duration,
-        finishReason: "error",
+        startTime,
         usageMetadata: metadata,
         isStreamed: false,
         providerInfo: this.providerInfo,
         messages: params.messages,
+        enforcementScope,
       });
       throw error;
     }
@@ -416,7 +499,10 @@ export class CompletionsInterface {
     params: OpenAI.ChatCompletionCreateParamsStreaming,
     metadata?: UsageMetadata,
   ): Promise<StreamingWrapper> {
-    enforcePreCallRules(enforcementCriteriaFor(this.providerInfo, params.model, metadata));
+    const enforcementScope = enforcementScopeFor(this.providerInfo, params.model, metadata);
+    await enforceCostControls(enforcementScope);
+    const startTime = Date.now();
+    const callerRequestedUsage = params.stream_options?.include_usage === true;
 
     const { result: stream, meteredElsewhere } = await runProviderCall(
       MIDDLEWARE_SOURCE,
@@ -425,7 +511,7 @@ export class CompletionsInterface {
         this.client.chat.completions.create({
           ...params,
           stream: true,
-          stream_options: { include_usage: true },
+          stream_options: { ...params.stream_options, include_usage: true },
         }),
     );
 
@@ -437,6 +523,9 @@ export class CompletionsInterface {
       params.messages,
       meteredElsewhere ? skipTracking : trackUsageAsync,
       metadata,
+      callerRequestedUsage,
+      startTime,
+      enforcementScope,
     );
   }
 }
@@ -471,6 +560,8 @@ export class EmbeddingsInterface {
     params: OpenAI.EmbeddingCreateParams,
     metadata?: UsageMetadata,
   ): Promise<OpenAI.CreateEmbeddingResponse> {
+    const enforcementScope = enforcementScopeFor(this.providerInfo, params.model, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const requestId = randomUUID();
 
@@ -491,6 +582,7 @@ export class EmbeddingsInterface {
       usageMetadata: metadata,
       requestStartTime: startTime,
       providerInfo: this.providerInfo,
+      enforcementScope,
     });
 
     return response;
@@ -510,6 +602,12 @@ export class ImagesInterface {
 
   private async meteredGenerate(params: OpenAI.ImageGenerateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
+    const enforcementScope = enforcementScopeFor(
+      this.providerInfo,
+      params.model || DEFAULT_IMAGE_MODEL,
+      metadata,
+    );
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const response = await this.originalImages.generate(cleanParams);
 
@@ -522,6 +620,7 @@ export class ImagesInterface {
         this.config,
         this.providerInfo,
         metadata,
+        enforcementScope,
         trackImageUsageAsync,
       );
     }
@@ -535,6 +634,8 @@ export class ImagesInterface {
       this.config,
       this.providerInfo,
       metadata,
+      undefined,
+      enforcementScope,
     );
     return response;
   }
@@ -545,6 +646,12 @@ export class ImagesInterface {
 
   private async meteredEdit(params: OpenAI.ImageEditParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
+    const enforcementScope = enforcementScopeFor(
+      this.providerInfo,
+      params.model || DEFAULT_IMAGE_MODEL,
+      metadata,
+    );
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const response = await this.originalImages.edit(cleanParams);
 
@@ -557,6 +664,7 @@ export class ImagesInterface {
         this.config,
         this.providerInfo,
         metadata,
+        enforcementScope,
         trackImageUsageAsync,
       );
     }
@@ -570,6 +678,8 @@ export class ImagesInterface {
       this.config,
       this.providerInfo,
       metadata,
+      undefined,
+      enforcementScope,
     );
     return response;
   }
@@ -580,6 +690,12 @@ export class ImagesInterface {
 
   private async meteredCreateVariation(params: OpenAI.ImageCreateVariationParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
+    const enforcementScope = enforcementScopeFor(
+      this.providerInfo,
+      params.model || DEFAULT_IMAGE_MODEL,
+      metadata,
+    );
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const response = await this.originalImages.createVariation(cleanParams);
     const duration = Date.now() - startTime;
@@ -592,6 +708,8 @@ export class ImagesInterface {
       this.config,
       this.providerInfo,
       metadata,
+      undefined,
+      enforcementScope,
     );
     return response;
   }
@@ -610,6 +728,8 @@ export class AudioTranscriptionsInterface {
 
   private async meteredCreate(params: OpenAI.Audio.TranscriptionCreateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
+    const enforcementScope = enforcementScopeFor(this.providerInfo, params.model, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const response = await this.originalTranscriptions.create(
       cleanParams as OpenAI.Audio.TranscriptionCreateParamsNonStreaming,
@@ -624,6 +744,7 @@ export class AudioTranscriptionsInterface {
       this.config,
       this.providerInfo,
       metadata,
+      enforcementScope,
     );
     return response;
   }
@@ -642,6 +763,8 @@ export class AudioTranslationsInterface {
 
   private async meteredCreate(params: OpenAI.Audio.TranslationCreateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
+    const enforcementScope = enforcementScopeFor(this.providerInfo, params.model, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const response = await this.originalTranslations.create(cleanParams);
     const duration = Date.now() - startTime;
@@ -654,6 +777,7 @@ export class AudioTranslationsInterface {
       this.config,
       this.providerInfo,
       metadata,
+      enforcementScope,
     );
     return response;
   }
@@ -672,6 +796,8 @@ export class AudioSpeechInterface {
 
   private async meteredCreate(params: OpenAI.Audio.SpeechCreateParams): Promise<any> {
     const { usageMetadata: metadata, ...cleanParams } = params as WithUsageMetadata<typeof params>;
+    const enforcementScope = enforcementScopeFor(this.providerInfo, params.model, metadata);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const response = await this.originalSpeech.create(cleanParams);
     const duration = Date.now() - startTime;
@@ -684,25 +810,20 @@ export class AudioSpeechInterface {
       this.config,
       this.providerInfo,
       metadata,
+      enforcementScope,
     );
     return response;
   }
 }
 
 export class ResponsesInterface {
-  private readonly ledger = new MeteredResponseLedger();
+  private readonly ledger = new MeteredRequestLedger<PendingResponseContext>();
 
   constructor(
     private client: OpenAI,
     private config: Config,
     private providerInfo: ProviderInfo,
   ) {}
-
-  private inputMessages(params: Record<string, unknown>): unknown[] {
-    return Array.isArray(params.input)
-      ? params.input
-      : [{ role: "user" as const, content: params.input }];
-  }
 
   create(
     params: Record<string, unknown> & { stream: true },
@@ -723,17 +844,32 @@ export class ResponsesInterface {
     return runWithCallConfig(this.config, () => this.meteredCreate(params, metadata));
   }
 
+  async parse<
+    Params extends ResponseCreateParamsWithTools,
+    ParsedT = ExtractParsedResponseContent<Params>,
+  >(params: Params, metadata?: UsageMetadata): Promise<ParsedResponse<ParsedT>> {
+    const response = await this.create(params as Record<string, unknown>, metadata);
+    return parseResponse<Params, ParsedT>(response as unknown as OpenAIResponse, params);
+  }
+
   private async meteredCreate(
     params: Record<string, unknown>,
     metadata?: UsageMetadata,
   ): Promise<ResponsesAPIResult | ResponsesStream> {
-    const startTime = Date.now();
-    const requestId = randomUUID();
-    const isStreamed = Boolean(params.stream);
     const responsesAPI = (this.client as unknown as OpenAIClientWithResponses).responses;
     if (!responsesAPI?.create) {
       throw new Error("Responses API not available in this OpenAI SDK version");
     }
+    const enforcementScope = enforcementScopeFor(
+      this.providerInfo,
+      params.model as string,
+      metadata,
+    );
+    await enforceCostControls(enforcementScope);
+
+    const startTime = Date.now();
+    const requestId = randomUUID();
+    const isStreamed = Boolean(params.stream);
 
     try {
       const result = await responsesAPI.create(params);
@@ -744,6 +880,7 @@ export class ResponsesInterface {
           params,
           startTime,
           requestId,
+          enforcementScope,
           metadata,
         );
       }
@@ -751,7 +888,7 @@ export class ResponsesInterface {
       const response = result as ResponsesAPIResult;
 
       if (!isTerminalResponseStatus(response.status)) {
-        this.deferToCollection(response, params, metadata);
+        this.deferToCollection(response, params, enforcementScope, metadata);
         return response;
       }
 
@@ -761,12 +898,24 @@ export class ResponsesInterface {
         model: response.model || (params.model as string),
         duration: Date.now() - startTime,
         metadata,
-        messages: this.inputMessages(params),
+        messages: toInputMessages(params.input),
+        enforcementScope,
       });
 
       return response;
     } catch (error) {
-      this.trackFailure(params, requestId, startTime, isStreamed, metadata);
+      if (!isCostLimitRefusal(error)) {
+        trackFailedCall({
+          requestId,
+          model: params.model as string,
+          startTime,
+          usageMetadata: metadata,
+          isStreamed,
+          providerInfo: this.providerInfo,
+          messages: toInputMessages(params.input),
+          enforcementScope,
+        });
+      }
       throw error;
     }
   }
@@ -803,6 +952,7 @@ export class ResponsesInterface {
         response.output_text && shouldCapturePrompts(collectionMetadata)
           ? sanitizeCredentials(response.output_text)
           : undefined,
+      enforcementScope: pending?.enforcementScope,
     });
 
     return response;
@@ -811,12 +961,14 @@ export class ResponsesInterface {
   private deferToCollection(
     response: ResponsesAPIResult,
     params: Record<string, unknown>,
+    enforcementScope: EnforcementCriteria,
     metadata?: UsageMetadata,
   ): void {
     if (response.id) {
       this.ledger.rememberContext(response.id, {
         metadata: { ...resolveAgenticJobFields(metadata), ...metadata },
-        messages: shouldCapturePrompts(metadata) ? this.inputMessages(params) : undefined,
+        messages: shouldCapturePrompts(metadata) ? toInputMessages(params.input) : undefined,
+        enforcementScope,
       });
     }
 
@@ -836,6 +988,7 @@ export class ResponsesInterface {
     metadata?: UsageMetadata;
     messages: unknown[];
     responseContent?: string;
+    enforcementScope?: EnforcementCriteria;
   }): void {
     const { response, responseId } = metering;
     if (!this.ledger.claim(responseId)) return;
@@ -857,28 +1010,7 @@ export class ResponsesInterface {
       messages: metering.messages,
       responseContent: metering.responseContent,
       onDeliveryFailure: () => this.ledger.release(responseId),
-    });
-  }
-
-  private trackFailure(
-    params: Record<string, unknown>,
-    requestId: string,
-    startTime: number,
-    isStreamed: boolean,
-    metadata?: UsageMetadata,
-  ): void {
-    trackUsageAsync({
-      requestId,
-      model: params.model as string,
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      duration: Date.now() - startTime,
-      finishReason: "error",
-      usageMetadata: metadata,
-      isStreamed,
-      providerInfo: this.providerInfo,
-      messages: this.inputMessages(params),
+      enforcementScope: metering.enforcementScope,
     });
   }
 
@@ -894,12 +1026,20 @@ export class ResponsesInterface {
     params: Record<string, unknown>,
     startTime: number,
     requestId: string,
+    enforcementScope: EnforcementCriteria,
     metadata?: UsageMetadata,
   ): ResponsesStream {
     const providerStream = stream as { iterator?: () => AsyncIterator<unknown> };
 
     if (typeof providerStream.iterator !== "function") {
-      return this.meterResponseStream(stream, params, startTime, requestId, metadata);
+      return this.meterResponseStream(
+        stream,
+        params,
+        startTime,
+        requestId,
+        enforcementScope,
+        metadata,
+      );
     }
 
     const originalIterator = providerStream.iterator.bind(providerStream);
@@ -912,6 +1052,7 @@ export class ResponsesInterface {
         params,
         startTime,
         requestId,
+        enforcementScope,
         metadata,
       );
     };
@@ -924,6 +1065,7 @@ export class ResponsesInterface {
     params: Record<string, unknown>,
     startTime: number,
     requestId: string,
+    enforcementScope: EnforcementCriteria,
     metadata?: UsageMetadata,
   ): AsyncGenerator<unknown> {
     let fullContent = "";
@@ -948,9 +1090,10 @@ export class ResponsesInterface {
           usageMetadata: responseId ? withResponseIdempotencyKey(responseId, metadata) : metadata,
           isStreamed: true,
           providerInfo: this.providerInfo,
-          messages: this.inputMessages(params),
+          messages: toInputMessages(params.input),
           responseContent: fullContent ? sanitizeCredentials(fullContent) : undefined,
           onDeliveryFailure: responseId ? () => this.ledger.release(responseId) : undefined,
+          enforcementScope,
         });
       });
 

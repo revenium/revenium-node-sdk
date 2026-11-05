@@ -45,37 +45,37 @@ export function loadEnvFiles(): void {
 
 export type EnvReveniumConfig = ReveniumConfig & { reveniumBaseUrl: string };
 
-export function loadConfigFromEnv(): EnvReveniumConfig | null {
+type ReveniumEnvironment = Partial<EnvReveniumConfig> & Pick<EnvReveniumConfig, "reveniumBaseUrl">;
+
+export function readReveniumEnvironment(): ReveniumEnvironment {
   loadEnvFiles();
 
-  const reveniumApiKey =
-    process.env[ENV_VARS.REVENIUM_API_KEY] || process.env[ENV_VARS.REVENIUM_API_KEY_ALT];
-
-  const reveniumBaseUrl =
-    process.env[ENV_VARS.REVENIUM_BASE_URL] ||
-    process.env[ENV_VARS.REVENIUM_BASE_URL_ALT] ||
-    DEFAULT_REVENIUM_BASE_URL;
-
-  const printSummary = parsePrintSummaryValue(process.env[ENV_VARS.PRINT_SUMMARY]);
-  const reveniumTeamId = process.env[ENV_VARS.TEAM_ID];
-  const reveniumEnforcementBaseUrl = process.env[ENV_VARS.ENFORCEMENT_BASE_URL];
-  const capturePromptsEnv = process.env[ENV_VARS.CAPTURE_PROMPTS];
-
-  if (!reveniumApiKey) return null;
-
-  const config: EnvReveniumConfig = {
-    reveniumApiKey,
-    reveniumBaseUrl,
-    printSummary,
-    reveniumTeamId,
-    reveniumEnforcementBaseUrl,
+  const environment: ReveniumEnvironment = {
+    reveniumApiKey:
+      process.env[ENV_VARS.REVENIUM_API_KEY] || process.env[ENV_VARS.REVENIUM_API_KEY_ALT],
+    reveniumBaseUrl:
+      process.env[ENV_VARS.REVENIUM_BASE_URL] ||
+      process.env[ENV_VARS.REVENIUM_BASE_URL_ALT] ||
+      DEFAULT_REVENIUM_BASE_URL,
+    printSummary: parsePrintSummaryValue(process.env[ENV_VARS.PRINT_SUMMARY]),
+    reveniumTeamId: process.env[ENV_VARS.TEAM_ID],
+    reveniumEnforcementBaseUrl: process.env[ENV_VARS.ENFORCEMENT_BASE_URL],
   };
 
+  const capturePromptsEnv = process.env[ENV_VARS.CAPTURE_PROMPTS];
   if (capturePromptsEnv !== undefined) {
-    config.capturePrompts = capturePromptsEnv.toLowerCase() === "true";
+    environment.capturePrompts = capturePromptsEnv.toLowerCase() === "true";
   }
 
-  return config;
+  return environment;
+}
+
+export function loadConfigFromEnv(): EnvReveniumConfig | null {
+  const environment = readReveniumEnvironment();
+  const { reveniumApiKey } = environment;
+  if (!reveniumApiKey) return null;
+
+  return { ...environment, reveniumApiKey };
 }
 
 export function resetEnvFilesLoaded(): void {

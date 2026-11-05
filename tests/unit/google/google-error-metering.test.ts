@@ -1,4 +1,11 @@
 import type { Logger } from "../../../src/_core/types/index";
+import {
+  createGeminiReply,
+  createJsonResponse,
+  createSseResponse,
+  drain,
+  stubGoogleAuth,
+} from "../../helpers/fixtures";
 
 const originalFetch = global.fetch;
 
@@ -48,41 +55,17 @@ const VERTEX_ENV = {
   GOOGLE_APPLICATION_CREDENTIALS: "/tmp/credentials.json",
 };
 
-const CHAT_RESPONSE = {
-  text: "hi",
-  modelVersion: "gemini-2.0-flash-001",
-  responseId: "response-1",
-  candidates: [{ finishReason: "STOP" }],
-  usageMetadata: {
-    promptTokenCount: PROMPT_TOKENS,
-    candidatesTokenCount: CANDIDATE_TOKENS,
-    totalTokenCount: TOTAL_TOKENS,
-  },
-};
+const CHAT_RESPONSE = createGeminiReply({
+  promptTokenCount: PROMPT_TOKENS,
+  candidatesTokenCount: CANDIDATE_TOKENS,
+  totalTokenCount: TOTAL_TOKENS,
+});
 
-const mockSendMessage = jest.fn();
-const mockGenerateContentStream = jest.fn();
-const mockEmbedContent = jest.fn();
-const mockCountTokens = jest.fn();
+stubGoogleAuth();
 
-jest.mock("@google/genai", () => ({
-  GoogleGenAI: jest.fn().mockImplementation(() => ({
-    chats: {
-      create: () => ({ sendMessage: mockSendMessage, getHistory: () => [] }),
-    },
-    models: {
-      generateContentStream: mockGenerateContentStream,
-      embedContent: mockEmbedContent,
-      countTokens: mockCountTokens,
-    },
-  })),
-}));
-
-jest.mock("google-auth-library", () => ({
-  GoogleAuth: jest.fn().mockImplementation(() => ({
-    getClient: () => Promise.resolve({ getAccessToken: () => ({ token: "access-token" }) }),
-  })),
-}));
+let generateReply: () => Response;
+let streamReply: () => Response;
+let embedReply: () => Response;
 
 let envSnapshot: NodeJS.ProcessEnv;
 let setLogger: typeof import("../../../src/_core/config/manager").setLogger;
@@ -109,11 +92,44 @@ function failedResponse(status: number, body: string): Response {
   } as unknown as Response;
 }
 
+function googleError(status: number, message: string): Response {
+  return createJsonResponse({ error: { code: status, message, status: "FAILED" } }, status);
+}
+
+function geminiReply(url: string): Response | undefined {
+  if (url.includes(":streamGenerateContent")) return streamReply();
+  if (url.includes(":generateContent")) return generateReply();
+  if (url.includes(":countTokens")) return createJsonResponse({ totalTokens: PROMPT_TOKENS });
+  if (url.includes(":batchEmbedContents") || url.includes("text-embedding-004:predict")) {
+    return embedReply();
+  }
+  return undefined;
+}
+
+function interruptedStreamResponse(chunk: unknown, error: unknown): Response {
+  const encoder = new TextEncoder();
+  const networkChunks = [`data: ${JSON.stringify(chunk)}\n\n`, JSON.stringify({ error })];
+  return new Response(
+    new ReadableStream({
+      pull(controller) {
+        const next = networkChunks.shift();
+        if (next === undefined) controller.close();
+        else controller.enqueue(encoder.encode(next));
+      },
+    }),
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+
 function createFetchMock(googleResponses: (url: string) => Response | undefined): jest.Mock {
   return jest.fn((url: string) => {
-    const googleResponse = googleResponses(url);
+    const googleResponse = geminiReply(url) ?? googleResponses(url);
     return Promise.resolve(googleResponse ?? jsonResponse({}));
   });
+}
+
+function providerCalls(fetchMock: jest.Mock, endpoint: string): unknown[][] {
+  return fetchMock.mock.calls.filter(([called]) => String(called).includes(endpoint));
 }
 
 function successfulGoogleFetch(): jest.Mock {
@@ -188,31 +204,11 @@ function expectZeroTokens(payload: Record<string, unknown>): void {
   expect(payload.totalTokenCount).toBe(0);
 }
 
-async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
-  for await (const chunk of iterable) {
-    void chunk;
-  }
-}
-
-function streamOf(chunks: unknown[], failWith?: Error): AsyncIterable<unknown> {
-  return {
-    [Symbol.asyncIterator]: async function* () {
-      for (const chunk of chunks) yield chunk;
-      if (failWith) throw failWith;
-    },
-  };
-}
-
 beforeEach(async () => {
   jest.resetModules();
-  mockSendMessage.mockReset();
-  mockSendMessage.mockResolvedValue(CHAT_RESPONSE);
-  mockGenerateContentStream.mockReset();
-  mockGenerateContentStream.mockResolvedValue(streamOf([CHAT_RESPONSE]));
-  mockEmbedContent.mockReset();
-  mockEmbedContent.mockResolvedValue({ embeddings: [{ values: [0.1, 0.2] }] });
-  mockCountTokens.mockReset();
-  mockCountTokens.mockResolvedValue({ totalTokens: PROMPT_TOKENS });
+  generateReply = () => createJsonResponse(CHAT_RESPONSE);
+  streamReply = () => createSseResponse([CHAT_RESPONSE]);
+  embedReply = () => createJsonResponse({ embeddings: [{ values: [0.1, 0.2] }] });
 
   envSnapshot = { ...process.env };
   for (const key of [...REVENIUM_ENV_KEYS, ...GOOGLE_ENV_KEYS]) delete process.env[key];
@@ -401,7 +397,7 @@ describe("Google failure metering", () => {
 
   it("records a failed Vertex stream open as an error", async () => {
     Object.assign(process.env, VERTEX_ENV);
-    mockGenerateContentStream.mockRejectedValue(new Error("vertex model overloaded"));
+    streamReply = () => googleError(503, "vertex model overloaded");
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -427,7 +423,7 @@ describe("Google failure metering", () => {
     global.fetch = meteringFetch;
 
     const { GoogleAuth } = await import("google-auth-library");
-    (GoogleAuth as unknown as jest.Mock).mockImplementationOnce(() => ({
+    (GoogleAuth as unknown as jest.Mock).mockImplementation(() => ({
       getClient: () => Promise.reject(new Error("service account key expired")),
     }));
 
@@ -449,7 +445,7 @@ describe("Google failure metering", () => {
 
   it("records a Vertex chat rejected by Google as an error with zero tokens", async () => {
     Object.assign(process.env, VERTEX_ENV);
-    mockSendMessage.mockRejectedValue(new Error("got status: 404 Not Found"));
+    generateReply = () => googleError(404, "Not Found");
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -470,7 +466,7 @@ describe("Google failure metering", () => {
 
   it("caps the error reason at the length the metering API accepts", async () => {
     Object.assign(process.env, VERTEX_ENV);
-    mockSendMessage.mockRejectedValue(new Error("x".repeat(2000)));
+    generateReply = () => googleError(400, "x".repeat(2000));
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -512,7 +508,7 @@ describe("Google failure metering", () => {
 
   it("records a failed Vertex embedding as an error without counting tokens", async () => {
     Object.assign(process.env, VERTEX_ENV);
-    mockEmbedContent.mockRejectedValue(new Error("embedding backend unavailable"));
+    embedReply = () => googleError(503, "embedding backend unavailable");
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -528,7 +524,7 @@ describe("Google failure metering", () => {
     expect(payload.stopReason).toBe("ERROR");
     expect(payload.errorReason).toContain("embedding backend unavailable");
     expectZeroTokens(payload);
-    expect(mockCountTokens).not.toHaveBeenCalled();
+    expect(providerCalls(meteringFetch, ":countTokens")).toHaveLength(0);
   });
 
   it.each([
@@ -564,7 +560,7 @@ describe("Google failure metering", () => {
 
   it("records a failed Gemini chat as an error", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockSendMessage.mockRejectedValue(new Error("API key not valid"));
+    generateReply = () => googleError(400, "API key not valid");
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -584,7 +580,7 @@ describe("Google failure metering", () => {
 
   it("records a failed Gemini stream open as an error", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockGenerateContentStream.mockRejectedValue(new Error("model overloaded"));
+    streamReply = () => googleError(503, "model overloaded");
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -604,7 +600,7 @@ describe("Google failure metering", () => {
 
   it("records a failed Gemini embedding as an error", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockEmbedContent.mockRejectedValue(new Error("embedding rejected"));
+    embedReply = () => googleError(400, "embedding rejected");
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -624,9 +620,12 @@ describe("Google failure metering", () => {
 
   it("records a mid-stream Google failure once as an error", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockGenerateContentStream.mockResolvedValue(
-      streamOf([CHAT_RESPONSE], new Error("stream aborted by the model")),
-    );
+    streamReply = () =>
+      interruptedStreamResponse(CHAT_RESPONSE, {
+        code: 500,
+        status: "INTERNAL",
+        message: "stream aborted by the model",
+      });
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -650,7 +649,7 @@ describe("Google failure metering", () => {
 
   it("keeps an abandoned Google stream out of the error state", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockGenerateContentStream.mockResolvedValue(streamOf([CHAT_RESPONSE, CHAT_RESPONSE]));
+    streamReply = () => createSseResponse([CHAT_RESPONSE, CHAT_RESPONSE]);
 
     const meteringFetch = successfulGoogleFetch();
     global.fetch = meteringFetch;
@@ -675,7 +674,7 @@ describe("Google failure metering", () => {
 
   it("rethrows the Google error when metering transport fails on the error path", async () => {
     Object.assign(process.env, VERTEX_ENV);
-    mockSendMessage.mockRejectedValue(new Error("got status: 404 Not Found"));
+    generateReply = () => googleError(404, "Not Found");
 
     const meteringFetch = createFetchMock((url) =>
       url.includes("api.revenium.ai") ? failedResponse(500, "metering down") : undefined,
@@ -728,6 +727,34 @@ describe("Google failure metering", () => {
       VIDEO_SECONDS,
     );
     expect(videoPayload.errorReason).toBeUndefined();
+  }, 20000);
+
+  it("bills Vertex image and video records in the Vertex location with the environment ticket, not the server region", async () => {
+    Object.assign(process.env, VERTEX_ENV, {
+      GOOGLE_CLOUD_LOCATION: "europe-west4",
+      REVENIUM_REGION: "us-east-1",
+      REVENIUM_TICKET_ID: "ENG-123",
+    });
+
+    const meteringFetch = successfulGoogleFetch();
+    global.fetch = meteringFetch;
+
+    const { VertexAIController } = await import("../../../src/google/vertex/index");
+    const controller = new VertexAIController();
+
+    await controller.generateImage({ model: "imagen-3.0-generate-002", prompt: "a cat" });
+    await controller.generateVideo({
+      model: "veo-2.0-generate-001",
+      prompt: "a cat",
+      duration: VIDEO_SECONDS,
+    });
+    await waitForMeteringCalls(meteringFetch, 1, IMAGES_URL);
+    await waitForMeteringCalls(meteringFetch, 1, VIDEO_URL);
+
+    const expected = { region: "europe-west4", ticketId: "ENG-123" };
+
+    expect(readMeteringRequest(meteringFetch, IMAGES_URL)).toMatchObject(expected);
+    expect(readMeteringRequest(meteringFetch, VIDEO_URL)).toMatchObject(expected);
   }, 20000);
 
   it("sends the Vertex Imagen resolution and quality at the top level of the record", async () => {
@@ -790,4 +817,52 @@ describe("Google failure metering", () => {
     const payload = readMeteringRequest(meteringFetch, VIDEO_URL);
     expect(payload.resolution).toBe("1080p");
   }, 20000);
+});
+
+describe("Google cost limit directive", () => {
+  const blockReply = {
+    enforcement: { action: "BLOCK", ruleName: "stub-cap", message: "Daily cap reached" },
+  };
+  const metadata = { subscriberId: "sub-1" };
+
+  it("refuses the next Gemini chat for the scope the record was metered under", async () => {
+    Object.assign(process.env, GENAI_ENV);
+    const meteringFetch = createFetchMock((url) =>
+      url === COMPLETIONS_URL ? jsonResponse(blockReply) : undefined,
+    );
+    global.fetch = meteringFetch;
+
+    const { GoogleGenAIController } = await import("../../../src/google/genai/index");
+    const controller = new GoogleGenAIController();
+
+    await controller.createChat(["hi"], "gemini-2.0-flash-001", metadata);
+    await waitForMeteringCalls(meteringFetch, 1, COMPLETIONS_URL);
+
+    await expect(controller.createChat(["hi"], "gemini-2.0-flash-001", metadata)).rejects.toThrow(
+      "Daily cap reached",
+    );
+    await expect(
+      controller.createChat(["hi"], "gemini-2.0-flash-001", { subscriberId: "sub-2" }),
+    ).resolves.toBeDefined();
+    expect(providerCalls(meteringFetch, ":generateContent")).toHaveLength(2);
+  });
+
+  it("refuses the next Vertex image generation for the scope the record was metered under", async () => {
+    Object.assign(process.env, VERTEX_ENV);
+    const providerFetch = successfulGoogleFetch();
+    const meteringFetch = jest.fn((url: string, init?: RequestInit) =>
+      url === IMAGES_URL ? Promise.resolve(jsonResponse(blockReply)) : providerFetch(url, init),
+    );
+    global.fetch = meteringFetch as unknown as typeof fetch;
+
+    const { VertexAIController } = await import("../../../src/google/vertex/index");
+    const controller = new VertexAIController();
+    const request = { model: "imagen-3.0-generate-002", prompt: "a cat" };
+
+    await controller.generateImage(request, metadata);
+    await waitForMeteringCalls(meteringFetch, 1, IMAGES_URL);
+
+    await expect(controller.generateImage(request, metadata)).rejects.toThrow("Daily cap reached");
+    expect(meteringFetch.mock.calls.filter(([url]) => url.includes(":predict"))).toHaveLength(1);
+  });
 });

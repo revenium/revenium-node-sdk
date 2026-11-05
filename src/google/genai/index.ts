@@ -1,6 +1,11 @@
+import "../genai-augmentation.js";
+
+import { patchGoogleGenAI } from "../models-patch.js";
+
 export { GoogleGenAIController } from "./controller.js";
 export { GoogleGenAIService } from "./service.js";
 export { initialize, configure, isInitialized } from "../config.js";
+export { patchGoogleGenAI, isGoogleGenAIPatched } from "../models-patch.js";
 
 export type {
   GoogleUsageMetadata,
@@ -47,3 +52,5 @@ export {
 
 export { flushMeteringBuffer, getBufferStats } from "../../_core/metering/buffer.js";
 export type { BufferStats } from "../../_core/metering/buffer.js";
+
+patchGoogleGenAI();

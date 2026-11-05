@@ -208,6 +208,7 @@ export class StreamingResponseParser {
       responseFormat: this.responseFormat,
       request: this.requestBody,
       response: reconstructedResponse,
+      enforcementScope: this.requestContext.enforcementScope,
     });
   }
 }

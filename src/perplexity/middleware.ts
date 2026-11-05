@@ -14,6 +14,12 @@ import {
 } from "../_core/prompt/extraction.js";
 import { runProviderCall } from "../_core/metering/metering-context.js";
 import { resolveConfig, runWithCallConfig } from "../_core/config/call-config.js";
+import { isCostLimitRefusal } from "../_core/resilience/error-handler.js";
+import {
+  buildEnforcementCriteria,
+  enforceCostControls,
+  type EnforcementCriteria,
+} from "../_core/enforcement/evaluator.js";
 import type { PerplexityCost } from "./types.js";
 
 interface PerplexityCompletionResponse {
@@ -32,6 +38,7 @@ interface PerplexityCompletionResponse {
 }
 
 const MIDDLEWARE_SOURCE = "revenium-perplexity-node";
+const PROVIDER = "Perplexity";
 
 export type TrackUsageFn = typeof trackUsageAsync;
 
@@ -52,6 +59,7 @@ export function trackUsageAsync(trackingData: {
   responseFormat?: { type: string; json_schema?: { name: string } } | string;
   messages?: any;
   responseContent?: string;
+  enforcementScope?: EnforcementCriteria;
 }): void {
   const logger = getLogger();
 
@@ -97,7 +105,7 @@ export function trackUsageAsync(trackingData: {
     requestId: trackingData.requestId,
     startTime,
     duration: trackingData.duration,
-    provider: "Perplexity",
+    provider: PROVIDER,
     modelSource: "PERPLEXITY",
     middlewareSource: MIDDLEWARE_SOURCE,
     usageMetadata: trackingData.usageMetadata,
@@ -116,7 +124,7 @@ export function trackUsageAsync(trackingData: {
     .then(async (payload) => {
       Object.assign(payload, costFields);
       try {
-        await sendToRevenium(payload);
+        await sendToRevenium(payload, trackingData.enforcementScope);
       } finally {
         printUsageSummary(payload);
       }
@@ -141,6 +149,7 @@ export class StreamingWrapper implements AsyncIterable<any> {
   private callConfig: Config | null;
   private capturePrompts: boolean;
   private maxPromptSize: number;
+  private enforcementScope?: EnforcementCriteria;
 
   constructor(
     stream: AsyncIterable<any>,
@@ -152,6 +161,7 @@ export class StreamingWrapper implements AsyncIterable<any> {
     messages?: any,
     trackFn: TrackUsageFn = trackUsageAsync,
     callConfig: Config | null = resolveConfig(),
+    enforcementScope?: EnforcementCriteria,
   ) {
     this.stream = stream;
     this.model = model;
@@ -162,12 +172,15 @@ export class StreamingWrapper implements AsyncIterable<any> {
     this.messages = messages || [];
     this.trackFn = trackFn;
     this.callConfig = callConfig;
+    this.enforcementScope = enforcementScope;
     this.capturePrompts = runWithCallConfig(callConfig, () => shouldCapturePrompts(metadata));
     this.maxPromptSize = runWithCallConfig(callConfig, getMaxPromptSize);
   }
 
   private track(trackingData: Parameters<TrackUsageFn>[0]): void {
-    runWithCallConfig(this.callConfig, () => this.trackFn(trackingData));
+    runWithCallConfig(this.callConfig, () =>
+      this.trackFn({ ...trackingData, enforcementScope: this.enforcementScope }),
+    );
   }
 
   async *[Symbol.asyncIterator](): AsyncGenerator<any> {
@@ -296,6 +309,8 @@ export class CompletionsInterface {
     params: OpenAI.Chat.ChatCompletionCreateParams,
     metadata?: UsageMetadata,
   ): Promise<any> {
+    const enforcementScope = buildEnforcementCriteria(metadata, params.model, PROVIDER);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const transactionId = randomUUID();
 
@@ -332,12 +347,13 @@ export class CompletionsInterface {
             responseContent && shouldCapturePrompts(metadata)
               ? sanitizeCredentials(responseContent)
               : undefined,
+          enforcementScope,
         });
       }
 
       return response;
     } catch (error: any) {
-      const duration = Date.now() - startTime;
+      if (isCostLimitRefusal(error)) throw error;
 
       trackUsageAsync({
         requestId: transactionId,
@@ -345,11 +361,12 @@ export class CompletionsInterface {
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
-        duration,
+        duration: Date.now() - startTime,
         finishReason: "error",
         usageMetadata: metadata,
         isStreamed: false,
         messages: params.messages,
+        enforcementScope,
       });
 
       throw error;
@@ -367,6 +384,8 @@ export class CompletionsInterface {
     params: OpenAI.Chat.ChatCompletionCreateParams,
     metadata?: UsageMetadata,
   ): Promise<StreamingWrapper> {
+    const enforcementScope = buildEnforcementCriteria(metadata, params.model, PROVIDER);
+    await enforceCostControls(enforcementScope);
     const startTime = Date.now();
     const transactionId = randomUUID();
 
@@ -391,9 +410,10 @@ export class CompletionsInterface {
         params.messages,
         meteredElsewhere ? skipTracking : trackUsageAsync,
         this.config,
+        enforcementScope,
       );
     } catch (error: any) {
-      const duration = Date.now() - startTime;
+      if (isCostLimitRefusal(error)) throw error;
 
       trackUsageAsync({
         requestId: transactionId,
@@ -401,11 +421,12 @@ export class CompletionsInterface {
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
-        duration,
+        duration: Date.now() - startTime,
         finishReason: "error",
         usageMetadata: metadata,
         isStreamed: true,
         messages: params.messages,
+        enforcementScope,
       });
 
       throw error;

@@ -1,7 +1,6 @@
-import { createReveniumConfig } from "../../helpers/fixtures";
+import { createReveniumConfig, REVENIUM_BASE_URL } from "../../helpers/fixtures";
 
 const BASE_URL = "https://api.anthropic.com";
-const REVENIUM_BASE_URL = "https://api.revenium.ai";
 const MODEL = "claude-3-5-sonnet-20241022";
 
 const MESSAGE_RESPONSE = {

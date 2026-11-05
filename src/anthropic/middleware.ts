@@ -1,4 +1,4 @@
-import { UsageMetadata, ReveniumPayload } from "../_core/types/index.js";
+import { UsageMetadata, ReveniumPayload, PricingTier } from "../_core/types/index.js";
 import { getLogger } from "../_core/config/manager.js";
 import { resolveConfig } from "../_core/config/call-config.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
@@ -15,6 +15,7 @@ import {
   truncateString,
 } from "../_core/prompt/extraction.js";
 import { DEFAULT_CONFIG } from "../_core/constants.js";
+import type { EnforcementCriteria } from "../_core/enforcement/evaluator.js";
 import { AnthropicProvider, DIRECT_ANTHROPIC_PROVIDER } from "./provider-detection.js";
 
 const MIDDLEWARE_SOURCE = "revenium-anthropic-node";
@@ -36,10 +37,12 @@ export interface AnthropicTrackingData {
   requestTime: Date;
   responseTime: Date;
   timeToFirstToken?: number;
+  pricingTier?: PricingTier;
   hasVisionContent?: boolean;
   requestBody?: any;
   response?: any;
   provider?: AnthropicProvider;
+  enforcementScope?: EnforcementCriteria;
 }
 
 export function detectVisionContent(params?: any): boolean {
@@ -343,7 +346,7 @@ export function reconstructResponseFromChunks(chunks: any[], model: string): any
   };
 }
 
-export function trackUsageAsync(data: AnthropicTrackingData): void {
+export function trackUsageAsync(data: AnthropicTrackingData): Promise<void> {
   const config = resolveConfig();
   const logger = getLogger();
 
@@ -351,7 +354,7 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
     logger.warn("Revenium configuration not available - skipping tracking", {
       requestId: data.requestId,
     });
-    return;
+    return Promise.resolve();
   }
 
   const promptData =
@@ -361,7 +364,7 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
 
   const failSilent = config.failSilent ?? DEFAULT_CONFIG.FAIL_SILENT;
 
-  void (async () => {
+  return (async () => {
     let payload: ReveniumPayload | undefined;
     try {
       payload = await buildPayload({
@@ -369,6 +372,7 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
         model: data.model,
         requestId: data.requestId,
         startTime: data.requestTime.getTime(),
+        responseTime: data.responseTime.getTime(),
         duration: data.duration,
         provider: data.provider ?? DIRECT_ANTHROPIC_PROVIDER,
         modelSource: "ANTHROPIC",
@@ -394,6 +398,7 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
         stopReason: mapStopReason(data.stopReason, logger),
         isStreamed: data.isStreamed,
         timeToFirstToken: data.timeToFirstToken,
+        pricingTier: data.pricingTier,
         promptData,
         attributes:
           data.hasVisionContent !== undefined
@@ -401,7 +406,7 @@ export function trackUsageAsync(data: AnthropicTrackingData): void {
             : undefined,
       });
 
-      await sendToRevenium(payload!);
+      await sendToRevenium(payload!, data.enforcementScope);
     } catch (error) {
       logger.warn("Anthropic tracking failed", {
         error: error instanceof Error ? error.message : String(error),

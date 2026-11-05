@@ -1,12 +1,18 @@
 import { getConfig, getLogger } from "../config/manager.js";
-import { BUFFER_CONFIG } from "../constants.js";
-import { HttpError, isRetryableStatus } from "../resilience/retry.js";
+import { BUFFER_CONFIG, HTTP_CONFLICT, HTTP_TOO_MANY_REQUESTS } from "../constants.js";
+import { HttpError, isRetryableStatus, parseRetryAfter, withJitter } from "../resilience/retry.js";
+import {
+  CircuitBreakerOpenError,
+  MeteringTimeoutError,
+  getErrorMessage,
+} from "../resilience/error-handler.js";
 
 export interface BufferEntry {
   url: string;
   headers: Record<string, string>;
   body: string;
   createdAt: number;
+  conflictReplays?: number;
 }
 
 export interface BufferStats {
@@ -19,11 +25,36 @@ export interface BufferStats {
   totalExpired: number;
 }
 
+type SendOutcome =
+  | { kind: "sent" }
+  | { kind: "dropped" }
+  | { kind: "retry" }
+  | { kind: "throttled"; retryAfterSeconds: number | undefined };
+
+function retryAfterOf(response: Response): number | undefined {
+  return parseRetryAfter(response.headers.get("Retry-After"));
+}
+
+function conflictOutcome(
+  conflictReplays: number,
+  retryAfterSeconds: number | undefined,
+): SendOutcome {
+  const giveUp =
+    retryAfterSeconds === undefined || conflictReplays > BUFFER_CONFIG.MAX_CONFLICT_REPLAYS;
+  return giveUp ? { kind: "dropped" } : { kind: "throttled", retryAfterSeconds };
+}
+
+function throttledResumeDelayMs(retryAfterSeconds: number | undefined): number {
+  const seconds = Math.max(retryAfterSeconds ?? 0, BUFFER_CONFIG.MIN_RETRY_AFTER_SECONDS);
+  return withJitter(Math.min(seconds * 1000, BUFFER_CONFIG.MAX_AGE_MS));
+}
+
 class MeteringBuffer {
   private buffer: BufferEntry[] = [];
   private maxSize: number;
   private flushIntervalMs: number;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private resumeTimer: ReturnType<typeof setTimeout> | null = null;
   private isFlushing = false;
   private totalBuffered = 0;
   private totalFlushed = 0;
@@ -85,10 +116,14 @@ class MeteringBuffer {
         }
 
         const result = await this.sendOne(entry);
-        if (result === "retry") break;
+        if (result.kind === "throttled") {
+          this.scheduleResume(throttledResumeDelayMs(result.retryAfterSeconds));
+          break;
+        }
+        if (result.kind === "retry") break;
 
         this.buffer.shift();
-        if (result === "sent") {
+        if (result.kind === "sent") {
           this.totalFlushed++;
         } else {
           this.totalDropped++;
@@ -150,37 +185,64 @@ class MeteringBuffer {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
+    if (this.resumeTimer) {
+      clearTimeout(this.resumeTimer);
+      this.resumeTimer = null;
+    }
     this.removeExitHandlers();
   }
 
-  private async sendOne(entry: BufferEntry): Promise<"sent" | "dropped" | "retry"> {
+  private async sendOne(entry: BufferEntry): Promise<SendOutcome> {
     const logger = getLogger();
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), BUFFER_CONFIG.FLUSH_TIMEOUT_MS);
 
     try {
       const response = await fetch(entry.url, {
         method: "POST",
         headers: entry.headers,
         body: entry.body,
-        signal: controller.signal,
-      }).finally(() => clearTimeout(timeoutId));
+        signal: AbortSignal.timeout(BUFFER_CONFIG.FLUSH_TIMEOUT_MS),
+      });
 
-      if (response.ok) return "sent";
-      if (!isRetryableStatus(response.status)) return "dropped";
-      return "retry";
+      if (response.ok) return { kind: "sent" };
+      if (response.status === HTTP_TOO_MANY_REQUESTS) {
+        return { kind: "throttled", retryAfterSeconds: retryAfterOf(response) };
+      }
+      if (response.status === HTTP_CONFLICT) {
+        entry.conflictReplays = (entry.conflictReplays ?? 0) + 1;
+        return conflictOutcome(entry.conflictReplays, retryAfterOf(response));
+      }
+      if (!isRetryableStatus(response.status)) return { kind: "dropped" };
+      return { kind: "retry" };
     } catch (error) {
       logger.debug("Buffer flush fetch failed", {
         error: error instanceof Error ? error.message : String(error),
       });
-      return "retry";
+      return { kind: "retry" };
     }
+  }
+
+  private scheduleResume(delayMs: number): void {
+    if (this.resumeTimer) clearTimeout(this.resumeTimer);
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = null;
+      this.flushInBackground();
+    }, delayMs);
+    this.resumeTimer.unref();
+  }
+
+  private flushInBackground(): Promise<void> {
+    return this.flush().catch((error) => {
+      getLogger().warn("Background metering buffer flush failed", {
+        error: getErrorMessage(error),
+      });
+    });
   }
 
   private ensureFlushLoop(): void {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(() => {
-      this.flush().catch(() => {});
+      if (this.resumeTimer) return;
+      this.flushInBackground();
     }, this.flushIntervalMs);
     this.flushTimer.unref();
   }
@@ -189,13 +251,11 @@ class MeteringBuffer {
     if (this.exitHandler) return;
 
     this.exitHandler = () => {
-      this.flush().catch(() => {});
+      this.flushInBackground();
     };
 
     this.signalHandler = () => {
-      this.flush()
-        .catch(() => {})
-        .finally(() => process.exit());
+      this.flushInBackground().finally(() => process.exit());
     };
 
     process.on("beforeExit", this.exitHandler);
@@ -245,16 +305,14 @@ export function resetMeteringBuffer(): void {
 }
 
 export function shouldBufferError(error: unknown): boolean {
-  if (error instanceof Error && error.message.includes("Circuit breaker is OPEN")) {
-    return true;
-  }
+  if (error instanceof CircuitBreakerOpenError) return true;
 
   if (error instanceof HttpError) {
     return isRetryableStatus(error.status);
   }
 
   if (error instanceof TypeError) return true;
-  if (error instanceof Error && error.name === "AbortError") return true;
+  if (error instanceof MeteringTimeoutError) return true;
 
   return false;
 }

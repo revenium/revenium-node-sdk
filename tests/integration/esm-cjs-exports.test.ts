@@ -106,6 +106,7 @@ describe("CJS exports", () => {
     expect(mod.ReveniumOpenAI).toBeDefined();
     expect(mod.Initialize).toBeDefined();
     expect(mod.trackUsageAsync).toBeDefined();
+    expect(mod.DecisionsInterface).toBeDefined();
   });
 });
 

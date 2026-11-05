@@ -29,3 +29,15 @@ declare module "@anthropic-ai/sdk/resources/beta/messages/messages" {
     usageMetadata?: UsageMetadata;
   }
 }
+
+declare module "@anthropic-ai/sdk/resources/messages/batches" {
+  interface BatchResultsParams {
+    usageMetadata?: UsageMetadata;
+  }
+}
+
+declare module "@anthropic-ai/sdk/resources/beta/messages/batches" {
+  interface BatchResultsParams {
+    usageMetadata?: UsageMetadata;
+  }
+}

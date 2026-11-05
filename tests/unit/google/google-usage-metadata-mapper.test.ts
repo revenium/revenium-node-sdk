@@ -182,6 +182,16 @@ describe("mapGoogleUsageMetadata", () => {
       skill_plugin_name: "revenium",
       skill_marketplace_name: "revenium-tools",
       skill_invocation_trigger: "user-slash",
+      effort: "high",
+      promptId: "prompt-01",
+      promptLength: 412,
+      querySource: "sdk",
+      speed: "fast",
+      subagentType: "explore",
+      prompt_id: "prompt-01",
+      prompt_length: 412,
+      query_source: "sdk",
+      subagent_type: "explore",
     };
 
     expect(mapGoogleUsageMetadata(sharedFields)).toEqual(sharedFields);

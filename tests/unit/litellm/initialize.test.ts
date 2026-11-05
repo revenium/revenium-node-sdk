@@ -37,7 +37,7 @@ let setLogger: typeof import("../../../src/_core/config/manager").setLogger;
 let isHttpClientPatched: typeof import("../../../src/litellm/http-client").isHttpClientPatched;
 let resetEnvFilesLoaded: typeof import("../../../src/_core/config/loader").resetEnvFilesLoaded;
 
-function createProxyFetch(meteringStatus = 200): jest.Mock {
+function createProxyFetch(meteringStatus = 200, meteringReply: unknown = {}): jest.Mock {
   return jest.fn((input: unknown) => {
     const url = typeof input === "string" ? input : String(input);
     const isProxyCall = url.includes("localhost:4000");
@@ -50,7 +50,7 @@ function createProxyFetch(meteringStatus = 200): jest.Mock {
           ],
           usage: { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14 },
         }
-      : {};
+      : meteringReply;
     const status = isProxyCall ? 200 : meteringStatus;
     return Promise.resolve({
       ok: status < 400,
@@ -323,6 +323,7 @@ describe("LiteLLM initialize", () => {
         reveniumMeteringBaseUrl: "https://api.revenium.ai",
         litellmProxyUrl: "http://localhost:4000",
         maxRetries: 2,
+        bufferMaxSize: 50000,
       }),
     ).toBe(true);
 
@@ -330,6 +331,7 @@ describe("LiteLLM initialize", () => {
     expect(getConfig()).toMatchObject({
       reveniumApiKey: "hak_configured_key",
       maxRetries: 2,
+      bufferMaxSize: 50000,
     });
   });
 
@@ -415,5 +417,30 @@ describe("LiteLLM initialize", () => {
       process.chdir(originalCwd);
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("LiteLLM cost limit directive", () => {
+  const blockReply = {
+    enforcement: { action: "BLOCK", ruleName: "stub-cap", message: "Daily cap reached" },
+  };
+
+  function proxyCalls(proxyFetch: jest.Mock): unknown[][] {
+    return proxyFetch.mock.calls.filter(([url]) => String(url).includes("localhost:4000"));
+  }
+
+  it("rejects the next proxy fetch for the same scope before it leaves the process", async () => {
+    const proxyFetch = createProxyFetch(201, blockReply);
+    global.fetch = proxyFetch;
+    initialize();
+
+    await chatThroughProxy(proxyFetch);
+
+    await expect(chatThroughProxy(proxyFetch)).rejects.toMatchObject({
+      name: "CostLimitExceeded",
+      message: "Daily cap reached",
+      ruleName: "stub-cap",
+    });
+    expect(proxyCalls(proxyFetch)).toHaveLength(1);
   });
 });

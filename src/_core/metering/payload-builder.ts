@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
-import { ReveniumPayload, UsageMetadata } from "../types/index.js";
-import { buildMetadataFields } from "../metadata/metadata-builder.js";
+import { PricingTier, ReveniumPayload, UsageMetadata } from "../types/index.js";
+import { buildMetadataFields, resolvePromptContextFields } from "../metadata/metadata-builder.js";
 import {
   getEnvironment,
   getRegion,
@@ -27,8 +27,25 @@ import {
 } from "./operation-subtype.js";
 import { ERROR_STOP_REASON } from "../stop-reason-mapper.js";
 import { readAudioUsage } from "./audio-usage.js";
+import { DEFAULT_IMAGE_MODEL } from "../constants.js";
 
 const DEFAULT_IMAGE_RESOLUTION = "1024x1024";
+
+function resolveEnvDefaultedFields(metadataFields: Record<string, unknown>) {
+  return {
+    environment: (metadataFields.environment as string) ?? getEnvironment() ?? undefined,
+    credentialAlias:
+      (metadataFields.credentialAlias as string) ?? getCredentialAlias() ?? undefined,
+    traceType: (metadataFields.traceType as string) ?? getTraceType() ?? undefined,
+    traceName: (metadataFields.traceName as string) ?? getTraceName() ?? undefined,
+    ticketId: (metadataFields.ticketId as string) ?? getTicketId() ?? undefined,
+    parentTransactionId:
+      (metadataFields.parentTransactionId as string) ?? getParentTransactionId() ?? undefined,
+    transactionName:
+      (metadataFields.transactionName as string) ?? getTransactionName() ?? undefined,
+    retryNumber: (metadataFields.retryNumber as number) ?? getRetryNumber() ?? undefined,
+  };
+}
 
 export interface PayloadParams {
   operationType: "CHAT" | "EMBED";
@@ -53,6 +70,8 @@ export interface PayloadParams {
   stopReason: string;
   isStreamed: boolean;
   timeToFirstToken?: number;
+  pricingTier?: PricingTier;
+  responseTime?: number;
   request?: any;
   promptData?: {
     systemPrompt?: string;
@@ -64,7 +83,7 @@ export interface PayloadParams {
 }
 
 export async function buildPayload(params: PayloadParams): Promise<ReveniumPayload> {
-  const now = new Date().toISOString();
+  const responseTime = new Date(params.responseTime ?? Date.now()).toISOString();
   const requestTime = new Date(params.startTime).toISOString();
   const metadataFields = buildMetadataFields(params.usageMetadata);
 
@@ -77,9 +96,9 @@ export async function buildPayload(params: PayloadParams): Promise<ReveniumPaylo
     modelSource: params.modelSource,
     middlewareSource: params.middlewareSource,
     requestTime,
-    responseTime: now,
+    responseTime,
     requestDuration: params.duration,
-    completionStartTime: now,
+    completionStartTime: responseTime,
     inputTokenCount: params.usage.prompt_tokens,
     outputTokenCount: params.operationType === "EMBED" ? 0 : params.usage.completion_tokens || 0,
     totalTokenCount: params.usage.total_tokens,
@@ -91,19 +110,11 @@ export async function buildPayload(params: PayloadParams): Promise<ReveniumPaylo
     stopReason: params.stopReason,
     isStreamed: params.isStreamed,
     timeToFirstToken: params.timeToFirstToken,
+    pricingTier: params.pricingTier,
     ...metadataFields,
-    environment: (metadataFields.environment as string) ?? getEnvironment() ?? undefined,
+    ...resolvePromptContextFields(params.usageMetadata),
+    ...resolveEnvDefaultedFields(metadataFields),
     region: (metadataFields.region as string) ?? (await getRegion()) ?? undefined,
-    credentialAlias:
-      (metadataFields.credentialAlias as string) ?? getCredentialAlias() ?? undefined,
-    traceType: (metadataFields.traceType as string) ?? getTraceType() ?? undefined,
-    traceName: (metadataFields.traceName as string) ?? getTraceName() ?? undefined,
-    ticketId: (metadataFields.ticketId as string) ?? getTicketId() ?? undefined,
-    parentTransactionId:
-      (metadataFields.parentTransactionId as string) ?? getParentTransactionId() ?? undefined,
-    transactionName:
-      (metadataFields.transactionName as string) ?? getTransactionName() ?? undefined,
-    retryNumber: (metadataFields.retryNumber as number) ?? getRetryNumber() ?? undefined,
     operationSubtype:
       (metadataFields.operationSubtype as string) ??
       detectOperationSubtype(params.request) ??
@@ -127,6 +138,7 @@ export interface ImagePayloadExtra {
   isStreamed?: boolean;
   timeToFirstToken?: number;
   stopReason?: string;
+  region?: string;
   tokens?: {
     input: number | null;
     output: number | null;
@@ -183,7 +195,7 @@ export function buildImagePayload(
     transactionId: `image-${operationSubtype}-${randomUUID()}`,
     operationType: "IMAGE",
     costType: "AI",
-    model: request.model || "dall-e-2",
+    model: request.model || DEFAULT_IMAGE_MODEL,
     provider,
     modelSource,
     middlewareSource,
@@ -201,6 +213,8 @@ export function buildImagePayload(
     isStreamed: extra?.isStreamed ?? false,
     timeToFirstToken: extra?.timeToFirstToken,
     ...metadataFields,
+    ...resolveEnvDefaultedFields(metadataFields),
+    region: (metadataFields.region as string) ?? extra?.region,
     operationSubtype,
     requestedImageCount,
     actualImageCount,
@@ -295,6 +309,7 @@ export function buildAudioPayload(
     isStreamed: false,
     timeToFirstToken: undefined,
     ...metadataFields,
+    ...resolveEnvDefaultedFields(metadataFields),
     operationSubtype,
     billingUnit: toMeteringBillingUnit(billingUnit),
     durationSeconds,
@@ -371,6 +386,8 @@ export function buildVideoPayload(
     isStreamed: false,
     timeToFirstToken: undefined,
     ...metadataFields,
+    ...resolveEnvDefaultedFields(metadataFields),
+    region: (metadataFields.region as string) ?? extra?.region,
     operationSubtype,
     durationSeconds: videoDurationSeconds,
     resolution: extra?.resolution,
