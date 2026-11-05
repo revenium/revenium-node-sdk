@@ -1,4 +1,11 @@
 import type { Logger } from "../../../src/_core/types/index";
+import {
+  createGeminiReply,
+  createJsonResponse,
+  createSseResponse,
+  drain,
+  stubGoogleAuth,
+} from "../../helpers/fixtures";
 
 const originalFetch = global.fetch;
 
@@ -42,55 +49,33 @@ const GENAI_ENV = {
   GOOGLE_API_KEY: "google-api-key",
 };
 
-const VERTEX_ENV = {
+const VERTEX_DEFAULT_CREDENTIALS_ENV = {
   ...REVENIUM_ENV,
   GOOGLE_CLOUD_PROJECT: "test-project",
+};
+
+const VERTEX_ENV = {
+  ...VERTEX_DEFAULT_CREDENTIALS_ENV,
   GOOGLE_APPLICATION_CREDENTIALS: "/tmp/credentials.json",
 };
 
-const mockCountTokens = jest.fn();
+const CHAT_REPLY = createGeminiReply({
+  promptTokenCount: PROMPT_TOKENS,
+  candidatesTokenCount: CANDIDATE_TOKENS,
+  totalTokenCount: TOTAL_TOKENS,
+});
 
 jest.mock("@google/genai", () => {
-  const chatResponse = {
-    text: "hi",
-    modelVersion: "gemini-2.0-flash-001",
-    responseId: "response-1",
-    candidates: [{ finishReason: "STOP" }],
-    usageMetadata: {
-      promptTokenCount: PROMPT_TOKENS,
-      candidatesTokenCount: CANDIDATE_TOKENS,
-      totalTokenCount: TOTAL_TOKENS,
-    },
-  };
-
+  const actual = jest.requireActual("@google/genai");
   return {
-    GoogleGenAI: jest.fn().mockImplementation(() => ({
-      chats: {
-        create: () => ({
-          sendMessage: () => Promise.resolve(chatResponse),
-          getHistory: () => [],
-        }),
-      },
-      models: {
-        generateContentStream: () =>
-          Promise.resolve({
-            [Symbol.asyncIterator]: async function* () {
-              yield chatResponse;
-            },
-          }),
-        embedContent: () => Promise.resolve({ embeddings: [{ values: [0.1, 0.2] }] }),
-        countTokens: mockCountTokens,
-      },
-    })),
+    ...actual,
+    GoogleGenAI: jest.fn((options) => new actual.GoogleGenAI(options)),
   };
 });
 
-jest.mock("google-auth-library", () => ({
-  GoogleAuth: jest.fn().mockImplementation(() => ({
-    getClient: () => Promise.resolve({ getAccessToken: () => ({ token: "access-token" }) }),
-  })),
-}));
+stubGoogleAuth();
 
+let countTokensReply: () => Response;
 let envSnapshot: NodeJS.ProcessEnv;
 let getConfig: typeof import("../../../src/_core/config/manager").getConfig;
 let setConfig: typeof import("../../../src/_core/config/manager").setConfig;
@@ -107,8 +92,38 @@ function jsonResponse(body: unknown): Response {
   } as unknown as Response;
 }
 
+function geminiReply(url: string): Response | undefined {
+  if (url.includes(":streamGenerateContent")) return createSseResponse([CHAT_REPLY]);
+  if (url.includes(":generateContent")) return createJsonResponse(CHAT_REPLY);
+  if (url.includes(":countTokens")) return countTokensReply();
+  if (url.includes(":batchEmbedContents")) {
+    return createJsonResponse({ embeddings: [{ values: [0.1, 0.2] }] });
+  }
+  if (url.includes("text-embedding-004:predict")) {
+    return createJsonResponse({ predictions: [{ embeddings: { values: [0.1, 0.2] } }] });
+  }
+  return undefined;
+}
+
+function expectEmbeddingInputCounted(fetchMock: jest.Mock, input: string): void {
+  const countTokensRequests = fetchMock.mock.calls
+    .filter(([url]) => String(url).includes(":countTokens"))
+    .map(([url, init]) => ({ url: String(url), body: JSON.parse(String(init?.body)) }));
+
+  expect(countTokensRequests).toEqual([
+    {
+      url: expect.stringContaining("text-embedding-004:countTokens"),
+      body: expect.objectContaining({
+        contents: [expect.objectContaining({ parts: [{ text: input }] })],
+      }),
+    },
+  ]);
+}
+
 function createFetchMock(): jest.Mock {
   return jest.fn((url: string) => {
+    const gemini = geminiReply(url);
+    if (gemini) return Promise.resolve(gemini);
     if (url.includes(":predictLongRunning")) {
       return Promise.resolve(jsonResponse({ name: "operations/op-1" }));
     }
@@ -235,16 +250,9 @@ async function runFromEnvFileDirectory(
   }
 }
 
-async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
-  for await (const chunk of iterable) {
-    void chunk;
-  }
-}
-
 beforeEach(async () => {
   jest.resetModules();
-  mockCountTokens.mockReset();
-  mockCountTokens.mockResolvedValue({ totalTokens: PROMPT_TOKENS });
+  countTokensReply = () => createJsonResponse({ totalTokens: PROMPT_TOKENS });
   envSnapshot = { ...process.env };
   for (const key of [...REVENIUM_ENV_KEYS, ...GOOGLE_ENV_KEYS]) delete process.env[key];
 
@@ -327,16 +335,13 @@ describe("Google middleware setup", () => {
 
     await waitForMeteringCalls(meteringFetch, 1);
     expectEmbeddingTokens(readMeteringRequest(meteringFetch).payload, PROMPT_TOKENS);
-    expect(mockCountTokens).toHaveBeenCalledTimes(1);
-    expect(mockCountTokens).toHaveBeenCalledWith({
-      model: "text-embedding-004",
-      contents: "hi",
-    });
+    expectEmbeddingInputCounted(meteringFetch, "hi");
   });
 
   it("meters a Google AI Studio embedding as unknown when the token count fails", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockCountTokens.mockRejectedValue(new Error("count unavailable"));
+    countTokensReply = () =>
+      createJsonResponse({ error: { code: 503, message: "count unavailable" } }, 503);
 
     const meteringFetch = createFetchMock();
     global.fetch = meteringFetch;
@@ -352,7 +357,7 @@ describe("Google middleware setup", () => {
 
   it("meters a Google AI Studio embedding as unknown when the token count is zero", async () => {
     Object.assign(process.env, GENAI_ENV);
-    mockCountTokens.mockResolvedValue({ totalTokens: 0 });
+    countTokensReply = () => createJsonResponse({ totalTokens: 0 });
 
     const meteringFetch = createFetchMock();
     global.fetch = meteringFetch;
@@ -408,16 +413,16 @@ describe("Google middleware setup", () => {
 
     await waitForMeteringCalls(meteringFetch, 1);
     expectEmbeddingTokens(readMeteringRequest(meteringFetch).payload, PROMPT_TOKENS);
-    expect(mockCountTokens).toHaveBeenCalledTimes(1);
-    expect(mockCountTokens).toHaveBeenCalledWith({
-      model: "text-embedding-004",
-      contents: "hi",
-    });
+    expectEmbeddingInputCounted(meteringFetch, "hi");
   });
 
   it("meters a Vertex AI embedding as unknown when the token count is unsupported", async () => {
     Object.assign(process.env, VERTEX_ENV);
-    mockCountTokens.mockRejectedValue(new Error("countTokens is not supported for this model"));
+    countTokensReply = () =>
+      createJsonResponse(
+        { error: { code: 400, message: "countTokens is not supported for this model" } },
+        400,
+      );
 
     const meteringFetch = createFetchMock();
     global.fetch = meteringFetch;
@@ -468,6 +473,80 @@ describe("Google middleware setup", () => {
     expect(headers["x-api-key"]).toBe("hak_test_key");
     expect(payload.model).toBe("veo-2.0-generate-001");
   }, 20000);
+
+  it("meters a Vertex AI chat with Google's built-in credentials and no key file", async () => {
+    Object.assign(process.env, VERTEX_DEFAULT_CREDENTIALS_ENV);
+
+    const meteringFetch = createFetchMock();
+    global.fetch = meteringFetch;
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const { VertexAIController } = await import("../../../src/google/vertex/index");
+    await new VertexAIController().createChat(["hi"], "gemini-2.0-flash-001");
+
+    await waitForMeteringCalls(meteringFetch, 1);
+    expect(meteringCalls(meteringFetch)).toHaveLength(1);
+    expect(GoogleGenAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        googleAuthOptions: expect.objectContaining({ keyFilename: undefined }),
+      }),
+    );
+  });
+
+  it("meters an Imagen generation with Google's built-in credentials and no key file", async () => {
+    Object.assign(process.env, VERTEX_DEFAULT_CREDENTIALS_ENV);
+
+    const meteringFetch = createFetchMock();
+    global.fetch = meteringFetch;
+
+    const { GoogleAuth } = await import("google-auth-library");
+    const { VertexAIController } = await import("../../../src/google/vertex/index");
+    await new VertexAIController().generateImage({
+      model: "imagen-3.0-generate-002",
+      prompt: "a cat",
+    });
+
+    await waitForMeteringCalls(meteringFetch, 1, IMAGES_URL);
+    expect(meteringCalls(meteringFetch, IMAGES_URL)).toHaveLength(1);
+    expect(GoogleAuth).toHaveBeenCalledWith(expect.objectContaining({ keyFilename: undefined }));
+  });
+
+  it("uses the project passed to the call when GOOGLE_CLOUD_PROJECT is unset", async () => {
+    Object.assign(process.env, REVENIUM_ENV);
+
+    global.fetch = createFetchMock();
+    const { warnings } = recordSetupMessages();
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const { VertexAIController } = await import("../../../src/google/vertex/index");
+    await new VertexAIController().createChat(
+      ["hi"],
+      "gemini-2.0-flash-001",
+      undefined,
+      "arg-project",
+      "europe-west4",
+    );
+
+    expect(GoogleGenAI).toHaveBeenCalledWith(
+      expect.objectContaining({ project: "arg-project", location: "europe-west4" }),
+    );
+    expect(warnings.filter((message) => message.includes("GOOGLE_CLOUD_LOCATION"))).toEqual([]);
+  });
+
+  it("names both ways to supply the project when neither is given", async () => {
+    Object.assign(process.env, REVENIUM_ENV);
+
+    const meteringFetch = createFetchMock();
+    global.fetch = meteringFetch;
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const { VertexAIController } = await import("../../../src/google/vertex/index");
+    await expect(
+      new VertexAIController().createChat(["hi"], "gemini-2.0-flash-001"),
+    ).rejects.toThrow(/projectId.*GOOGLE_CLOUD_PROJECT/);
+    expect(GoogleGenAI).not.toHaveBeenCalled();
+    expect(meteringFetch).not.toHaveBeenCalled();
+  });
 
   it("meters a Google AI Studio chat when the setup only exists in a .env file", async () => {
     const meteringFetch = createFetchMock();
@@ -623,6 +702,45 @@ describe("Google middleware setup", () => {
         expect.objectContaining({ project: "test-project" }),
       );
     });
+  });
+
+  it("reads the Vertex project from a .env file for a service constructed after configure", async () => {
+    global.fetch = createFetchMock();
+
+    await runFromEnvFileDirectory(VERTEX_DEFAULT_CREDENTIALS_ENV, async () => {
+      const { GoogleGenAI } = await import("@google/genai");
+      const { configure, VertexAIService } = await import("../../../src/google/vertex/index");
+      configure({ reveniumApiKey: "hak_valid" });
+      new VertexAIService("gemini-2.0-flash-001");
+
+      expect(GoogleGenAI).toHaveBeenCalledWith(
+        expect.objectContaining({ project: "test-project" }),
+      );
+    });
+  });
+
+  it("rejects a directly constructed Vertex service with no project before creating a client", async () => {
+    Object.assign(process.env, REVENIUM_ENV);
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const { VertexAIService } = await import("../../../src/google/vertex/index");
+
+    expect(() => new VertexAIService("gemini-2.0-flash-001")).toThrow(
+      /projectId.*GOOGLE_CLOUD_PROJECT/,
+    );
+    expect(GoogleGenAI).not.toHaveBeenCalled();
+  });
+
+  it("warns about the default location when a Vertex service is constructed directly", async () => {
+    Object.assign(process.env, VERTEX_DEFAULT_CREDENTIALS_ENV);
+    const { warnings } = recordSetupMessages();
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const { VertexAIService } = await import("../../../src/google/vertex/index");
+    new VertexAIService("gemini-2.0-flash-001");
+
+    expect(warnings).toContain("GOOGLE_CLOUD_LOCATION not set, defaulting to us-central1");
+    expect(GoogleGenAI).toHaveBeenCalledWith(expect.objectContaining({ location: "us-central1" }));
   });
 
   it("logs an error instead of throwing when configure receives a malformed key", async () => {

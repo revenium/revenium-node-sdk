@@ -6,6 +6,7 @@
 const {
   startEnforcementPolling,
   stopEnforcementPolling,
+  waitForInitialRules,
   enforcePreCallRules,
   CostLimitExceeded,
   setConfig,
@@ -138,8 +139,7 @@ async function exceptionContractBlock() {
   );
 
   startEnforcementPolling();
-  await waitFor(() => fetchPatch.calls.length >= 1, { timeoutMs: 2000 });
-  await sleep(50); // let setRules complete after fetch resolves
+  await waitForInitialRules();
 
   const tStart = Date.now();
   let caught;
@@ -215,8 +215,7 @@ async function exceptionContractShadow() {
   );
 
   startEnforcementPolling();
-  await waitFor(() => fetchPatch.calls.length >= 1, { timeoutMs: 2000 });
-  await sleep(50);
+  await waitForInitialRules();
 
   let threw = null;
   try {
@@ -280,7 +279,7 @@ async function missingTeamIdFailOpen() {
   fetchPatch.restore();
   resetConfig();
 
-  const skipWarn = logs.find((l) => l.level === "warn" && /reveniumTeamId not set/.test(l.m));
+  const skipWarn = logs.find((l) => l.level === "warn" && /No team id configured/.test(l.m));
 
   return {
     name,
@@ -306,8 +305,7 @@ async function noContentFailOpen() {
   const fetchPatch = patchFetch(async () => new Response(null, { status: 204 }));
 
   startEnforcementPolling();
-  await waitFor(() => fetchPatch.calls.length >= 1, { timeoutMs: 2000 });
-  await sleep(50);
+  await waitForInitialRules();
 
   let threw = null;
   try {

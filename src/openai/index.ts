@@ -28,6 +28,8 @@ export {
   trackAudioUsageAsync,
 } from "./middleware.js";
 
+export { DecisionsInterface } from "./decisions.js";
+
 export { StreamingWrapper } from "./streaming.js";
 
 export {

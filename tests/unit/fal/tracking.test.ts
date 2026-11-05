@@ -3,6 +3,7 @@ import { createReveniumConfig, createMockFetch } from "../../helpers/fixtures";
 const originalFetch = global.fetch;
 
 let sendFalMetrics: typeof import("../../../src/fal/tracking").sendFalMetrics;
+let retainBilledInput: typeof import("../../../src/fal/tracking").retainBilledInput;
 let setConfig: typeof import("../../../src/_core/config/manager").setConfig;
 let resetConfig: typeof import("../../../src/_core/config/manager").resetConfig;
 
@@ -14,6 +15,7 @@ beforeEach(async () => {
   const tracking = await import("../../../src/fal/tracking");
 
   sendFalMetrics = tracking.sendFalMetrics;
+  retainBilledInput = tracking.retainBilledInput;
   setConfig = manager.setConfig;
   resetConfig = manager.resetConfig;
 
@@ -725,6 +727,47 @@ describe("sendFalMetrics CHAT tracking", () => {
     expect(body.totalTokenCount).toBe(267);
     expect(body.operationSubtype).toBeUndefined();
   });
+
+  it("sends the prompt context on CHAT records only", async () => {
+    const mockFetch = createMockFetch();
+    global.fetch = mockFetch;
+    const promptContext = {
+      effort: "high",
+      promptId: "prompt-01",
+      promptLength: 412,
+      querySource: "sdk",
+      speed: "fast",
+      subagentType: "explore",
+    };
+    const call = {
+      startTime: Date.now() - 800,
+      duration: 800,
+      isStreamed: false,
+      usageMetadata: promptContext,
+    };
+
+    await sendFalMetrics({
+      ...call,
+      endpointId: "openrouter/router",
+      operationType: "CHAT",
+      input: { prompt: "What is AI?" },
+      result: { usage: { prompt_tokens: 40, completion_tokens: 227, total_tokens: 267 } },
+    });
+    await sendFalMetrics({
+      ...call,
+      endpointId: "fal-ai/flux/dev",
+      operationType: "IMAGE",
+      input: { prompt: "a cat" },
+      result: { images: [{ url: "https://example.com/1.png" }] },
+    });
+
+    const chatBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const imageBody = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(chatBody).toMatchObject(promptContext);
+    for (const field of Object.keys(promptContext)) {
+      expect(imageBody).not.toHaveProperty(field);
+    }
+  });
 });
 
 describe("sendFalMetrics common fields", () => {
@@ -768,5 +811,18 @@ describe("sendFalMetrics common fields", () => {
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.isStreamed).toBe(true);
+  });
+});
+
+describe("retainBilledInput", () => {
+  it("keeps the billed fields and drops media inputs", () => {
+    const retained = retainBilledInput({
+      prompt: "a horse running",
+      duration: 5,
+      num_images: 2,
+      image_url: "data:image/png;base64,AAAA",
+    });
+
+    expect(retained).toEqual({ prompt: "a horse running", duration: 5, num_images: 2 });
   });
 });

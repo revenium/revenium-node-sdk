@@ -10,6 +10,8 @@ import {
   resetMeteringCircuitBreaker,
   resetEnforcementCircuitBreaker,
 } from "../../../src/_core/resilience/circuit-breaker";
+import { HttpError } from "../../../src/_core/resilience/retry";
+import { CircuitBreakerOpenError } from "../../../src/_core/resilience/error-handler";
 
 const testConfig: CircuitBreakerConfig = {
   failureThreshold: 3,
@@ -132,6 +134,63 @@ describe("CircuitBreaker", () => {
     expect(cb.getStats().failureCount).toBe(0);
   });
 
+  it("tells the function whether it runs as the recovery probe", async () => {
+    const cb = new CircuitBreaker(testConfig);
+    const observed: boolean[] = [];
+    const record = (isProbe: boolean) => {
+      observed.push(isProbe);
+      return Promise.resolve();
+    };
+
+    await cb.execute(record);
+    for (let i = 0; i < testConfig.failureThreshold; i++) {
+      await cb.execute(() => Promise.reject(new Error("fail"))).catch(() => {});
+    }
+    jest.advanceTimersByTime(testConfig.recoveryTimeout);
+    await cb.execute(record);
+
+    expect(observed).toEqual([false, true]);
+  });
+
+  it("HALF_OPEN admits a single probe", async () => {
+    const cb = new CircuitBreaker(testConfig);
+    for (let i = 0; i < testConfig.failureThreshold; i++) {
+      await cb.execute(() => Promise.reject(new Error("fail"))).catch(() => {});
+    }
+    jest.advanceTimersByTime(testConfig.recoveryTimeout);
+
+    let resolveProbe: (value: string) => void = () => {};
+    const probe = cb.execute(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveProbe = resolve;
+        }),
+    );
+    const concurrentCall = jest.fn(() => Promise.resolve("concurrent"));
+
+    expect(cb.canExecute()).toBe(false);
+    await expect(cb.execute(concurrentCall)).rejects.toThrow(CircuitBreakerOpenError);
+    await expect(cb.execute(concurrentCall)).rejects.toThrow("Circuit breaker is HALF_OPEN");
+    expect(concurrentCall).not.toHaveBeenCalled();
+
+    resolveProbe("probe");
+    await probe;
+    await expect(cb.execute(() => Promise.resolve("next"))).resolves.toBe("next");
+  });
+
+  it("success in CLOSED clears the failure window", async () => {
+    const cb = new CircuitBreaker(testConfig);
+    const fail = () => cb.execute(() => Promise.reject(new Error("fail"))).catch(() => {});
+
+    await fail();
+    await fail();
+    await cb.execute(() => Promise.resolve("ok"));
+    await fail();
+    await fail();
+
+    expect(cb.getState()).toBe(CircuitState.CLOSED);
+  });
+
   it("respects custom FailureStrategy", async () => {
     const strategy: FailureStrategy = {
       isRetryableError: (err) => {
@@ -185,6 +244,60 @@ describe("named circuit breakers (metering / enforcement)", () => {
     }
     expect(getEnforcementCircuitBreaker().getState()).toBe(CircuitState.OPEN);
     expect(getMeteringCircuitBreaker().getState()).toBe(CircuitState.CLOSED);
+  });
+
+  it.each([400, 401, 403, 404, 422])(
+    "metering breaker stays CLOSED after rejected records (%i)",
+    async (status) => {
+      for (let i = 0; i < 10; i++) {
+        await executeWithMeteringCircuitBreaker(() =>
+          Promise.reject(new HttpError("rejected", status)),
+        ).catch(() => {});
+      }
+
+      expect(getMeteringCircuitBreaker().getState()).toBe(CircuitState.CLOSED);
+      await expect(executeWithMeteringCircuitBreaker(() => Promise.resolve("ok"))).resolves.toBe(
+        "ok",
+      );
+    },
+  );
+
+  it("metering breaker ignores 429", async () => {
+    for (let i = 0; i < 10; i++) {
+      await executeWithMeteringCircuitBreaker(() =>
+        Promise.reject(new HttpError("throttled", 429, 1)),
+      ).catch(() => {});
+    }
+
+    expect(getMeteringCircuitBreaker().getState()).toBe(CircuitState.CLOSED);
+  });
+
+  it("metering breaker opens on 503", async () => {
+    for (let i = 0; i < 5; i++) {
+      await executeWithMeteringCircuitBreaker(() =>
+        Promise.reject(new HttpError("unavailable", 503)),
+      ).catch(() => {});
+    }
+
+    expect(getMeteringCircuitBreaker().getState()).toBe(CircuitState.OPEN);
+  });
+
+  it("metering breaker probes 5 seconds after the last failure", async () => {
+    for (let i = 0; i < 5; i++) {
+      await executeWithMeteringCircuitBreaker(() =>
+        Promise.reject(new HttpError("unavailable", 503)),
+      ).catch(() => {});
+    }
+    const probe = jest.fn(() => Promise.resolve("probe"));
+
+    jest.advanceTimersByTime(4_999);
+    await expect(executeWithMeteringCircuitBreaker(probe)).rejects.toThrow(
+      "Circuit breaker is OPEN",
+    );
+
+    jest.advanceTimersByTime(1);
+    await expect(executeWithMeteringCircuitBreaker(probe)).resolves.toBe("probe");
+    expect(probe).toHaveBeenCalledTimes(1);
   });
 
   it("resetMeteringCircuitBreaker leaves enforcement breaker untouched", async () => {

@@ -180,6 +180,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ stopReason: expected }),
+        expect.anything(),
       );
     },
   );
@@ -208,6 +209,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ stopReason: expected }),
+        expect.anything(),
       );
     },
   );
@@ -232,6 +234,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ outputResponse: "hello" }),
+      expect.anything(),
     );
   });
 
@@ -245,6 +248,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ stopReason: "ERROR", model: "gpt-4o-mini" }),
+      expect.anything(),
     );
   });
 
@@ -261,6 +265,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ stopReason: "ERROR", totalTokenCount: 0 }),
+      expect.anything(),
     );
   });
 
@@ -303,6 +308,7 @@ describe("ResponsesInterface stop reason metering", () => {
         outputTokenCount: 44,
         stopReason: "END",
       }),
+      expect.anything(),
     );
   });
 
@@ -338,6 +344,7 @@ describe("ResponsesInterface stop reason metering", () => {
         inputTokenCount: 12,
         outputTokenCount: 3,
       }),
+      expect.anything(),
     );
   });
 
@@ -370,6 +377,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ idempotencyKey: "openai-response-resp_stub" }),
+      expect.anything(),
     );
   });
 
@@ -392,6 +400,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ organizationName: "org_1", traceId: "trace_1" }),
+      expect.anything(),
     );
   });
 
@@ -414,6 +423,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ organizationName: "org_2" }),
+      expect.anything(),
     );
   });
 
@@ -431,6 +441,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ requestDuration: 30_000 }),
+      undefined,
     );
   });
 
@@ -444,6 +455,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ requestDuration: expect.any(Number) }),
+      undefined,
     );
     const [[payload]] = jest.mocked(sendToRevenium).mock.calls;
     expect(payload.requestDuration).toBeLessThan(5_000);
@@ -485,7 +497,10 @@ describe("ResponsesInterface stop reason metering", () => {
     await flushPromises();
 
     expect(sendToRevenium).toHaveBeenCalledTimes(1);
-    expect(sendToRevenium).toHaveBeenCalledWith(expect.objectContaining({ stopReason: expected }));
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ stopReason: expected }),
+      undefined,
+    );
   });
 
   it("does not meter when retrieve itself throws", async () => {
@@ -509,6 +524,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ idempotencyKey: "openai-response-resp_stub" }),
+      undefined,
     );
   });
 
@@ -524,6 +540,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ idempotencyKey: "caller-key" }),
+      undefined,
     );
   });
 
@@ -545,6 +562,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ reasoningTokenCount: 12 }),
+      expect.anything(),
     );
   });
 
@@ -569,7 +587,10 @@ describe("ResponsesInterface stop reason metering", () => {
     ).rejects.toThrow("stream broke");
     await flushPromises();
 
-    expect(sendToRevenium).toHaveBeenCalledWith(expect.objectContaining({ stopReason: "ERROR" }));
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ stopReason: "ERROR" }),
+      expect.anything(),
+    );
   });
 
   it("meters an abandoned stream as CANCELLED", async () => {
@@ -592,6 +613,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ stopReason: "CANCELLED" }),
+      expect.anything(),
     );
   });
 
@@ -618,6 +640,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ stopReason: expected }),
+        expect.anything(),
       );
     },
   );
@@ -665,6 +688,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ timeToFirstToken: expect.any(Number) }),
+      expect.anything(),
     );
   });
 
@@ -678,6 +702,7 @@ describe("ResponsesInterface stop reason metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ stopReason: "ERROR", model: "gpt-4o-mini" }),
+      expect.anything(),
     );
   });
 
@@ -731,6 +756,7 @@ describe("ResponsesInterface stop reason metering", () => {
           isStreamed: true,
           stopReason: "END",
         }),
+        expect.anything(),
       );
     });
 
@@ -770,6 +796,7 @@ describe("ResponsesInterface stop reason metering", () => {
       expect(sendToRevenium).toHaveBeenCalledTimes(1);
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ stopReason: "CANCELLED", isStreamed: true }),
+        expect.anything(),
       );
     });
 
@@ -784,6 +811,7 @@ describe("ResponsesInterface stop reason metering", () => {
       expect(sendToRevenium).toHaveBeenCalledTimes(1);
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ stopReason: "ERROR", isStreamed: true, model: "gpt-4o-mini" }),
+        expect.anything(),
       );
     });
 
@@ -813,6 +841,7 @@ describe("ResponsesInterface stop reason metering", () => {
       expect(sendToRevenium).toHaveBeenCalledTimes(1);
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ totalTokenCount: 377, isStreamed: true }),
+        expect.anything(),
       );
     });
 
@@ -837,6 +866,7 @@ describe("ResponsesInterface stop reason metering", () => {
       expect(sendToRevenium).toHaveBeenCalledTimes(1);
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ totalTokenCount: 377, stopReason: "END" }),
+        expect.anything(),
       );
     });
 
@@ -864,6 +894,7 @@ describe("ResponsesInterface stop reason metering", () => {
           isStreamed: true,
           stopReason: "END",
         }),
+        expect.anything(),
       );
     });
 
@@ -889,6 +920,7 @@ describe("ResponsesInterface stop reason metering", () => {
       expect(sendToRevenium).toHaveBeenCalledTimes(1);
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ stopReason: "CANCELLED", isStreamed: true }),
+        expect.anything(),
       );
     });
 
@@ -906,6 +938,7 @@ describe("ResponsesInterface stop reason metering", () => {
       expect(sendToRevenium).toHaveBeenCalledTimes(1);
       expect(sendToRevenium).toHaveBeenCalledWith(
         expect.objectContaining({ totalTokenCount: 0, isStreamed: true, stopReason: "END" }),
+        expect.anything(),
       );
     });
   });

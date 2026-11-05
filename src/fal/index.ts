@@ -1,22 +1,17 @@
 import { getLogger, setConfig } from "../_core/config/manager.js";
-import { loadConfigFromEnv as loadCoreEnv } from "../_core/config/loader.js";
-import { validateConfig } from "../_core/config/validator.js";
-import { DEFAULT_REVENIUM_BASE_URL } from "../_core/constants.js";
+import { loadEnvFiles } from "../_core/config/loader.js";
+import { withEnvironmentDefaults } from "../_core/config/client-config.js";
 import { ReveniumFal } from "./client.js";
 import { toReveniumConfig } from "./config.js";
 import type { FalConfig } from "./types.js";
 
 let globalClient: ReveniumFal | null = null;
 
-function loadFalConfigFromEnv(): FalConfig | null {
-  const coreConfig = loadCoreEnv();
-  if (!coreConfig) return null;
-
+function readFalEnvironment(): Partial<FalConfig> {
   const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY;
 
   if (!falApiKey) {
-    const logger = getLogger();
-    logger.warn(
+    getLogger().warn(
       "FAL_KEY not found in environment. " +
         "The fal.ai client may use its own env-based auth, " +
         "or requests will fail at runtime.",
@@ -25,47 +20,22 @@ function loadFalConfigFromEnv(): FalConfig | null {
 
   return {
     falApiKey,
-    reveniumApiKey: coreConfig.reveniumApiKey,
-    reveniumBaseUrl: coreConfig.reveniumBaseUrl || DEFAULT_REVENIUM_BASE_URL,
     organizationName: process.env.REVENIUM_ORGANIZATION_NAME,
     organizationId: process.env.REVENIUM_ORGANIZATION_ID,
     debug: process.env.REVENIUM_DEBUG === "true",
-    printSummary: coreConfig.printSummary,
-    teamId: coreConfig.reveniumTeamId,
-    capturePrompts: coreConfig.capturePrompts,
     failSilent: process.env.REVENIUM_FAIL_SILENT !== "false",
   };
 }
 
 export function Initialize(config?: Partial<FalConfig>): void {
-  const logger = getLogger();
-
-  let finalConfig: FalConfig;
-
-  if (config) {
-    finalConfig = {
-      reveniumBaseUrl: DEFAULT_REVENIUM_BASE_URL,
-      debug: false,
-      ...config,
-    } as FalConfig;
-  } else {
-    const envConfig = loadFalConfigFromEnv();
-    if (!envConfig) {
-      throw new Error(
-        "Failed to load configuration from environment variables. " +
-          "Ensure REVENIUM_METERING_API_KEY is set.",
-      );
-    }
-    finalConfig = envConfig;
-  }
-
-  const reveniumConfig = toReveniumConfig(finalConfig);
-  validateConfig(reveniumConfig);
+  loadEnvFiles();
+  const falConfig = config ?? readFalEnvironment();
+  const reveniumConfig = withEnvironmentDefaults(toReveniumConfig(falConfig));
   setConfig(reveniumConfig);
 
-  globalClient = new ReveniumFal(finalConfig);
+  globalClient = new ReveniumFal({ ...falConfig, reveniumApiKey: reveniumConfig.reveniumApiKey });
 
-  logger.info("Revenium fal.ai client initialized");
+  getLogger().info("Revenium fal.ai client initialized");
 }
 
 export function GetClient(): ReveniumFal {
@@ -96,6 +66,7 @@ export function Configure(config: Partial<FalConfig>): void {
 export { ReveniumFal } from "./client.js";
 
 export type { FalConfig, FalUsageMetadata, FalTrackingData } from "./types.js";
+export type { MeteredFalQueue } from "./metered-queue.js";
 
 export type { ReveniumConfig, UsageMetadata, Logger, Config } from "../_core/types/index.js";
 

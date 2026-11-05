@@ -1,12 +1,18 @@
 import { randomUUID } from "crypto";
+import type { Content, ContentListUnion, PartUnion } from "@google/genai";
 import { Subscriber, UsageMetadata } from "../_core/types/index.js";
-import { getConfig, getLogger } from "../_core/config/manager.js";
+import { getLogger } from "../_core/config/manager.js";
+import { resolveConfig } from "../_core/config/call-config.js";
 import { getErrorMessage } from "../_core/resilience/error-handler.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
 import { resolveReportedCount } from "../_core/metering/cache-tokens.js";
 import { buildPayload } from "../_core/metering/payload-builder.js";
 import { ERROR_STOP_REASON } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
+import {
+  buildEnforcementCriteria,
+  type EnforcementCriteria,
+} from "../_core/enforcement/evaluator.js";
 import {
   shouldCapturePrompts,
   getMaxPromptSize,
@@ -19,6 +25,8 @@ import {
 } from "./types.js";
 
 const MIDDLEWARE_SOURCE = "revenium-google-node";
+
+export const GOOGLE_PROVIDER = "Google";
 
 const MAX_ERROR_REASON_LENGTH = 255;
 
@@ -179,6 +187,15 @@ export function mapGoogleUsageMetadata(meta?: GoogleUsageMetadata): UsageMetadat
   return result;
 }
 
+export function buildGoogleEnforcementCriteria(
+  model: string,
+  meta?: GoogleUsageMetadata,
+): EnforcementCriteria {
+  const criteria = buildEnforcementCriteria(mapGoogleUsageMetadata(meta), model, GOOGLE_PROVIDER);
+  if (meta?.subscriber?.credential) return criteria;
+  return { ...criteria, credential: meta?.subscriberCredentialName ?? meta?.subscriberCredential };
+}
+
 export function withGoogleErrorReason(
   usageMetadata: UsageMetadata | undefined,
   error: unknown,
@@ -189,21 +206,49 @@ export function withGoogleErrorReason(
   };
 }
 
+function partToPrompt(part: PartUnion): string {
+  if (typeof part === "string") return part;
+  if (part.text) return part.text;
+  const media = part.inlineData ?? part.fileData;
+  if (!media) return "";
+  return media.mimeType?.startsWith("image/") ? "[IMAGE]" : "[FILE]";
+}
+
+function isContent(item: Content | PartUnion): item is Content {
+  return typeof item === "object" && "parts" in item;
+}
+
+function contentToPrompt(item: Content | PartUnion): string {
+  if (!isContent(item)) return partToPrompt(item);
+  return (item.parts ?? []).map(partToPrompt).filter(Boolean).join("\n");
+}
+
+export function googleContentsToPrompts(contents: ContentListUnion | undefined): string[] {
+  if (contents === undefined) return [];
+  const items = Array.isArray(contents) ? contents : [contents];
+  return items.map(contentToPrompt).filter(Boolean);
+}
+
+export function shouldCaptureGooglePrompts(meta?: GoogleUsageMetadata): boolean {
+  return shouldCapturePrompts(mapGoogleUsageMetadata(meta));
+}
+
 function extractGooglePrompts(
   prompts: string[],
   response: any,
   meta?: GoogleUsageMetadata,
+  systemPrompt?: string,
 ): {
   systemPrompt?: string;
   inputMessages?: string;
   outputResponse?: string;
   promptsTruncated: boolean;
 } | null {
-  const usageMetadata = mapGoogleUsageMetadata(meta);
-  if (!shouldCapturePrompts(usageMetadata)) return null;
+  if (!shouldCaptureGooglePrompts(meta)) return null;
 
   const maxSize = getMaxPromptSize();
 
+  const systemResult = truncateString(systemPrompt, maxSize);
   const inputResult = truncateString(prompts.join("\n\n"), maxSize);
 
   let outputRaw = "";
@@ -214,12 +259,13 @@ function extractGooglePrompts(
   }
   const outputResult = truncateString(outputRaw, maxSize);
 
-  if (!inputResult.value && !outputResult.value) return null;
+  if (!systemResult.value && !inputResult.value && !outputResult.value) return null;
 
   return {
+    systemPrompt: systemResult.value || undefined,
     inputMessages: inputResult.value || undefined,
     outputResponse: outputResult.value || undefined,
-    promptsTruncated: inputResult.truncated || outputResult.truncated,
+    promptsTruncated: systemResult.truncated || inputResult.truncated || outputResult.truncated,
   };
 }
 
@@ -318,9 +364,11 @@ export async function trackGoogleUsageAsync(params: {
   modelSource: "GOOGLE" | "GOOGLE_VERTEX_AI";
   usageMetadata?: GoogleUsageMetadata;
   prompts?: string[];
+  systemPrompt?: string;
   timeToFirstToken?: number;
   resolveInputTokens?: () => Promise<number | null>;
   error?: unknown;
+  enforcementScope?: EnforcementCriteria;
 }): Promise<void> {
   const logger = getLogger();
 
@@ -339,7 +387,12 @@ export async function trackGoogleUsageAsync(params: {
   const usageMeta = failed ? withGoogleErrorReason(providedMeta, params.error) : providedMeta;
 
   const promptData = params.prompts
-    ? extractGooglePrompts(params.prompts, params.response, params.usageMetadata)
+    ? extractGooglePrompts(
+        params.prompts,
+        params.response,
+        params.usageMetadata,
+        params.systemPrompt,
+      )
     : null;
 
   const duration = params.endTime.getTime() - params.startTime.getTime();
@@ -347,7 +400,7 @@ export async function trackGoogleUsageAsync(params: {
   try {
     const reportedUsage = params.response?.usageMetadata;
     const isEmbedding = params.operationType === "EMBED";
-    const shouldCountEmbeddingTokens = !failed && getConfig() !== null;
+    const shouldCountEmbeddingTokens = !failed && resolveConfig() !== null;
     const inputTokens = isEmbedding
       ? ((await resolveEmbeddingInputTokens(
           params.response,
@@ -361,7 +414,7 @@ export async function trackGoogleUsageAsync(params: {
       requestId: params.transactionId,
       startTime: params.startTime.getTime(),
       duration,
-      provider: "Google",
+      provider: GOOGLE_PROVIDER,
       modelSource: params.modelSource,
       middlewareSource: MIDDLEWARE_SOURCE,
       usageMetadata: usageMeta,
@@ -382,7 +435,7 @@ export async function trackGoogleUsageAsync(params: {
     });
 
     try {
-      await sendToRevenium(payload);
+      await sendToRevenium(payload, params.enforcementScope);
     } finally {
       printUsageSummary(payload);
     }

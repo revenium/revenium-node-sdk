@@ -1,5 +1,6 @@
 import { CIRCUIT_BREAKER_CONFIG } from "../constants.js";
-import { EnforcementRequestRejectedError } from "./error-handler.js";
+import { CircuitBreakerOpenError, EnforcementRequestRejectedError } from "./error-handler.js";
+import { HttpError, isRequestRejection } from "./retry.js";
 
 export enum CircuitState {
   CLOSED = "CLOSED",
@@ -36,13 +37,19 @@ const enforcementFailureStrategy: FailureStrategy = {
   isProviderThrottling: () => false,
 };
 
+const meteringFailureStrategy: FailureStrategy = {
+  isRetryableError: (error: unknown) =>
+    !(error instanceof HttpError && isRequestRejection(error.status)),
+  isProviderThrottling: () => false,
+};
+
 export class CircuitBreaker {
   private state: CircuitState = CircuitState.CLOSED;
   private failureCount: number = 0;
   private successCount: number = 0;
   private lastFailureTime: number = 0;
   private failures: number[] = [];
-  private lastCleanupTime: number = 0;
+  private probeInFlight = false;
   private readonly maxFailureHistorySize = CIRCUIT_BREAKER_CONFIG.MAX_FAILURE_HISTORY_SIZE;
   private readonly strategy: FailureStrategy;
 
@@ -50,22 +57,20 @@ export class CircuitBreaker {
     private config: CircuitBreakerConfig = DEFAULT_CIRCUIT_CONFIG,
     strategy?: FailureStrategy,
   ) {
-    this.lastCleanupTime = Date.now();
     this.strategy = strategy || defaultStrategy;
   }
 
-  async execute<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.state === CircuitState.OPEN) {
-      if (this.shouldAttemptRecovery()) {
-        this.state = CircuitState.HALF_OPEN;
-        this.successCount = 0;
-      } else {
-        throw new Error("Circuit breaker is OPEN - failing fast");
-      }
+  async execute<T>(fn: (isProbe: boolean) => Promise<T>): Promise<T> {
+    if (!this.canExecute()) {
+      throw new CircuitBreakerOpenError(this.state);
+    }
+    const isProbe = this.state !== CircuitState.CLOSED;
+    if (isProbe) {
+      this.startProbe();
     }
 
     try {
-      const result = await fn();
+      const result = await fn(isProbe);
       this.onSuccess();
       return result;
     } catch (error) {
@@ -73,13 +78,17 @@ export class CircuitBreaker {
         this.onFailure();
       }
       throw error;
+    } finally {
+      if (isProbe) {
+        this.probeInFlight = false;
+      }
     }
   }
 
   canExecute(): boolean {
-    if (this.state === CircuitState.CLOSED || this.state === CircuitState.HALF_OPEN) return true;
-    if (this.state === CircuitState.OPEN && this.shouldAttemptRecovery()) return true;
-    return false;
+    if (this.state === CircuitState.CLOSED) return true;
+    if (this.state === CircuitState.HALF_OPEN) return !this.probeInFlight;
+    return this.shouldAttemptRecovery();
   }
 
   getState(): CircuitState {
@@ -118,8 +127,16 @@ export class CircuitBreaker {
     this.failureCount = 0;
     this.successCount = 0;
     this.lastFailureTime = 0;
-    this.lastCleanupTime = Date.now();
     this.failures = [];
+    this.probeInFlight = false;
+  }
+
+  private startProbe(): void {
+    if (this.state === CircuitState.OPEN) {
+      this.state = CircuitState.HALF_OPEN;
+      this.successCount = 0;
+    }
+    this.probeInFlight = true;
   }
 
   private onSuccess(): void {
@@ -132,7 +149,7 @@ export class CircuitBreaker {
       }
     } else if (this.state === CircuitState.CLOSED) {
       this.failureCount = 0;
-      this.performPeriodicCleanup();
+      this.failures = [];
     }
   }
 
@@ -169,17 +186,6 @@ export class CircuitBreaker {
     const now = Date.now();
     this.failures = this.failures.filter((timestamp) => now - timestamp < this.config.timeWindow);
   }
-
-  private performPeriodicCleanup(): void {
-    const now = Date.now();
-    if (
-      now - this.lastCleanupTime > CIRCUIT_BREAKER_CONFIG.CLEANUP_INTERVAL ||
-      this.failures.length > CIRCUIT_BREAKER_CONFIG.CLEANUP_SIZE_THRESHOLD
-    ) {
-      this.cleanupOldFailures();
-      this.lastCleanupTime = now;
-    }
-  }
 }
 
 let meteringCircuitBreaker: CircuitBreaker | null = null;
@@ -191,7 +197,7 @@ export function getMeteringCircuitBreaker(
 ): CircuitBreaker {
   if (!meteringCircuitBreaker) {
     const finalConfig = config ? { ...DEFAULT_CIRCUIT_CONFIG, ...config } : DEFAULT_CIRCUIT_CONFIG;
-    meteringCircuitBreaker = new CircuitBreaker(finalConfig, strategy);
+    meteringCircuitBreaker = new CircuitBreaker(finalConfig, strategy ?? meteringFailureStrategy);
   }
   return meteringCircuitBreaker;
 }
@@ -220,10 +226,14 @@ export function resetEnforcementCircuitBreaker(): void {
   enforcementCircuitBreaker = null;
 }
 
-export function executeWithMeteringCircuitBreaker<T>(fn: () => Promise<T>): Promise<T> {
+export function executeWithMeteringCircuitBreaker<T>(
+  fn: (isProbe: boolean) => Promise<T>,
+): Promise<T> {
   return getMeteringCircuitBreaker().execute(fn);
 }
 
-export function executeWithEnforcementCircuitBreaker<T>(fn: () => Promise<T>): Promise<T> {
+export function executeWithEnforcementCircuitBreaker<T>(
+  fn: (isProbe: boolean) => Promise<T>,
+): Promise<T> {
   return getEnforcementCircuitBreaker().execute(fn);
 }

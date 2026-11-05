@@ -1,32 +1,34 @@
-import { MeteredResponseLedger } from "../../../src/openai/metered-response-ledger";
+import { MeteredRequestLedger } from "../../../src/_core/metering/metered-request-ledger";
 
-describe("MeteredResponseLedger", () => {
+type StubContext = { metadata?: { organizationName: string }; messages?: unknown[] };
+
+describe("MeteredRequestLedger", () => {
   it("accepts a response id the first time", () => {
-    expect(new MeteredResponseLedger().claim("resp_stub")).toBe(true);
+    expect(new MeteredRequestLedger<StubContext>().claim("resp_stub")).toBe(true);
   });
 
   it("rejects a response id already recorded", () => {
-    const ledger = new MeteredResponseLedger();
+    const ledger = new MeteredRequestLedger<StubContext>();
     ledger.claim("resp_stub");
 
     expect(ledger.claim("resp_stub")).toBe(false);
   });
 
   it("tracks distinct response ids independently", () => {
-    const ledger = new MeteredResponseLedger();
+    const ledger = new MeteredRequestLedger<StubContext>();
     ledger.claim("resp_one");
 
     expect(ledger.claim("resp_two")).toBe(true);
   });
 
   it("keeps separate ledgers isolated from each other", () => {
-    new MeteredResponseLedger().claim("resp_stub");
+    new MeteredRequestLedger<StubContext>().claim("resp_stub");
 
-    expect(new MeteredResponseLedger().claim("resp_stub")).toBe(true);
+    expect(new MeteredRequestLedger<StubContext>().claim("resp_stub")).toBe(true);
   });
 
   it("accepts a released response id again", () => {
-    const ledger = new MeteredResponseLedger();
+    const ledger = new MeteredRequestLedger<StubContext>();
     ledger.claim("resp_stub");
     ledger.release("resp_stub");
 
@@ -34,7 +36,7 @@ describe("MeteredResponseLedger", () => {
   });
 
   it("accepts the oldest response id again once the cap is exceeded", () => {
-    const ledger = new MeteredResponseLedger(2);
+    const ledger = new MeteredRequestLedger<StubContext>(2);
     ledger.claim("resp_one");
     ledger.claim("resp_two");
 
@@ -45,25 +47,25 @@ describe("MeteredResponseLedger", () => {
   });
 
   it("returns the context recorded for a response id", () => {
-    const ledger = new MeteredResponseLedger();
+    const ledger = new MeteredRequestLedger<StubContext>();
     ledger.rememberContext("resp_stub", { metadata: { organizationName: "org_1" } });
 
     expect(ledger.contextFor("resp_stub")).toEqual({ metadata: { organizationName: "org_1" } });
   });
 
   it("returns the captured input recorded for a response id", () => {
-    const ledger = new MeteredResponseLedger();
+    const ledger = new MeteredRequestLedger<StubContext>();
     ledger.rememberContext("resp_stub", { messages: [{ role: "user", content: "hello" }] });
 
     expect(ledger.contextFor("resp_stub")?.messages).toEqual([{ role: "user", content: "hello" }]);
   });
 
   it("returns no context for an unknown response id", () => {
-    expect(new MeteredResponseLedger().contextFor("resp_stub")).toBeUndefined();
+    expect(new MeteredRequestLedger<StubContext>().contextFor("resp_stub")).toBeUndefined();
   });
 
   it("drops the oldest context once the cap is exceeded", () => {
-    const ledger = new MeteredResponseLedger(2);
+    const ledger = new MeteredRequestLedger<StubContext>(2);
     ledger.rememberContext("resp_one", { metadata: { organizationName: "org_1" } });
     ledger.rememberContext("resp_two", { metadata: { organizationName: "org_2" } });
 

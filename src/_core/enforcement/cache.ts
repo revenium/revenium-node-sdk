@@ -1,3 +1,4 @@
+import { ENFORCEMENT_CONFIG } from "../constants.js";
 import type { EnforcementFilter } from "./filters.js";
 
 export type EnforcementAction = "BLOCK" | "THROTTLE" | "WARN_ONLY";
@@ -56,6 +57,7 @@ const EMPTY_CACHE: CachedEnforcementSnapshot = {
 };
 
 let cachedSnapshot: CachedEnforcementSnapshot = EMPTY_CACHE;
+let loadedAt: number | null = null;
 
 function outranks(candidate: EnforcementGroupEntry, incumbent: EnforcementGroupEntry): boolean {
   if (candidate.breached !== incumbent.breached) return candidate.breached;
@@ -79,12 +81,20 @@ function foldGroupEntries(
   return entries;
 }
 
+export function getRulesAgeMs(): number | null {
+  return loadedAt === null ? null : performance.now() - loadedAt;
+}
+
+export function isFreshRuleAge(ageMs: number | null): boolean {
+  return ageMs !== null && ageMs <= ENFORCEMENT_CONFIG.MAX_RULE_AGE;
+}
+
 export function getSnapshot(): CachedEnforcementSnapshot {
-  return cachedSnapshot;
+  return isFreshRuleAge(getRulesAgeMs()) ? cachedSnapshot : EMPTY_CACHE;
 }
 
 export function getRules(): EnforcementRule[] {
-  return cachedSnapshot.rules.map((cached) => cached.rule);
+  return getSnapshot().rules.map((cached) => cached.rule);
 }
 
 export function setRules(snapshot: EnforcementSnapshot): void {
@@ -93,8 +103,10 @@ export function setRules(snapshot: EnforcementSnapshot): void {
     departmentBlocks: snapshot.departmentBlocks,
     departmentBlockBalances: snapshot.departmentBlockBalances,
   };
+  loadedAt = performance.now();
 }
 
 export function clearCache(): void {
   cachedSnapshot = EMPTY_CACHE;
+  loadedAt = null;
 }

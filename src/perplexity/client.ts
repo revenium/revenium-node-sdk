@@ -1,9 +1,13 @@
 import OpenAI from "openai";
 import { Config } from "../_core/types/index.js";
-import { getConfig, setConfig, initializeConfig } from "../_core/config/manager.js";
+import { setConfig } from "../_core/config/manager.js";
+import { loadEnvFiles } from "../_core/config/loader.js";
 import { validateConfig } from "../_core/config/validator.js";
-import { snapshotClientConfig } from "../_core/config/client-config.js";
-import { DEFAULT_REVENIUM_BASE_URL } from "../_core/constants.js";
+import {
+  applyDefined,
+  snapshotClientConfig,
+  withEnvironmentDefaults,
+} from "../_core/config/client-config.js";
 import { ChatInterface } from "./middleware.js";
 import { resetMeteringWarnings } from "../_core/metering/metering-context.js";
 
@@ -42,31 +46,18 @@ export class ReveniumPerplexity {
 
 let globalClient: ReveniumPerplexity | null = null;
 
-export function Initialize(config?: Partial<PerplexityConfig>): void {
-  let finalConfig: PerplexityConfig;
+function readPerplexityEnvironment(): Partial<PerplexityConfig> {
+  return {
+    perplexityApiKey: process.env.PERPLEXITY_API_KEY,
+    perplexityBaseUrl: process.env.PERPLEXITY_API_BASE_URL || DEFAULT_PERPLEXITY_BASE_URL,
+  };
+}
 
-  if (config) {
-    finalConfig = {
-      reveniumBaseUrl: DEFAULT_REVENIUM_BASE_URL,
-      perplexityBaseUrl: DEFAULT_PERPLEXITY_BASE_URL,
-      debug: false,
-      ...config,
-    } as PerplexityConfig;
-  } else {
-    const envLoaded = initializeConfig();
-    if (!envLoaded) {
-      throw new Error(
-        "Failed to load configuration from environment variables. " +
-          "Ensure REVENIUM_METERING_API_KEY and PERPLEXITY_API_KEY are set.",
-      );
-    }
-    finalConfig = getConfig()! as PerplexityConfig;
-    finalConfig.perplexityApiKey = finalConfig.perplexityApiKey || process.env.PERPLEXITY_API_KEY;
-    finalConfig.perplexityBaseUrl =
-      finalConfig.perplexityBaseUrl ||
-      process.env.PERPLEXITY_API_BASE_URL ||
-      DEFAULT_PERPLEXITY_BASE_URL;
-  }
+export function Initialize(config?: Partial<PerplexityConfig>): void {
+  loadEnvFiles();
+  const finalConfig = withEnvironmentDefaults<PerplexityConfig>(
+    applyDefined(readPerplexityEnvironment(), config ?? {}),
+  );
 
   if (!finalConfig.perplexityApiKey) {
     throw new Error(
@@ -74,7 +65,6 @@ export function Initialize(config?: Partial<PerplexityConfig>): void {
     );
   }
 
-  validateConfig(finalConfig);
   setConfig(finalConfig);
 
   globalClient = new ReveniumPerplexity(finalConfig);

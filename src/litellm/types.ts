@@ -1,5 +1,6 @@
 import type { UsageMetadata } from "../_core/types/index.js";
 import type { CacheCreationTtlBuckets } from "../_core/metering/cache-tokens.js";
+import type { EnforcementCriteria } from "../_core/enforcement/evaluator.js";
 
 export type MessageRole = "system" | "user" | "assistant" | "function" | "tool";
 
@@ -156,6 +157,7 @@ export interface RequestContext {
   body: RequestBody;
   startTime: number;
   metadata?: LiteLLMUsageMetadata;
+  enforcementScope?: EnforcementCriteria;
 }
 
 export interface LiteLLMUsageMetadata extends UsageMetadata {
@@ -182,6 +184,7 @@ export interface LiteLLMConfig {
   teamId?: string;
   capturePrompts?: boolean;
   maxPromptSize?: number;
+  bufferMaxSize?: number;
 }
 
 export interface MiddlewareStatus {

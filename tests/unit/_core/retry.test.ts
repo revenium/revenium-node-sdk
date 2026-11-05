@@ -136,24 +136,20 @@ describe("withRetry", () => {
     expect(calls).toBe(2);
   });
 
-  it("retries on AbortError", async () => {
+  it("does not retry an aborted attempt", async () => {
+    const aborted = Object.assign(new Error("aborted"), { name: "AbortError" });
     let calls = 0;
     const promise = withRetry(() => {
       calls++;
-      if (calls === 1) {
-        const err = new Error("aborted");
-        err.name = "AbortError";
-        throw err;
-      }
-      return Promise.resolve("ok");
+      return Promise.reject(aborted);
     });
 
-    await flushRetries(3);
-    expect(await promise).toBe("ok");
-    expect(calls).toBe(2);
+    await expect(promise).rejects.toBe(aborted);
+    expect(calls).toBe(1);
   });
 
   it("honors Retry-After seconds", async () => {
+    jest.spyOn(Math, "random").mockReturnValue(0);
     let calls = 0;
     const promise = withRetry(() => {
       calls++;
@@ -175,7 +171,30 @@ describe("withRetry", () => {
     expect(calls).toBe(2);
   });
 
+  it("adds jitter on top of Retry-After, never earlier", async () => {
+    jest.spyOn(Math, "random").mockReturnValue(0.5);
+    let calls = 0;
+    const promise = withRetry(() => {
+      calls++;
+      if (calls === 1) throw new HttpError("throttled", 429, 1);
+      return Promise.resolve("ok");
+    });
+
+    await Promise.resolve();
+    jest.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    expect(calls).toBe(1);
+
+    jest.advanceTimersByTime(50);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(await promise).toBe("ok");
+    expect(calls).toBe(2);
+  });
+
   it("clamps Retry-After to 60 seconds", async () => {
+    jest.spyOn(Math, "random").mockReturnValue(0);
     let calls = 0;
     const promise = withRetry(() => {
       calls++;

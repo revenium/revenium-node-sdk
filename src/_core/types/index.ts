@@ -55,6 +55,16 @@ export interface UsageMetadata {
   skill_plugin_name?: string;
   skill_marketplace_name?: string;
   skill_invocation_trigger?: string;
+  effort?: string;
+  promptId?: string;
+  promptLength?: number;
+  querySource?: string;
+  speed?: string;
+  subagentType?: string;
+  prompt_id?: string;
+  prompt_length?: number;
+  query_source?: string;
+  subagent_type?: string;
 }
 
 export type OperationType =
@@ -99,6 +109,8 @@ export interface Logger {
   error(message: string, meta?: Record<string, unknown> | string | unknown): void;
 }
 
+export type PricingTier = "STANDARD" | "BATCH";
+
 export interface ReveniumPayload {
   transactionId: string;
   operationType: OperationType;
@@ -122,6 +134,7 @@ export interface ReveniumPayload {
   stopReason: string;
   isStreamed: boolean;
   timeToFirstToken?: number | undefined;
+  pricingTier?: PricingTier;
   inputTokenCost?: number;
   outputTokenCost?: number;
   totalCost?: number;
@@ -160,6 +173,12 @@ export interface ReveniumPayload {
   skillPluginName?: string;
   skillMarketplaceName?: string;
   skillInvocationTrigger?: string;
+  effort?: string;
+  promptId?: string;
+  promptLength?: number;
+  querySource?: string;
+  speed?: string;
+  subagentType?: string;
   agenticJobId?: string;
   agenticJobName?: string;
   agenticJobType?: string;

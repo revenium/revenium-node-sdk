@@ -3,9 +3,10 @@ import { ToolEventPayload } from "../types/tool-metering.js";
 import { getLogger } from "../config/manager.js";
 import { resolveConfig } from "../config/call-config.js";
 import { buildReveniumUrl } from "../metering/url-builder.js";
-import { DEFAULT_REVENIUM_BASE_URL, API_ENDPOINTS } from "../constants.js";
+import { DEFAULT_REVENIUM_BASE_URL, API_ENDPOINTS, DEFAULT_CONFIG } from "../constants.js";
 import { executeWithMeteringCircuitBreaker } from "../resilience/circuit-breaker.js";
 import { withRetry, HttpError, parseRetryAfter } from "../resilience/retry.js";
+import { withMeteringTimeout } from "../resilience/request-timeout.js";
 import { getMeteringBuffer, shouldBufferError } from "../metering/buffer.js";
 
 export async function sendToolEvent(payload: ToolEventPayload): Promise<void> {
@@ -39,33 +40,28 @@ export async function sendToolEvent(payload: ToolEventPayload): Promise<void> {
     transactionId: payload.transactionId,
   });
 
-  try {
-    await executeWithMeteringCircuitBreaker(async () => {
-      await withRetry(async () => {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10_000);
+  const postOnce = (): Promise<void> =>
+    withMeteringTimeout(async (signal) => {
+      const response = await fetch(url, { method: "POST", headers, body: serializedBody, signal });
 
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: serializedBody,
-          signal: controller.signal,
-        }).finally(() => clearTimeout(timeoutId));
-
-        if (!response.ok) {
-          const responseText = await response.text();
-          logger.error("Tool event API error", {
-            status: response.status,
-            body: responseText,
-          });
-          throw new HttpError(
-            `Revenium tool event API error: ${response.status} ${response.statusText}`,
-            response.status,
-            parseRetryAfter(response.headers.get("Retry-After")),
-          );
-        }
-      });
+      if (!response.ok) {
+        const responseText = await response.text();
+        logger.error("Tool event API error", {
+          status: response.status,
+          body: responseText,
+        });
+        throw new HttpError(
+          `Revenium tool event API error: ${response.status} ${response.statusText}`,
+          response.status,
+          parseRetryAfter(response.headers.get("Retry-After")),
+        );
+      }
     });
+
+  try {
+    await executeWithMeteringCircuitBreaker((isProbe) =>
+      withRetry(postOnce, isProbe ? 0 : DEFAULT_CONFIG.MAX_RETRIES),
+    );
   } catch (error) {
     if (shouldBufferError(error)) {
       getMeteringBuffer().push({ url, headers, body: serializedBody, createdAt: Date.now() });

@@ -3,7 +3,12 @@ import type { FalAudioResult, FalVideoResult } from "./types.js";
 
 const NUMERIC_SECONDS_PATTERN = /^\d+(\.\d+)?s?$/i;
 
-const DURATION_KEYS = ["duration", "duration_seconds", "seconds_total", "total_seconds"] as const;
+export const DURATION_KEYS = [
+  "duration",
+  "duration_seconds",
+  "seconds_total",
+  "total_seconds",
+] as const;
 
 const VIDEO_DEFAULT_DURATIONS: ReadonlyArray<{ pattern: RegExp; seconds: number }> = [
   { pattern: /^fal-ai\/veo3(\/fast)?(\/image-to-video)?$/i, seconds: 8 },

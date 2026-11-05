@@ -58,7 +58,7 @@ describe("background Responses collection through the wrapper client", () => {
   });
 
   function queuedJob(): Record<string, unknown> {
-    return { id: "resp_stub", model: "o4-mini", status: "queued" };
+    return { id: "resp_stub", model: "o4-mini", status: "queued", output: [] };
   }
 
   function completedJob(): Record<string, unknown> {
@@ -91,6 +91,31 @@ describe("background Responses collection through the wrapper client", () => {
         inputTokenCount: 333,
         outputTokenCount: 44,
       }),
+      expect.anything(),
+    );
+  });
+
+  it("meters a background parse only when it is collected", async () => {
+    mockProviderResponses.create.mockResolvedValue(queuedJob());
+    mockProviderResponses.retrieve.mockResolvedValue(completedJob());
+
+    await client.responses().parse({ model: "o4-mini", input: "hello", background: true });
+    await flushPromises();
+
+    expect(mockProviderResponses.create).toHaveBeenCalledTimes(1);
+    expect(sendToRevenium).not.toHaveBeenCalled();
+
+    await client.responses().retrieve("resp_stub");
+    await flushPromises();
+
+    expect(sendToRevenium).toHaveBeenCalledTimes(1);
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({
+        transactionId: "resp_stub",
+        inputTokenCount: 333,
+        outputTokenCount: 44,
+      }),
+      expect.anything(),
     );
   });
 
@@ -102,6 +127,7 @@ describe("background Responses collection through the wrapper client", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ reasoningTokenCount: 20, cacheReadTokenCount: 100 }),
+      undefined,
     );
   });
 
@@ -127,7 +153,10 @@ describe("background Responses collection through the wrapper client", () => {
     await client.responses().retrieve("resp_stub");
     await flushPromises();
 
-    expect(sendToRevenium).toHaveBeenCalledWith(expect.objectContaining({ agenticJobId: "job_1" }));
+    expect(sendToRevenium).toHaveBeenCalledWith(
+      expect.objectContaining({ agenticJobId: "job_1" }),
+      expect.anything(),
+    );
   });
 
   it("reuses the captured input of the creation call at collection", async () => {
@@ -148,6 +177,7 @@ describe("background Responses collection through the wrapper client", () => {
         inputMessages: expect.stringContaining("hello"),
         outputResponse: expect.stringContaining("the answer"),
       }),
+      expect.anything(),
     );
   });
 
@@ -167,6 +197,7 @@ describe("background Responses collection through the wrapper client", () => {
         requestTime: "2026-10-14T10:00:00.000Z",
         requestDuration: 30000,
       }),
+      undefined,
     );
   });
 
@@ -189,6 +220,7 @@ describe("background Responses collection through the wrapper client", () => {
     expect(sendToRevenium).toHaveBeenCalledTimes(1);
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ transactionId: "resp_stub" }),
+      expect.anything(),
     );
   });
 
@@ -207,6 +239,7 @@ describe("background Responses collection through the wrapper client", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ organizationName: "org_1", traceId: "trace_1" }),
+      expect.anything(),
     );
   });
 });

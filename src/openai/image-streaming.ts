@@ -3,6 +3,7 @@ import type { Config, UsageMetadata } from "../_core/types/index.js";
 import { runWithCallConfig } from "../_core/config/call-config.js";
 import type { ImageOperationSubtype } from "../_core/metering/operation-subtype.js";
 import type { ImagePayloadExtra } from "../_core/metering/payload-builder.js";
+import type { EnforcementCriteria } from "../_core/enforcement/evaluator.js";
 import type { ProviderInfo } from "./provider-detection.js";
 import { ERROR_STOP_REASON } from "../_core/stop-reason-mapper.js";
 
@@ -20,6 +21,7 @@ type ImageStreamTracker = (
   providerInfo: ProviderInfo,
   metadata: UsageMetadata | undefined,
   extra: ImagePayloadExtra,
+  enforcementScope: EnforcementCriteria,
 ) => void;
 
 const COMPLETED_EVENT_TYPES = new Set(["image_generation.completed", "image_edit.completed"]);
@@ -48,6 +50,7 @@ export function instrumentImageStream(
   config: Config,
   providerInfo: ProviderInfo,
   metadata: UsageMetadata | undefined,
+  enforcementScope: EnforcementCriteria,
   track: ImageStreamTracker,
 ): AsyncIterable<ImageStreamEvent> {
   const providerStream = stream as { iterator?: () => AsyncIterator<ImageStreamEvent> };
@@ -61,6 +64,7 @@ export function instrumentImageStream(
       config,
       providerInfo,
       metadata,
+      enforcementScope,
       track,
     );
   }
@@ -78,6 +82,7 @@ export function instrumentImageStream(
       config,
       providerInfo,
       metadata,
+      enforcementScope,
       track,
     );
   };
@@ -93,6 +98,7 @@ async function* meterImageStream(
   config: Config,
   providerInfo: ProviderInfo,
   metadata: UsageMetadata | undefined,
+  enforcementScope: EnforcementCriteria,
   track: ImageStreamTracker,
 ): AsyncGenerator<ImageStreamEvent> {
   const reportedTokens = { input: 0, output: 0, total: 0 };
@@ -119,6 +125,7 @@ async function* meterImageStream(
           timeToFirstToken: firstImageTime ? firstImageTime - startTime : undefined,
           tokens: usageReported ? { ...reportedTokens } : { ...UNREPORTED_TOKENS },
         },
+        enforcementScope,
       ),
     );
 

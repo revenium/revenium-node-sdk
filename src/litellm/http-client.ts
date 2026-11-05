@@ -7,9 +7,11 @@ import {
   extractMetadataFromHeaders,
   mergeCallMetadata,
   extractUsageFromResponse,
+  buildLiteLLMEnforcementCriteria,
   MIDDLEWARE_SOURCE,
 } from "./tracking.js";
 import { claimMetering, getCallUsageMetadata } from "../_core/metering/metering-context.js";
+import { enforceCostControls } from "../_core/enforcement/evaluator.js";
 import { StreamingResponseParser } from "./sse-parser.js";
 import type {
   LiteLLMConfig,
@@ -79,19 +81,12 @@ async function parseRequestBody<T>(requestContext: RequestContext): Promise<T | 
   }
 }
 
-function extractRequestBody(
-  requestContext: RequestContext,
-): LiteLLMChatCompletionRequest | undefined {
+function extractRequestBody(body: RequestBody): LiteLLMChatCompletionRequest | undefined {
   try {
-    if (typeof requestContext.body === "string") {
-      return JSON.parse(requestContext.body);
-    } else if (
-      typeof requestContext.body === "object" &&
-      requestContext.body !== null &&
-      "model" in requestContext.body &&
-      "messages" in requestContext.body
-    ) {
-      return requestContext.body as unknown as LiteLLMChatCompletionRequest;
+    if (typeof body === "string") {
+      return JSON.parse(body);
+    } else if (typeof body === "object" && body !== null && "model" in body && "messages" in body) {
+      return body as unknown as LiteLLMChatCompletionRequest;
     }
   } catch {
     // skip
@@ -111,7 +106,7 @@ async function handleNonStreamingResponse(
   try {
     const responseData = (await response.json()) as LiteLLMChatCompletionResponse;
     const usage = extractUsageFromResponse(responseData, model);
-    const requestBody = extractRequestBody(requestContext);
+    const requestBody = extractRequestBody(requestContext.body);
 
     trackUsageAsync({
       ...usage,
@@ -123,6 +118,7 @@ async function handleNonStreamingResponse(
       responseFormat,
       request: requestBody,
       response: responseData,
+      enforcementScope: requestContext.enforcementScope,
     });
   } catch (error) {
     logger.error("Error processing non-streaming response", {
@@ -141,7 +137,7 @@ async function handleStreamingResponse(
   responseFormat?: any,
 ): Promise<void> {
   const logger = getLogger();
-  const requestBody = extractRequestBody(requestContext);
+  const requestBody = extractRequestBody(requestContext.body);
 
   if (!response.body) {
     trackUsageAsync({
@@ -157,6 +153,7 @@ async function handleStreamingResponse(
       timeToFirstToken: duration,
       responseFormat,
       request: requestBody,
+      enforcementScope: requestContext.enforcementScope,
     });
     return;
   }
@@ -190,6 +187,7 @@ async function handleStreamingResponse(
       timeToFirstToken: duration,
       responseFormat,
       request: requestBody,
+      enforcementScope: requestContext.enforcementScope,
     });
   }
 }
@@ -213,6 +211,7 @@ async function handleEmbeddingResponse(
       totalTokens: usage.total_tokens,
       duration,
       usageMetadata: requestContext.metadata,
+      enforcementScope: requestContext.enforcementScope,
     });
   } catch (error) {
     logger.error("Error processing embeddings response", {
@@ -299,17 +298,26 @@ function createPatchedFetch(): typeof fetch {
     }
 
     const rawHeaders = init?.headers ? Object.fromEntries(new Headers(init.headers)) : {};
+    const body = (init?.body as RequestBody) || null;
+    const metadata = withOrganizationDefaults(
+      mergeCallMetadata(extractMetadataFromHeaders(rawHeaders), getCallUsageMetadata()),
+      litellmConfig,
+    );
+
+    const enforcementScope = buildLiteLLMEnforcementCriteria(
+      metadata,
+      extractRequestBody(body)?.model || "unknown",
+    );
+    await enforceCostControls(enforcementScope);
 
     const requestContext: RequestContext = {
       url,
       method: init?.method || "GET",
       headers: rawHeaders,
-      body: (init?.body as RequestBody) || null,
+      body,
       startTime: Date.now(),
-      metadata: withOrganizationDefaults(
-        mergeCallMetadata(extractMetadataFromHeaders(rawHeaders), getCallUsageMetadata()),
-        litellmConfig,
-      ),
+      metadata,
+      enforcementScope,
     };
 
     const callConfig = resolveConfig();

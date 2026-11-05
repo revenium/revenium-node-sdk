@@ -7,6 +7,10 @@ import { mapStopReason } from "../_core/stop-reason-mapper.js";
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import { extractPrompts } from "../_core/prompt/extraction.js";
 import {
+  buildEnforcementCriteria,
+  type EnforcementCriteria,
+} from "../_core/enforcement/evaluator.js";
+import {
   getEnvironment,
   getRegion,
   getCredentialAlias,
@@ -19,7 +23,11 @@ import {
   getTicketId,
   normalizeTicketId,
 } from "../_core/metadata/trace-fields.js";
-import { resolveSkillFields, resolveAgenticJobFields } from "../_core/metadata/metadata-builder.js";
+import {
+  resolveSkillFields,
+  resolveAgenticJobFields,
+  resolvePromptContextFields,
+} from "../_core/metadata/metadata-builder.js";
 import { extractModelSource, extractProvider, extractModelName } from "./provider-mapper.js";
 import { extractUsageTokens, resolveMeteredModel, type ExtractedUsageTokens } from "./usage.js";
 import type { ReveniumPayload, Subscriber, UsageMetadata } from "../_core/types/index.js";
@@ -48,6 +56,17 @@ function buildSubscriber(metadata?: LiteLLMUsageMetadata): Subscriber | undefine
   return Object.keys(subscriber).length ? subscriber : undefined;
 }
 
+export function buildLiteLLMEnforcementCriteria(
+  metadata: LiteLLMUsageMetadata | undefined,
+  requestedModel: string,
+): EnforcementCriteria {
+  return buildEnforcementCriteria(
+    { ...metadata, subscriber: buildSubscriber(metadata) },
+    extractModelName(requestedModel),
+    extractProvider(requestedModel),
+  );
+}
+
 export async function sendReveniumMetrics(
   data: ExtractedUsageTokens & {
     requestId: string;
@@ -61,6 +80,7 @@ export async function sendReveniumMetrics(
     responseFormat?: any;
     request?: LiteLLMChatCompletionRequest;
     response?: LiteLLMChatCompletionResponse;
+    enforcementScope?: EnforcementCriteria;
   },
 ): Promise<void> {
   const logger = getLogger();
@@ -161,6 +181,7 @@ export async function sendReveniumMetrics(
     ...resolveAgenticJobFields(data.usageMetadata),
     ticketId: data.usageMetadata?.ticketId || getTicketId() || undefined,
     ...resolveSkillFields(data.usageMetadata),
+    ...resolvePromptContextFields(data.usageMetadata),
     attributes: Object.keys(attributes).length > 0 ? attributes : undefined,
     systemPrompt: promptData?.systemPrompt,
     inputMessages: promptData?.inputMessages,
@@ -169,7 +190,7 @@ export async function sendReveniumMetrics(
   };
 
   try {
-    await sendToRevenium(payload);
+    await sendToRevenium(payload, data.enforcementScope);
   } finally {
     printUsageSummary(payload);
   }
@@ -206,6 +227,7 @@ export function trackEmbeddingsUsageAsync(data: {
   totalTokens: number;
   duration: number;
   usageMetadata?: LiteLLMUsageMetadata;
+  enforcementScope?: EnforcementCriteria;
 }): void {
   trackUsageAsync({
     ...data,
@@ -217,11 +239,17 @@ export function trackEmbeddingsUsageAsync(data: {
   });
 }
 
-function parseRetryNumber(value?: string): number | undefined {
+function parseIntegerHeader(value?: string): number | undefined {
   if (!value) return undefined;
 
-  const retryNumber = Number.parseInt(value, 10);
-  return Number.isInteger(retryNumber) ? retryNumber : undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) ? parsed : undefined;
+}
+
+function parseStrictIntegerHeader(value?: string): number | undefined {
+  if (!value) return undefined;
+
+  return /^\d+$/.test(value.trim()) ? Number(value) : Number.NaN;
 }
 
 export function mergeCallMetadata(
@@ -252,7 +280,7 @@ export function extractMetadataFromHeaders(headers: Record<string, string>): Lit
     subscriberCredential: headers["x-revenium-subscriber-credential"],
     environment: headers["x-revenium-environment"],
     operationSubtype: headers["x-revenium-operation-subtype"],
-    retryNumber: parseRetryNumber(headers["x-revenium-retry-number"]),
+    retryNumber: parseIntegerHeader(headers["x-revenium-retry-number"]),
     parentTransactionId: headers["x-revenium-parent-transaction-id"],
     transactionName: headers["x-revenium-transaction-name"],
     region: headers["x-revenium-region"],
@@ -270,6 +298,12 @@ export function extractMetadataFromHeaders(headers: Record<string, string>): Lit
     skillPluginName: headers["x-revenium-skill-plugin-name"],
     skillMarketplaceName: headers["x-revenium-skill-marketplace-name"],
     skillInvocationTrigger: headers["x-revenium-skill-invocation-trigger"],
+    effort: headers["x-revenium-effort"],
+    promptId: headers["x-revenium-prompt-id"],
+    promptLength: parseStrictIntegerHeader(headers["x-revenium-prompt-length"]),
+    querySource: headers["x-revenium-query-source"],
+    speed: headers["x-revenium-speed"],
+    subagentType: headers["x-revenium-subagent-type"],
     capturePrompts: headers["x-revenium-capture-prompts"]
       ? headers["x-revenium-capture-prompts"].toLowerCase() === "true"
       : undefined,

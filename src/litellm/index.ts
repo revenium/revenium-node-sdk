@@ -75,6 +75,7 @@ function toSharedConfig(config: LiteLLMConfig): ReveniumConfig {
     maxPromptSize: config.maxPromptSize,
     failSilent: config.failSilent,
     maxRetries: config.maxRetries,
+    bufferMaxSize: config.bufferMaxSize,
   });
 }
 

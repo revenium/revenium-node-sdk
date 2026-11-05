@@ -1,9 +1,9 @@
 import OpenAI, { AzureOpenAI } from "openai";
 import { Config } from "../_core/types/index.js";
-import { getLogger, getConfig, setConfig, initializeConfig } from "../_core/config/manager.js";
+import { getLogger, setConfig } from "../_core/config/manager.js";
+import { loadEnvFiles } from "../_core/config/loader.js";
 import { validateConfig } from "../_core/config/validator.js";
-import { snapshotClientConfig } from "../_core/config/client-config.js";
-import { DEFAULT_REVENIUM_BASE_URL } from "../_core/constants.js";
+import { snapshotClientConfig, withEnvironmentDefaults } from "../_core/config/client-config.js";
 import { startEnforcementPolling, stopEnforcementPolling } from "../_core/enforcement/engine.js";
 import {
   ChatInterface,
@@ -14,6 +14,7 @@ import {
   AudioTranslationsInterface,
   AudioSpeechInterface,
 } from "./middleware.js";
+import { DecisionsInterface } from "./decisions.js";
 import { Provider, ProviderInfo, detectProviderFromConfig } from "./provider-detection.js";
 import { AzureConfig, loadAzureConfigFromEnv } from "./azure-config.js";
 import { resetMeteringWarnings } from "../_core/metering/metering-context.js";
@@ -100,6 +101,10 @@ export class ReveniumOpenAI {
     };
   }
 
+  decisions(): DecisionsInterface {
+    return new DecisionsInterface(this.client, this.config, this.providerInfo);
+  }
+
   getUnderlyingClient(): OpenAI | AzureOpenAI {
     return this.client;
   }
@@ -116,31 +121,10 @@ export class ReveniumOpenAI {
 let globalClient: ReveniumOpenAI | null = null;
 
 export function Initialize(config?: Partial<OpenAIConfig>): void {
-  let finalConfig: OpenAIConfig;
-
-  if (config) {
-    finalConfig = {
-      reveniumBaseUrl: DEFAULT_REVENIUM_BASE_URL,
-      debug: false,
-      ...config,
-    } as OpenAIConfig;
-  } else {
-    const envLoaded = initializeConfig();
-    if (!envLoaded) {
-      throw new Error(
-        "Failed to load configuration from environment variables. " +
-          "Ensure REVENIUM_METERING_API_KEY and OPENAI_API_KEY are set.",
-      );
-    }
-    finalConfig = getConfig()! as OpenAIConfig;
-
-    const azureConfig = loadAzureConfigFromEnv();
-    if (azureConfig) {
-      finalConfig.azure = azureConfig;
-    }
-  }
-
-  validateConfig(finalConfig);
+  loadEnvFiles();
+  const finalConfig = withEnvironmentDefaults<OpenAIConfig>(
+    config ?? { azure: loadAzureConfigFromEnv() ?? undefined },
+  );
   setConfig(finalConfig);
 
   const providerInfo = detectProviderFromConfig(finalConfig);

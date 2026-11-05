@@ -2,9 +2,15 @@ import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
 import { Stream } from "@anthropic-ai/sdk/streaming";
 import { randomUUID } from "crypto";
 import { getLogger, getConfig } from "../_core/config/manager.js";
-import { Config, ReveniumConfig } from "../_core/types/index.js";
+import { Config, PricingTier, ReveniumConfig, UsageMetadata } from "../_core/types/index.js";
 import { runWithCallConfig } from "../_core/config/call-config.js";
 import { shouldCapturePrompts } from "../_core/prompt/extraction.js";
+import {
+  buildEnforcementCriteria,
+  enforcePreCallRules,
+  type EnforcementCriteria,
+} from "../_core/enforcement/evaluator.js";
+import { waitForInitialRules } from "../_core/enforcement/engine.js";
 import {
   trackUsageAsync,
   extractUsageFromResponse,
@@ -15,6 +21,7 @@ import {
   AnthropicUsageCounts,
 } from "./middleware.js";
 import { AnthropicProvider, detectAnthropicProvider } from "./provider-detection.js";
+import { instrumentBatchResults } from "./batch-results.js";
 
 type AnthropicConfigExtras = Config & { anthropicApiKey?: string };
 
@@ -22,7 +29,17 @@ interface PatchingContext {
   originalMethods: Record<string, any>;
   messagesPrototype?: any;
   betaMessagesPrototype?: any;
+  batchesPrototype?: any;
+  betaBatchesPrototype?: any;
   isPatched: boolean;
+}
+
+type BatchResultsKey = "batchResults" | "betaBatchResults";
+
+interface BatchRead {
+  endedAt: Date;
+  usageMetadata?: UsageMetadata;
+  config: ReveniumConfig | null;
 }
 
 interface AnthropicCallContext {
@@ -34,6 +51,9 @@ interface AnthropicCallContext {
   requestBody: any;
   provider: AnthropicProvider;
   config: ReveniumConfig | null;
+  enforcementScope: EnforcementCriteria;
+  pricingTier?: PricingTier;
+  responseTime?: Date;
 }
 
 const patchingContext: PatchingContext = {
@@ -86,6 +106,31 @@ function getBetaMessagesPrototype(): any {
   }
 }
 
+function getBatchesPrototype(messagesPrototype: any): any {
+  return messagesPrototype?.constructor?.Batches?.prototype;
+}
+
+function patchBatchResults(prototype: any, originalKey: BatchResultsKey): any {
+  if (typeof prototype?.results !== "function") {
+    getLogger().debug("Anthropic batch results surface unavailable, skipping batch metering", {
+      surface: originalKey,
+    });
+    return undefined;
+  }
+
+  patchingContext.originalMethods[originalKey] = prototype.results;
+  prototype.results = function (
+    this: any,
+    messageBatchID: string,
+    params?: any,
+    options?: any,
+  ): Promise<any> {
+    return patchedBatchResultsMethod.call(this, originalKey, messageBatchID, params, options);
+  };
+
+  return prototype;
+}
+
 export function patchAnthropic(): void {
   const logger = getLogger();
 
@@ -128,6 +173,15 @@ export function patchAnthropic(): void {
     logger.debug("Anthropic beta messages surface unavailable, metering regular messages only");
   }
 
+  patchingContext.batchesPrototype = patchBatchResults(
+    getBatchesPrototype(messagesPrototype),
+    "batchResults",
+  );
+  patchingContext.betaBatchesPrototype = patchBatchResults(
+    getBatchesPrototype(betaMessagesPrototype),
+    "betaBatchResults",
+  );
+
   patchingContext.isPatched = true;
   logger.info("Anthropic SDK patched successfully");
 }
@@ -137,7 +191,13 @@ export function unpatchAnthropic(): void {
 
   if (!patchingContext.isPatched) return;
 
-  const { messagesPrototype, betaMessagesPrototype, originalMethods } = patchingContext;
+  const {
+    messagesPrototype,
+    betaMessagesPrototype,
+    batchesPrototype,
+    betaBatchesPrototype,
+    originalMethods,
+  } = patchingContext;
 
   if (messagesPrototype && originalMethods.create) {
     messagesPrototype.create = originalMethods.create;
@@ -151,10 +211,20 @@ export function unpatchAnthropic(): void {
     betaMessagesPrototype.create = originalMethods.betaCreate;
   }
 
+  if (batchesPrototype && originalMethods.batchResults) {
+    batchesPrototype.results = originalMethods.batchResults;
+  }
+
+  if (betaBatchesPrototype && originalMethods.betaBatchResults) {
+    betaBatchesPrototype.results = originalMethods.betaBatchResults;
+  }
+
   patchingContext.isPatched = false;
   patchingContext.originalMethods = {};
   patchingContext.messagesPrototype = undefined;
   patchingContext.betaMessagesPrototype = undefined;
+  patchingContext.batchesPrototype = undefined;
+  patchingContext.betaBatchesPrototype = undefined;
   logger.info("Anthropic SDK unpatched successfully");
 }
 
@@ -163,15 +233,36 @@ export function isAnthropicPatched(): boolean {
 }
 
 function createCallContext(resource: any, params: any): AnthropicCallContext {
+  const metadata = params.usageMetadata || {};
+  const provider = detectAnthropicProvider(resource._client?.baseURL);
   return {
     requestId: randomUUID(),
     requestModel: params.model,
-    metadata: params.usageMetadata || {},
+    metadata,
     requestTime: new Date(),
     startTime: Date.now(),
     requestBody: params,
-    provider: detectAnthropicProvider(resource._client?.baseURL),
+    provider,
     config: getConfig(),
+    enforcementScope: buildEnforcementCriteria(metadata, params.model, provider),
+  };
+}
+
+function createBatchEntryContext(
+  resource: any,
+  message: any,
+  read: BatchRead,
+): AnthropicCallContext {
+  return {
+    ...createCallContext(resource, { model: message.model, usageMetadata: read.usageMetadata }),
+    requestId: message.id,
+    requestTime: read.endedAt,
+    startTime: read.endedAt.getTime(),
+    responseTime: read.endedAt,
+    requestBody: undefined,
+    config: read.config,
+    pricingTier: "BATCH",
+    metadata: { ...read.usageMetadata, idempotencyKey: `anthropic-batch-${message.id}` },
   };
 }
 
@@ -185,6 +276,7 @@ function buildTrackingData(
     timeToFirstToken?: number;
   },
 ): AnthropicTrackingData {
+  const responseTime = context.responseTime ?? new Date();
   return {
     requestId: context.requestId,
     model: details.model,
@@ -195,22 +287,24 @@ function buildTrackingData(
     cacheCreation5mTokens: usage.cacheCreation5mTokens,
     cacheCreation1hTokens: usage.cacheCreation1hTokens,
     reasoningTokens: usage.reasoningTokens,
-    duration: Date.now() - context.startTime,
+    duration: responseTime.getTime() - context.startTime,
     isStreamed: details.isStreamed,
     stopReason: usage.stopReason,
     metadata: context.metadata,
     requestTime: context.requestTime,
-    responseTime: new Date(),
+    responseTime,
     timeToFirstToken: details.timeToFirstToken,
-    hasVisionContent: detectVisionContent(context.requestBody),
+    pricingTier: context.pricingTier,
+    hasVisionContent: context.requestBody ? detectVisionContent(context.requestBody) : undefined,
     requestBody: context.requestBody,
     response: details.response,
     provider: context.provider,
+    enforcementScope: context.enforcementScope,
   };
 }
 
-function meterMessage(response: any, context: AnthropicCallContext): any {
-  runWithCallConfig(context.config, () =>
+function trackMessage(response: any, context: AnthropicCallContext): Promise<void> {
+  return runWithCallConfig(context.config, () =>
     trackUsageAsync(
       buildTrackingData(context, extractUsageFromResponse(response), {
         model: response?.model ?? context.requestModel,
@@ -219,6 +313,10 @@ function meterMessage(response: any, context: AnthropicCallContext): any {
       }),
     ),
   );
+}
+
+function meterMessage(response: any, context: AnthropicCallContext): any {
+  void trackMessage(response, context);
   return response;
 }
 
@@ -349,7 +447,9 @@ async function patchedCreateMethod(this: any, params: any, options?: any): Promi
   const originalCreate = patchingContext.originalMethods.create;
   if (!originalCreate) throw new Error("Original create method not available");
 
+  await waitForInitialRules();
   const context = createCallContext(this, params);
+  enforcePreCallRules(context.enforcementScope);
   const { usageMetadata: _, ...cleanParams } = params;
 
   let response: any;
@@ -508,11 +608,35 @@ function patchedBetaCreateMethod(this: any, params: any, options?: any): any {
   if (!originalBetaCreate) throw new Error("Original beta create method not available");
 
   const context = createCallContext(this, params);
+  enforcePreCallRules(context.enforcementScope);
   const { usageMetadata: _, ...cleanParams } = params;
 
   return instrumentBetaPromise(
     originalBetaCreate.call(this, cleanParams, options),
     createBetaMetering(context, !!params.stream),
+  );
+}
+
+async function patchedBatchResultsMethod(
+  this: any,
+  originalKey: BatchResultsKey,
+  messageBatchID: string,
+  params?: any,
+  options?: any,
+): Promise<any> {
+  const { usageMetadata, ...cleanParams } = params ?? {};
+  const config = getConfig();
+  const batch = await this.retrieve(messageBatchID, cleanParams, options);
+  const read: BatchRead = { endedAt: new Date(batch.ended_at), usageMetadata, config };
+  const decoder = await patchingContext.originalMethods[originalKey].call(
+    this,
+    messageBatchID,
+    cleanParams,
+    options,
+  );
+
+  return instrumentBatchResults(decoder, (message) =>
+    trackMessage(message, createBatchEntryContext(this, message, read)),
   );
 }
 
@@ -539,6 +663,7 @@ function patchedStreamMethod(this: any, params: any, options?: any): any {
   if (!originalStream) throw new Error("Original stream method not available");
 
   const context = createCallContext(this, params);
+  enforcePreCallRules(context.enforcementScope);
   const { usageMetadata: _, ...cleanParams } = params;
 
   const unpatchedResource = Object.create(this, {

@@ -1,6 +1,14 @@
-import { createReveniumConfig } from "./fixtures";
+import {
+  createJsonResponse,
+  createReveniumConfig,
+  drain,
+  installRoutingFetch,
+  REVENIUM_BASE_URL,
+  settle,
+  waitForMetering,
+  type MeteringBody,
+} from "./fixtures";
 
-export const REVENIUM_BASE_URL = "https://api.revenium.ai";
 export const DIRECT_BASE_URL = "https://api.anthropic.com";
 export const MODEL = "claude-3-5-sonnet-20241022";
 export const REQUEST = {
@@ -36,7 +44,6 @@ const SSE_EVENTS = [
   { type: "message_stop" },
 ];
 
-type MeteringBody = Record<string, unknown>;
 type AnthropicModule = typeof import("@anthropic-ai/sdk").default;
 type AnthropicClient = InstanceType<AnthropicModule>;
 
@@ -46,10 +53,7 @@ export interface MeteringResult {
 }
 
 export function jsonResponse(): Response {
-  return new Response(JSON.stringify(MESSAGE_RESPONSE), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  return createJsonResponse(MESSAGE_RESPONSE);
 }
 
 export function sseResponse(): Response {
@@ -60,38 +64,6 @@ export function sseResponse(): Response {
     status: 200,
     headers: { "content-type": "text/event-stream" },
   });
-}
-
-export function installRoutingFetch(providerResponse: () => Response): MeteringBody[] {
-  const meteringBodies: MeteringBody[] = [];
-  global.fetch = jest.fn(async (url: unknown, init?: RequestInit) => {
-    if (String(url).startsWith(REVENIUM_BASE_URL)) {
-      meteringBodies.push(JSON.parse(String(init?.body)));
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-    }
-    return providerResponse();
-  }) as unknown as typeof fetch;
-  return meteringBodies;
-}
-
-export async function waitForMetering(bodies: MeteringBody[]): Promise<MeteringBody> {
-  for (let attempt = 0; attempt < 100 && bodies.length === 0; attempt++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  if (bodies.length === 0) throw new Error("Timed out waiting for a metering request");
-  return bodies[0];
-}
-
-export async function settle(): Promise<void> {
-  for (let tick = 0; tick < 20; tick++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
-
-export async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
-  for await (const chunk of iterable) {
-    void chunk;
-  }
 }
 
 export function differingKeys(left: MeteringBody, right: MeteringBody): string[] {

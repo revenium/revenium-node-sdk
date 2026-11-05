@@ -3,13 +3,11 @@ import {
   MODEL,
   REQUEST,
   differingKeys,
-  installRoutingFetch,
   jsonResponse,
-  settle,
   setupAnthropicMetering,
   sseResponse,
-  waitForMetering,
 } from "../../helpers/anthropic-metering";
+import { installRoutingFetch, settle, waitForMetering } from "../../helpers/fixtures";
 
 const FOUNDRY_BASE_URL = "https://my-resource.services.ai.azure.com/anthropic";
 

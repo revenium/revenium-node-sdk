@@ -16,8 +16,8 @@ A professional-grade Node.js middleware that integrates with OpenAI, Azure OpenA
 - **Go-Aligned API** - Consistent `Initialize()` / `GetClient()` pattern across providers
 - **Sub-Path Imports** - Tree-shakeable `@revenium/middleware/openai`, `/anthropic`, etc.
 - **Tool Metering** - Track custom tool and external API calls with `meterTool()` and `reportToolCall()`
-- **Fire-and-Forget** - Metering never blocks your application flow
-- **Streaming Support** - Handles regular and streaming requests for all providers
+- **Fire-and-Forget** - Metering never blocks your application flow, except the Anthropic batch results loop, which waits while 32 records are still being delivered
+- **Streaming Support** - Handles regular and streaming requests for all providers, for the calls made through the clients the SDK wraps; each provider section lists the calls that are not metered
 - **ESM + CJS** - Dual output with full TypeScript type definitions
 - **Automatic .env Loading** - Reads `.env.local` and `.env` from your application's working directory, with no extra dependency. Real environment variables always win; files outside the working directory are never read
 
@@ -29,8 +29,8 @@ A professional-grade Node.js middleware that integrates with OpenAI, Azure OpenA
 | Azure OpenAI     | `@revenium/middleware/openai`        | `Initialize()` / `GetClient()` (auto-detected)              |
 | Anthropic        | `@revenium/middleware/anthropic`     | `initialize()` / `configure()` / auto-init on import        |
 | Foundry          | `@revenium/middleware/anthropic`     | Same as Anthropic (auto-detected from the base URL)         |
-| Google GenAI     | `@revenium/middleware/google/genai`  | `GoogleGenAIController` / `configure()` / init on first use |
-| Google Vertex AI | `@revenium/middleware/google/vertex` | `VertexAIController` / `configure()` / init on first use    |
+| Google GenAI     | `@revenium/middleware/google/genai`  | Your `GoogleGenAI` client / `configure()` / patch on import |
+| Google Vertex AI | `@revenium/middleware/google/vertex` | Your `GoogleGenAI` client / `configure()` / patch on import |
 | Perplexity       | `@revenium/middleware/perplexity`    | `Initialize()` / `GetClient()`                              |
 | LiteLLM          | `@revenium/middleware/litellm`       | `initialize()` / `configure()` / `enable()` / `disable()`   |
 | fal.ai           | `@revenium/middleware/fal`           | `Initialize()` / `GetClient()`                              |
@@ -73,16 +73,21 @@ Plus the API key for your chosen provider (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
 
 ### Quick Start - OpenAI
 
+Ensure `OPENAI_API_KEY` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
+
 ```typescript
 import { Initialize, GetClient } from "@revenium/middleware/openai";
 
 Initialize();
 const client = GetClient();
 
-const response = await client.chat.completions.create({
-  model: "gpt-4o-mini",
-  messages: [{ role: "user", content: "Hello!" }],
-});
+const response = await client
+  .chat()
+  .completions()
+  .create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "Hello!" }],
+  });
 ```
 
 ### Quick Start - Anthropic
@@ -105,14 +110,21 @@ const response = await client.messages.create({
 Ensure `GOOGLE_API_KEY` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
 
 ```typescript
-import { GoogleGenAIController } from "@revenium/middleware/google/genai";
+import "@revenium/middleware/google/genai";
+import { GoogleGenAI } from "@google/genai";
 
-const controller = new GoogleGenAIController();
+const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY });
 
-const response = await controller.createChat(["Hello!"], "gemini-2.0-flash-001");
+const response = await ai.models.generateContent({
+  model: "gemini-2.0-flash-001",
+  contents: "Hello!",
+  usageMetadata: { subscriber: { id: "user-123" } },
+});
 ```
 
 ### Quick Start - Azure OpenAI
+
+Ensure `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
 
 ```typescript
 import { Initialize, GetClient } from "@revenium/middleware/openai";
@@ -120,27 +132,41 @@ import { Initialize, GetClient } from "@revenium/middleware/openai";
 Initialize();
 const client = GetClient();
 
-const response = await client.chat.completions.create({
-  model: "my-deployment-name",
-  messages: [{ role: "user", content: "Hello!" }],
-});
+const response = await client
+  .chat()
+  .completions()
+  .create({
+    model: "my-deployment-name",
+    messages: [{ role: "user", content: "Hello!" }],
+  });
 ```
 
 Azure is auto-detected when `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` are set.
 
 ### Quick Start - Google Vertex AI
 
-Ensure `GOOGLE_CLOUD_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
+Ensure `GOOGLE_CLOUD_PROJECT` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file. Vertex AI signs in with Google Application Default Credentials, so it works as is on Cloud Run, GKE, Compute Engine or after `gcloud auth application-default login`; a service account key file is optional.
 
 ```typescript
-import { VertexAIController } from "@revenium/middleware/google/vertex";
+import "@revenium/middleware/google/vertex";
+import { GoogleGenAI } from "@google/genai";
 
-const controller = new VertexAIController();
+const ai = new GoogleGenAI({
+  vertexai: true,
+  project: process.env.GOOGLE_CLOUD_PROJECT,
+  location: "us-central1",
+});
 
-const response = await controller.createChat(["Hello!"], "gemini-2.0-flash-001");
+const response = await ai.models.generateContent({
+  model: "gemini-2.0-flash-001",
+  contents: "Hello!",
+  usageMetadata: { subscriber: { id: "user-123" } },
+});
 ```
 
 ### Quick Start - Perplexity
+
+Ensure `PERPLEXITY_API_KEY` and `REVENIUM_METERING_API_KEY` are set in your environment or `.env` file.
 
 ```typescript
 import { Initialize, GetClient } from "@revenium/middleware/perplexity";
@@ -148,10 +174,13 @@ import { Initialize, GetClient } from "@revenium/middleware/perplexity";
 Initialize();
 const client = GetClient();
 
-const response = await client.chat.completions.create({
-  model: "sonar",
-  messages: [{ role: "user", content: "Hello!" }],
-});
+const response = await client
+  .chat()
+  .completions()
+  .create({
+    model: "sonar",
+    messages: [{ role: "user", content: "Hello!" }],
+  });
 ```
 
 ### Quick Start - fal.ai
@@ -209,13 +238,61 @@ initialize();
 
 Go-aligned client pattern with Azure auto-detection:
 
-| Function              | Description                                               |
-| --------------------- | --------------------------------------------------------- |
-| `Initialize(config?)` | Initialize middleware from environment or explicit config |
-| `GetClient()`         | Get the wrapped OpenAI client instance                    |
-| `Configure(config)`   | Alias for `Initialize()` for programmatic configuration   |
-| `IsInitialized()`     | Check if middleware is initialized                        |
-| `Reset()`             | Reset the global client (useful for testing)              |
+| Function              | Description                                                                                                                            |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `Initialize(config?)` | Initialize middleware from explicit config; the environment fills the keys it leaves out ([Configuring in code](#configuring-in-code)) |
+| `GetClient()`         | Get the wrapped OpenAI client instance                                                                                                 |
+| `Configure(config)`   | Alias for `Initialize()` for programmatic configuration                                                                                |
+| `IsInitialized()`     | Check if middleware is initialized                                                                                                     |
+| `Reset()`             | Reset the global client (useful for testing)                                                                                           |
+
+**Client Methods:**
+
+| Method                                                                 | Description                                                  |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `chat().completions().create(params, metadata?)`                       | Chat completion                                              |
+| `chat().completions().createStreaming(params, metadata?)`              | Streamed chat completion                                     |
+| `chat().completions().parse(params, metadata?)`                        | Chat completion with structured output                       |
+| `responses().create(params, metadata?)`                                | Responses API call, streamed with `stream: true`             |
+| `responses().createStreaming(params, metadata?)`                       | Streamed Responses API call                                  |
+| `responses().parse(params, metadata?)`                                 | Responses API call with structured output                    |
+| `responses().retrieve(id, metadata?)`                                  | Collect a background response                                |
+| `embeddings().create(params, metadata?)`                               | Embeddings                                                   |
+| `images().generate(params)`, `edit(params)`, `createVariation(params)` | Image generation, edit and variation                         |
+| `audio().transcriptions`, `translations`, `speech` `.create(params)`   | Transcription, translation and text-to-speech                |
+| `decisions().create(params, metadata?)`                                | Decisions API call (requires `openai` >= 7.30.0)             |
+| `getUnderlyingClient()`                                                | Get the raw `OpenAI` or `AzureOpenAI` instance (not metered) |
+
+#### Structured outputs and Decisions
+
+`chat().completions().parse` and `responses().parse` take the same parameters as the `openai`
+methods of the same name, return the same parsed result, and emit one usage record with the
+tokens the provider reported, including reasoning and cached tokens. When the `openai` parser
+throws after the provider answered (`LengthFinishReasonError`, `ContentFilterFinishReasonError`,
+invalid JSON or a failed schema check), the record still carries those tokens and the parse
+error is rethrown. A Responses `parse` with `background: true` is metered when collected with
+`responses().retrieve(id)`, like `create`.
+
+`decisions().create` emits one usage record per call with input, output, reasoning, cached and
+cache-write tokens. The Decisions API exists from `openai` 7.30.0; with an older `openai` the call
+throws `Decisions API not available in this OpenAI SDK version (requires openai >= 7.30.0)`
+before anything is sent. The answers are not captured as response content.
+
+```typescript
+import { Initialize, GetClient } from "@revenium/middleware/openai";
+
+Initialize();
+const client = GetClient();
+
+const decision = await client.decisions().create(
+  {
+    model: "gpt-6-luna",
+    input: "Buy cheap watches now",
+    questions: [{ type: "predicate", name: "is_spam", instructions: "Is this message spam?" }],
+  },
+  { subscriber: { id: "user-123" } },
+);
+```
 
 #### Responses API — background mode
 
@@ -241,6 +318,20 @@ its idempotency store retains the key (24 hours by default). That also covers a 
 response already metered by its own `create` or by its own stream. A job ending `failed` or
 `cancelled` is recorded once with that outcome; a transport failure on `retrieve` is rethrown and
 records nothing, and a failed delivery to Revenium leaves the id collectable again.
+
+Not metered:
+
+- `chat.completions.stream` and `chat.completions.runTools`: use
+  `chat().completions().createStreaming` for streamed chat.
+- `responses.stream`: use `responses().create({ ...params, stream: true })`. `responses.compact`
+  is not metered either.
+- `videos.*` (Sora), `batches.*`, `realtime.*` and `live.*`.
+- `completions.create` (legacy Completions).
+- `beta.threads.runs.*` (Assistants).
+- `beta.responses.*`, `beta.agents.*`, `beta.chatkit.*` and `beta.realtime.*`.
+- `fineTuning.jobs.*`, `fineTuning.alpha.graders.run`, `containers.*` and `evals.runs.*`.
+- Every call made through `getUnderlyingClient()`.
+- `decisions().create` with `openai` older than 7.30.0, which throws instead.
 
 ### Anthropic
 
@@ -271,9 +362,52 @@ as a raw `Response` through `asResponse()`. Compaction iterations reported under
 `usage.iterations` are added to the metered token counts, since the Anthropic beta API excludes
 them from the top-level `usage` fields.
 
+Message Batches are metered when the application iterates `client.messages.batches.results()` or
+`client.beta.messages.batches.results()`: each `succeeded` result produces one record with
+`pricingTier: "BATCH"`, the result's `message.id` as `transactionId` and the tokens of that
+result. Metadata goes in `results(batchId, { usageMetadata })`, not in `requests[].params` of
+`batches.create`, which the Anthropic API rejects with extra fields. Each record carries the
+`Idempotency-Key` `anthropic-batch-<message.id>` and is dated at the batch's `ended_at`, read with
+one extra `batches.retrieve` call, with a `requestDuration` of 0 ms, since the batch exposes no
+per-request timing. Reading the same results again, from this or another process, is deduplicated
+by Revenium for as long as its idempotency store retains the key (24 hours by default); after that,
+reading them again meters them again. At most 32 batch records are sent at once, so the results
+loop waits while 32 are still being delivered. Batch records carry no prompt capture, since the
+batch does not expose the request.
+
+Not metered:
+
+- `client.completions.create` (legacy Text Completions): the response carries no token counts.
+- `client.messages.batches.create` and `client.beta.messages.batches.create`: the batch carries no
+  usage; its tokens are metered through `results()`.
+- Batch results downloaded directly from `results_url` without going through `results()`.
+- `errored`, `canceled` and `expired` batch results, which Anthropic does not bill.
+
 ### Google GenAI / Vertex AI
 
-Controller and service pattern:
+Importing `@revenium/middleware/google/genai` or `@revenium/middleware/google/vertex` meters your own `GoogleGenAI` client, including clients created with `vertexai: true` and clients created before the import. Import the middleware before the first call. Every request sent to Google produces one record, so a `generateContent` call that runs two automatic function calling rounds produces two records, each with the tokens of its own round. `generateContent`, `generateContentStream` and `embedContent` take `usageMetadata` directly; a chat takes it once at creation and applies it to every message:
+
+```typescript
+const chat = ai.chats.create({
+  model: "gemini-2.0-flash-001",
+  usageMetadata: { subscriber: { id: "user-123" } },
+});
+
+await chat.sendMessage({ message: "Hello!" });
+```
+
+Load the middleware and `@google/genai` the same way, both with `import` or both with `require`. Node gives each form its own copy of `@google/genai`, and the middleware meters only the copy that resolves the same way it was loaded, so a `require` of the middleware next to an `import` of `@google/genai`, or the reverse, meters nothing. `isGoogleGenAIPatched(ai)` reports whether your client is metered: it returns `false` for a client from a copy of `@google/genai` the middleware did not patch, and when the installed `@google/genai` lacks a request method the middleware meters. Called without a client, it checks the copy the middleware loaded.
+
+If you already call `trackGoogleUsageAsync()` for requests made on your own `GoogleGenAI` client, remove those calls when you upgrade: the import now meters these requests, and keeping both sends two records per request.
+
+Not metered:
+
+- The Live API (WebSocket sessions).
+- `ai.batches`, `ai.caches` and `ai.interactions`.
+- `generateImages`, `editImage`, `upscaleImage`, `recontextImage`, `segmentImage` and `generateVideos` called on your own client; use the `VertexAIController` image and video methods to meter `generateImages`, `editImage`, `upscaleImage` and `generateVideos`.
+- `@google/genai/web`, the browser build of the SDK.
+
+The controller and service pattern remains available as an alternative:
 
 | Export                                         | Description                           |
 | ---------------------------------------------- | ------------------------------------- |
@@ -288,39 +422,43 @@ Google accepts the same per-call `usageMetadata` as every other provider, includ
 
 Same Go-aligned client pattern as OpenAI:
 
-| Function              | Description                                               |
-| --------------------- | --------------------------------------------------------- |
-| `Initialize(config?)` | Initialize middleware from environment or explicit config |
-| `GetClient()`         | Get the wrapped Perplexity client instance                |
-| `Configure(config)`   | Alias for `Initialize()` for programmatic configuration   |
-| `IsInitialized()`     | Check if middleware is initialized                        |
-| `Reset()`             | Reset the global client (useful for testing)              |
+| Function              | Description                                                                                                                            |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `Initialize(config?)` | Initialize middleware from explicit config; the environment fills the keys it leaves out ([Configuring in code](#configuring-in-code)) |
+| `GetClient()`         | Get the wrapped Perplexity client instance                                                                                             |
+| `Configure(config)`   | Alias for `Initialize()` for programmatic configuration                                                                                |
+| `IsInitialized()`     | Check if middleware is initialized                                                                                                     |
+| `Reset()`             | Reset the global client (useful for testing)                                                                                           |
 
 ### fal.ai
 
 Enterprise wrapper for fal.ai's multi-modal platform (images, video, audio, LLM) with automatic metering:
 
-| Function              | Description                                               |
-| --------------------- | --------------------------------------------------------- |
-| `Initialize(config?)` | Initialize middleware from environment or explicit config |
-| `GetClient()`         | Get the wrapped fal.ai client instance                    |
-| `Configure(config)`   | Alias for `Initialize()` for programmatic configuration   |
-| `IsInitialized()`     | Check if middleware is initialized                        |
-| `Reset()`             | Reset the global client (useful for testing)              |
+| Function              | Description                                                                                                                            |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `Initialize(config?)` | Initialize middleware from explicit config; the environment fills the keys it leaves out ([Configuring in code](#configuring-in-code)) |
+| `GetClient()`         | Get the wrapped fal.ai client instance                                                                                                 |
+| `Configure(config)`   | Alias for `Initialize()` for programmatic configuration                                                                                |
+| `IsInitialized()`     | Check if middleware is initialized                                                                                                     |
+| `Reset()`             | Reset the global client (useful for testing)                                                                                           |
 
 **Client Methods:**
 
-| Method                                          | Description                                                          |
-| ----------------------------------------------- | -------------------------------------------------------------------- |
-| `fal.subscribe(endpointId, options, metadata?)` | Submit to queue and wait for result (recommended for most use cases) |
-| `fal.run(endpointId, options, metadata?)`       | Execute directly and wait for result (low-latency models)            |
-| `fal.stream(endpointId, options, metadata?)`    | Stream partial results (real-time LLM or progress tracking)          |
-| `fal.queue`                                     | Access the underlying queue client directly                          |
-| `fal.realtime`                                  | Access the underlying realtime client directly                       |
-| `fal.storage`                                   | Access the underlying storage client directly                        |
-| `fal.getUnderlyingClient()`                     | Get the raw `FalClient` instance (not metered)                       |
+| Method                                                            | Description                                                                               |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `fal.subscribe(endpointId, options, metadata?)`                   | Submit to queue and wait for result (recommended for most use cases)                      |
+| `fal.run(endpointId, options, metadata?)`                         | Execute directly and wait for result (low-latency models)                                 |
+| `fal.stream(endpointId, options, metadata?)`                      | Stream partial results (real-time LLM or progress tracking)                               |
+| `fal.queue.submit(endpointId, options, metadata?)`                | Submit a job to the queue without waiting; checked against cost controls, sends no record |
+| `fal.queue.result(endpointId, { requestId, input? }, metadata?)`  | Collect a queued job's result; metered once per job                                       |
+| `fal.queue.status`, `streamStatus`, `subscribeToStatus`, `cancel` | The fal.ai queue methods, unchanged (not metered)                                         |
+| `fal.realtime`                                                    | Access the underlying realtime client directly (not metered)                              |
+| `fal.storage`                                                     | Access the underlying storage client directly (not metered)                               |
+| `fal.getUnderlyingClient()`                                       | Get the raw `FalClient` instance (not metered)                                            |
 
 The `metadata` parameter is optional on all methods and enables cost attribution (e.g., `{ subscriber: { id: '...' }, organizationName, traceId }`). It does not affect the fal.ai payload. See [Metadata Fields](#metadata-fields) for all supported options.
+
+**Queued jobs:** `fal.queue.submit` and `fal.queue.status` send nothing; `fal.queue.result` sends one record when the job's result is collected, and collecting the same job again from the same client sends nothing. Metadata passed to `result` overrides the metadata passed to `submit` one top-level field at a time: a `subscriber` passed to `result` replaces the whole `subscriber` passed to `submit`. A job whose result is never collected through `fal.queue.result`, including one delivered only by webhook, is not metered. When another process collects the result, it has neither the `submit` metadata nor the `submit` input: pass the metadata as the third argument and the job's input as `input` in the `result` options. Without that `input`, the billed quantity comes only from the result and the model defaults, so a Kling video submitted with `duration: "10"` is billed as 5 seconds, a per-character TTS job as 0 characters, and the requested image count, `resolution`, `aspect_ratio` and an input `model` are lost; the record's `requestTime` and `requestDuration` then cover only the `result` call, not the job. Each record carries the `Idempotency-Key` `fal-<requestId>`, so Revenium deduplicates a job collected more than once. Each client keeps the metadata of at most 1,000 submitted jobs, and only the input fields used for billing (`model`, `num_images`, `image_size`, `aspect_ratio`, `resolution`, `text`, `prompt`, `input` and the duration fields); since `text`, `prompt` and `input` can all be kept for the same job, the worst case is 1,000 × 3 × the size of the largest of them, about 300 MB with 100 KB prompts. Past 1,000 pending jobs, the oldest job is collected like one from another process, without its `submit` metadata and input.
 
 **Media Type Routing:**
 
@@ -387,6 +525,12 @@ Any request sent through the patched HTTP client can carry attribution as `x-rev
 | `x-revenium-skill-plugin-name`          | `skillPluginName`             |
 | `x-revenium-skill-marketplace-name`     | `skillMarketplaceName`        |
 | `x-revenium-skill-invocation-trigger`   | `skillInvocationTrigger`      |
+| `x-revenium-effort`                     | `effort`                      |
+| `x-revenium-prompt-id`                  | `promptId`                    |
+| `x-revenium-prompt-length`              | `promptLength`                |
+| `x-revenium-query-source`               | `querySource`                 |
+| `x-revenium-speed`                      | `speed`                       |
+| `x-revenium-subagent-type`              | `subagentType`                |
 | `x-revenium-capture-prompts`            | prompt capture toggle         |
 
 Subscriber headers are independent: supplying only an id, or only an email, still attributes the call. A credential is attached only when both the name and the value are supplied.
@@ -474,7 +618,15 @@ All fields are optional and can be set per-request via `usageMetadata`:
 | `skillPluginName`        | string | Plugin that provides the skill                           |
 | `skillMarketplaceName`   | string | Marketplace the skill plugin came from                   |
 | `skillInvocationTrigger` | string | How the skill was invoked (e.g., "user-slash")           |
+| `effort`                 | string | Reasoning effort tag (e.g., "high"), max 16 chars        |
+| `promptId`               | string | Prompt identifier, max 64 chars                          |
+| `promptLength`           | number | Prompt length, integer from 0 to 2147483647              |
+| `querySource`            | string | Where the query came from, max 128 chars                 |
+| `speed`                  | string | Speed tag (e.g., "fast"), max 16 chars                   |
+| `subagentType`           | string | Subagent type that issued the request, max 128 chars     |
 | `operationSubtype`       | string | Overrides the detected image/audio/video subtype         |
+
+`effort`, `promptId`, `promptLength`, `querySource`, `speed` and `subagentType` are sent only on chat and embedding records. `effort`, `speed` and `promptId` accept letters, digits, `_` and `-`; `querySource` and `subagentType` also accept `.` and `:`. A value outside these rules is dropped with a warning naming the field, and the record is still sent. The snake_case aliases `prompt_id`, `prompt_length`, `query_source` and `subagent_type` are also accepted.
 
 A field set to an empty string is sent as an empty string and overrides its environment-variable fallback, so `environment: ""` records an empty environment instead of `REVENIUM_ENVIRONMENT`. The same applies to `region`, `credentialAlias`, `traceType`, `traceName`, `ticketId`, `parentTransactionId` and `transactionName`. Omit the field to keep the fallback.
 
@@ -503,21 +655,23 @@ Environment variables for distributed tracing and analytics:
 
 ## Cost Controls / Enforcement
 
-Per-call enforcement blocks outgoing provider requests when a subscriber has a breached `BLOCK` cost control configured in Revenium. The OpenAI middleware gates both sync and streaming chat completions; other providers will adopt the same gate in follow-up work (unified exception + Anthropic wiring + Node/Python/Go env-var normalization). Enforcement currently covers chat completions only; embeddings, images, and audio are not gated.
+Per-call enforcement blocks outgoing provider requests when a subscriber has a breached `BLOCK` cost control configured in Revenium. Every call that produces a metering record is gated, for every provider: OpenAI and Azure OpenAI chat (sync and streaming), embeddings, images, audio and the Responses API; Anthropic `messages.create`, `messages.stream` and `beta.messages.create`; Perplexity chat; Google AI and Vertex AI chat, streaming and embeddings, plus Vertex image and video; the LiteLLM proxy `fetch`; and fal.ai `run`, `subscribe`, `stream` and `queue.submit`. Collecting a background response with `responses().retrieve(id)` or a queued fal.ai job with `queue.result` is not gated, because it collects work that was already paid for.
+
+A call is refused when either source reports a breach: the cost controls polled from the enforcement API (OpenAI `Initialize()` only, see below), or a `BLOCK` directive Revenium returns on the metering reply of an earlier call (every provider, no team id needed).
 
 ### Environment variables
 
-| Variable                        | Required            | Description                                                                                                                                                         |
-| ------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REVENIUM_METERING_API_KEY`     | Yes                 | Revenium API key (starts with `hak_` or `rev_`). The `_METERING_` infix is load-bearing.                                                                            |
-| `REVENIUM_TEAM_ID`              | Yes for enforcement | Hashed team ID. If unset, the engine starts dormant (warns once, skips cost control fetch) and all provider calls pass through.                                     |
-| `REVENIUM_ENFORCEMENT_BASE_URL` | No                  | Host base for the enforcement API (e.g. `https://api.revenium.ai`); the SDK appends the service path itself. Falls back to `REVENIUM_METERING_BASE_URL` when unset. |
+| Variable                        | Required            | Description                                                                                                                                                                                  |
+| ------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REVENIUM_METERING_API_KEY`     | Yes                 | Revenium API key (starts with `hak_` or `rev_`). The `_METERING_` infix is load-bearing.                                                                                                     |
+| `REVENIUM_TEAM_ID`              | Yes for enforcement | Hashed team ID, or `reveniumTeamId` passed to `Initialize(config)`. If neither is set, the engine starts dormant (warns once, skips cost control fetch) and all provider calls pass through. |
+| `REVENIUM_ENFORCEMENT_BASE_URL` | No                  | Host base for the enforcement API (e.g. `https://api.revenium.ai`); the SDK appends the service path itself. Falls back to `REVENIUM_METERING_BASE_URL` when unset.                          |
 
 ### How it works
 
-`Initialize()` (from `@revenium/middleware/openai`) calls `startEnforcementPolling()`, which boots a background poller on `/profitstream/v2/api/ai/enforcement-rules/{teamId}` every 30s with ±20% jitter. Fetched cost controls are cached in memory; a `204 No Content` response caches an empty set. A `4xx` response leaves the cache untouched and logs a warning on every poll, naming the requested URL and status and stating whether previously loaded cost controls are still blocking calls or nothing is loaded; a `429` additionally backs polling off for the `Retry-After` window (capped at 60s). The poll timer is `unref`'d so it never prevents process exit.
+`Initialize()` (from `@revenium/middleware/openai`) calls `startEnforcementPolling()`, which boots a background poller on `/profitstream/v2/api/ai/enforcement-rules/{teamId}` every 30s with ±20% jitter. Fetched cost controls are cached in memory; a `204 No Content` response caches an empty set. The first gated call after `Initialize()` waits for that first fetch to finish, for at most the 5s fetch timeout, so a breached `BLOCK` cost control applies from the first call; later calls do not wait, and the metered latency never includes this wait. Anthropic `messages.stream()` and `beta.messages.create()` return synchronously and cannot wait, so they are checked against whatever has loaded by then. Calling `Initialize()` or `Configure()` again refetches the cost controls, and the next gated call waits for that fetch. Without polling, the gate never waits. Code that calls `startEnforcementPolling()` and `enforcePreCallRules()` from the package root directly can `await waitForInitialRules()` before its first check for the same guarantee. Cached cost controls apply for at most 300s after the last successful fetch (`200` or `204`). A failed refresh leaves the cache untouched and logs a warning on every poll stating how many seconds ago the cost controls were refreshed and whether they are still blocking calls, no longer applied, or not loaded; a `4xx` warning also names the requested URL and status, and a `429` additionally backs polling off for the `Retry-After` window (capped at 60s). The poll timer is `unref`'d so it never prevents process exit.
 
-Before every chat completion (sync and streaming), the middleware builds enforcement criteria from the request — `subscriberId` and `subscriberEmail` from `metadata.subscriber`, `credential` from the subscriber credential's alias name (its secret value is used only when no name field was supplied at all), `model` from request params, `agent` and `taskType` from metadata, `productName` and `organizationName` from metadata (each falling back to its deprecated `*Id` spelling the way the metered record does), `provider` from the detected provider — and calls `enforcePreCallRules(criteria)`. The evaluator resolves the caller to the subscriber id and the normalized email, then:
+Before every gated call, the middleware builds enforcement criteria from the request — `subscriberId` and `subscriberEmail` from `metadata.subscriber` (or the flat `subscriberId` / `subscriberEmail` fields on Google and LiteLLM), `credential` from the subscriber credential's alias name (its secret value is used only when no name field was supplied at all; on Google, `subscriberCredentialName`, then `subscriberCredential`), `model` from request params, `agent` and `taskType` from metadata, `productName` and `organizationName` from metadata (each falling back to its deprecated `*Id` spelling the way the metered record does), `provider` from the detected provider — and calls `enforcePreCallRules(criteria)`. The evaluator resolves the caller to the subscriber id and the normalized email, then:
 
 - acts on a cost control only when its `filters[]` cover the call. Filter rows compose with AND, a row with no value constrains nothing, and a cost control with no filters covers every call. The dimensions the SDK evaluates are `MODEL`, `PROVIDER`, `AGENT`, `PRODUCT`, `TASK_TYPE`, `ORGANIZATION`, `SUBSCRIBER` and `CREDENTIAL`; `PROVIDER` compares ignoring letter case, `SUBSCRIBER` ignores case only when the caller supplied an email, and the rest compare exactly. A row the SDK cannot evaluate — any other dimension, including `DEPARTMENT` outside the department path below, or an operator outside `IS` / `IS_NOT` / `IN` / `CONTAINS` / `STARTS_WITH` / `ENDS_WITH` — makes the cost control cover nothing client-side and leaves it to the platform, which enforces it server-side regardless;
 - on a per-person cost control (`groupBy` set), looks the caller up in `groupBreakdown` and acts only on their own row: someone who has not crossed the limit passes even while a teammate is blocked, and the error reports the blocked person's own figure. A grouped cost control the server sent no breakdown for (its metric is not cost) blocks nobody;
@@ -526,11 +680,31 @@ Before every chat completion (sync and streaming), the middleware builds enforce
 - logs a warning and continues past cost controls where `shadowMode === true` or `action ∈ {WARN_ONLY, THROTTLE}` — these are observation-only client-side; the server still enforces server-side throttling;
 - throws `CostLimitExceeded` on the first matching `BLOCK` cost control.
 
+The polled cost controls are checked first, so their error carries the full figures; a block reported on a metering reply is checked after them.
+
 A caller carrying neither a subscriber id nor an email cannot be matched against a per-person or department-scoped cost control, so those pass; team-wide cost controls still block it.
 
 A `MODEL` or `PROVIDER` filter is matched against what the request asks for, because the gate runs before the provider replies, while the metered record carries what the response reports. The two differ on three known paths: on Azure the request names the deployment and the record the provider model; on a streamed OpenAI chat the request names the alias (`gpt-4o`) and the record the dated model the chunks report (`gpt-4o-2024-08-06`); and on a call proxied through LiteLLM the gate sees the transport provider (`OpenAI`) where the record names the upstream one (`Anthropic`). A cost control written from what Revenium reporting shows therefore may not block client-side on those paths. The platform's own evaluation is authoritative and still enforces the cap server-side.
 
-The engine fails open: missing team ID, network outages, an unreachable Revenium API, or a parse error all leave the cache untouched and `enforcePreCallRules` becomes a no-op (the request passes). Enforcement errors never bubble to user code as metering failures.
+### Blocks reported on the metering reply
+
+Revenium can answer a metering record with `{"enforcement": {"action": "BLOCK", "ruleName": "...", "message": "..."}}` when the call it just metered crossed an active `BLOCK` cost control. The SDK then refuses later calls made under the same Revenium API key whose enforcement criteria are exactly the criteria of the metered call: same subscriber id, email (ignoring case and surrounding spaces), product, requested model, provider, agent, task type, organization and credential. A call that differs in any of them passes, and a call with no identity at all matches only other calls with no identity. The refusal throws `CostLimitExceeded` with the directive's `message` (or `Cost limit exceeded: <ruleName>` when the message is empty) before the provider is called.
+
+The block is lifted by whichever comes first:
+
+- 300 seconds after the directive arrived. Because a refused call is never metered, no reply could lift the block otherwise; once it expires one call goes through, and a new `BLOCK` reply blocks again, so at most one call per scope leaks every 300 seconds;
+- a later metering reply for the same criteria that carries no directive or a `WARN_ONLY` directive, provided its request was sent after the request that produced the block. A `BLOCK` reply that arrives late for an older request can still block again for up to 300 seconds;
+- a cost control refresh (OpenAI polling) for the same API key that no longer reports any rule with that name as breached, including a `204` with no rules. Rule names are not unique, so any breached rule with the same name keeps the block;
+- `stopEnforcementPolling()` or the OpenAI `Reset()`.
+
+An empty, non-JSON or unreadable metering reply changes nothing and never fails the metering send. Records resent from the outage buffer, and `trackAnthropicCall` or `trackGoogleUsageAsync` called directly without an `enforcementScope`, carry no criteria and never record a block.
+
+How the refusal surfaces differs on a few paths:
+
+- Anthropic `messages.stream()` and `beta.messages.create()` return synchronously, so they throw `CostLimitExceeded` synchronously instead of rejecting, and do not wait for the first cost control fetch after `Initialize()`.
+- On LiteLLM the patched `fetch` rejects with `CostLimitExceeded`. Called through the `openai` SDK, that surfaces as `APIConnectionError` with the `CostLimitExceeded` as its `cause`, after the SDK's own retries; every retry is refused too, so no attempt leaves the process. An OpenAI or Perplexity client pointed at the proxy does not meter that refusal as a failed call.
+
+The engine fails open: with a missing team ID, or before any cost control has loaded, `enforcePreCallRules` is a no-op and the request passes. Network outages, an unreachable Revenium API, or a parse error leave the cache untouched, so cost controls loaded earlier keep blocking until they are 300s old; after that they are no longer applied and requests pass until a fetch succeeds again. Enforcement errors never bubble to user code as metering failures.
 
 ### Error shape
 
@@ -540,9 +714,12 @@ class CostLimitExceeded extends ReveniumError {
   readonly threshold: number; // cost control limit
   readonly currentValue: number; // subscriber's metered value at block time
   readonly periodType: string; // DAILY / WEEKLY / MONTHLY / QUARTERLY
+  readonly ruleName?: string; // rule name, set when the block came from a metering reply
   readonly context?: Record<string, unknown>; // subscriberId / subscriberEmail / productName / model / provider at call time
 }
 ```
+
+A block reported on a metering reply carries no figures: `ruleId` and `periodType` are `""` and `threshold` and `currentValue` are `NaN`. `message` always describes the block, so prefer it over formatting the numeric fields yourself.
 
 `CostLimitExceeded` is exported from the package root:
 
@@ -556,7 +733,7 @@ import { CostLimitExceeded } from "@revenium/middleware";
 import { Initialize, GetClient } from "@revenium/middleware/openai";
 import { CostLimitExceeded } from "@revenium/middleware";
 
-Initialize(); // loads REVENIUM_METERING_API_KEY + REVENIUM_TEAM_ID from env, starts enforcement polling
+Initialize(); // loads REVENIUM_METERING_API_KEY + REVENIUM_TEAM_ID from env (or pass them in config), starts enforcement polling
 const client = GetClient();
 
 try {
@@ -573,9 +750,7 @@ try {
   console.log(response.choices[0].message.content);
 } catch (err) {
   if (err instanceof CostLimitExceeded) {
-    console.warn(
-      `blocked by cost control ${err.ruleId}: $${err.currentValue.toFixed(2)} of $${err.threshold.toFixed(2)} ${err.periodType} limit`,
-    );
+    console.warn(`blocked by cost control: ${err.message}`);
     return; // or degrade gracefully
   }
   throw err; // not an enforcement error — handle as usual
@@ -666,34 +841,82 @@ await ctx.amendOutcome({ reason: "Value correction", outcomeValue: 175 });
 
 ### Common Environment Variables
 
-| Variable                     | Required | Description                                                |
-| ---------------------------- | -------- | ---------------------------------------------------------- |
-| `REVENIUM_METERING_API_KEY`  | Yes      | Revenium API key (starts with `hak_` or `rev_`)            |
-| `REVENIUM_METERING_BASE_URL` | No       | Revenium API endpoint (default: `https://api.revenium.ai`) |
-| `REVENIUM_DEBUG`             | No       | Enable debug logging (`true`/`false`)                      |
-| `REVENIUM_PRINT_SUMMARY`     | No       | Terminal summary (`true`, `human`, `json`, `false`)        |
-| `REVENIUM_TEAM_ID`           | No       | Team ID for cost display in terminal summary               |
-| `REVENIUM_CAPTURE_PROMPTS`   | No       | Enable prompt capture (`true`/`false`)                     |
+| Variable                     | Required | Description                                                                       |
+| ---------------------------- | -------- | --------------------------------------------------------------------------------- |
+| `REVENIUM_METERING_API_KEY`  | Yes      | Revenium API key (starts with `hak_` or `rev_`)                                   |
+| `REVENIUM_METERING_BASE_URL` | No       | Revenium API endpoint (default: `https://api.revenium.ai`)                        |
+| `REVENIUM_DEBUG`             | No       | Enable debug logging (`true`/`false`)                                             |
+| `REVENIUM_PRINT_SUMMARY`     | No       | Terminal summary (`true`, `human`, `json`, `false`)                               |
+| `REVENIUM_TEAM_ID`           | No       | Team ID: turns on cost controls (OpenAI) and cost display in the terminal summary |
+| `REVENIUM_CAPTURE_PROMPTS`   | No       | Enable prompt capture (`true`/`false`)                                            |
+
+### Configuring in code
+
+`Initialize(config)` and `Configure(config)` for OpenAI, Perplexity and fal.ai accept the settings below. A value passed in code wins over the environment variable; a key left out, or set to `undefined`, is read from the environment, including `.env.local` and `.env` in the working directory, which are loaded into `process.env` on the first `Initialize()`.
+
+| Config key                                  | Environment variable                                                        | Notes                                                                                                                                                                                                                                                                       |
+| ------------------------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reveniumApiKey`                            | `REVENIUM_METERING_API_KEY` (or `REVENIUM_API_KEY`)                         |                                                                                                                                                                                                                                                                             |
+| `reveniumBaseUrl`                           | `REVENIUM_METERING_BASE_URL` (or `REVENIUM_BASE_URL`)                       | Default `https://api.revenium.ai`                                                                                                                                                                                                                                           |
+| `reveniumTeamId` (`teamId` on fal.ai)       | `REVENIUM_TEAM_ID`                                                          | Turns on cost controls (OpenAI) and cost display in the terminal summary. Not read from the environment for either when `reveniumApiKey` differs from `REVENIUM_METERING_API_KEY`; the jobs and outcomes API still falls back to `REVENIUM_TEAM_ID`, so pass `teamId` there |
+| `reveniumEnforcementBaseUrl`                | `REVENIUM_ENFORCEMENT_BASE_URL`                                             | OpenAI only, the only provider that enforces cost controls. Not read from the environment when `reveniumApiKey` differs from `REVENIUM_METERING_API_KEY`                                                                                                                    |
+| `printSummary`                              | `REVENIUM_PRINT_SUMMARY`                                                    |                                                                                                                                                                                                                                                                             |
+| `capturePrompts`                            | `REVENIUM_CAPTURE_PROMPTS`                                                  |                                                                                                                                                                                                                                                                             |
+| `maxPromptSize`                             | `REVENIUM_MAX_PROMPT_SIZE`                                                  | The variable is read on each call when the config leaves the key out                                                                                                                                                                                                        |
+| `debug`                                     | `REVENIUM_DEBUG`                                                            | Either one turns debug logging on; the variable is read on each log call                                                                                                                                                                                                    |
+| `failSilent`, `maxRetries`, `bufferMaxSize` | none                                                                        | Code only. fal.ai `Initialize()` without config reads `failSilent` from `REVENIUM_FAIL_SILENT`                                                                                                                                                                              |
+| `openaiApiKey`                              | `OPENAI_API_KEY`                                                            | OpenAI only, read by the OpenAI client                                                                                                                                                                                                                                      |
+| `azure`                                     | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION` | OpenAI only. Read from the environment only by `Initialize()` without config; when you pass config, pass `azure` to route calls to Azure                                                                                                                                    |
+| `perplexityApiKey`                          | `PERPLEXITY_API_KEY`                                                        | Perplexity only                                                                                                                                                                                                                                                             |
+| `perplexityBaseUrl`                         | `PERPLEXITY_API_BASE_URL`                                                   | Perplexity only, default `https://api.perplexity.ai`                                                                                                                                                                                                                        |
+| `falApiKey`                                 | `FAL_KEY`                                                                   | fal.ai only, read by the fal.ai client                                                                                                                                                                                                                                      |
+| `organizationName`, `organizationId`        | `REVENIUM_ORGANIZATION_NAME`, `REVENIUM_ORGANIZATION_ID`                    | fal.ai only. Read from the environment only by `Initialize()` without config                                                                                                                                                                                                |
+
+`setConfig()` applies the config exactly as given and reads nothing from the environment.
 
 ### Provider-Specific Variables
 
-| Variable                         | Provider      | Description                                       |
-| -------------------------------- | ------------- | ------------------------------------------------- |
-| `OPENAI_API_KEY`                 | OpenAI        | OpenAI API key                                    |
-| `AZURE_OPENAI_API_KEY`           | Azure OpenAI  | Azure OpenAI API key                              |
-| `AZURE_OPENAI_ENDPOINT`          | Azure OpenAI  | Azure resource endpoint URL                       |
-| `AZURE_OPENAI_API_VERSION`       | Azure OpenAI  | API version (default: `2024-02-15-preview`)       |
-| `ANTHROPIC_API_KEY`              | Anthropic     | Anthropic API key                                 |
-| `GOOGLE_API_KEY`                 | Google GenAI  | Google AI Studio API key                          |
-| `GOOGLE_CLOUD_PROJECT`           | Google Vertex | GCP project ID                                    |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Google Vertex | Path to service account key file                  |
-| `GOOGLE_CLOUD_LOCATION`          | Google Vertex | GCP region (default: `us-central1`)               |
-| `PERPLEXITY_API_KEY`             | Perplexity    | Perplexity API key                                |
-| `LITELLM_PROXY_URL`              | LiteLLM       | LiteLLM proxy URL (e.g., `http://localhost:4000`) |
-| `LITELLM_API_KEY`                | LiteLLM       | LiteLLM proxy API key                             |
-| `FAL_KEY`                        | fal.ai        | fal.ai API key                                    |
+| Variable                         | Provider      | Description                                                                                              |
+| -------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`                 | OpenAI        | OpenAI API key                                                                                           |
+| `AZURE_OPENAI_API_KEY`           | Azure OpenAI  | Azure OpenAI API key                                                                                     |
+| `AZURE_OPENAI_ENDPOINT`          | Azure OpenAI  | Azure resource endpoint URL                                                                              |
+| `AZURE_OPENAI_API_VERSION`       | Azure OpenAI  | API version, required (e.g. `2024-02-15-preview`)                                                        |
+| `ANTHROPIC_API_KEY`              | Anthropic     | Anthropic API key                                                                                        |
+| `GOOGLE_API_KEY`                 | Google GenAI  | Google AI Studio API key                                                                                 |
+| `GOOGLE_CLOUD_PROJECT`           | Google Vertex | GCP project ID, required unless `projectId` is passed to the call                                        |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Google Vertex | Optional path to a service account key file; when unset, Google Application Default Credentials are used |
+| `GOOGLE_CLOUD_LOCATION`          | Google Vertex | GCP region (default: `us-central1`)                                                                      |
+| `PERPLEXITY_API_KEY`             | Perplexity    | Perplexity API key                                                                                       |
+| `LITELLM_PROXY_URL`              | LiteLLM       | LiteLLM proxy URL (e.g., `http://localhost:4000`)                                                        |
+| `LITELLM_API_KEY`                | LiteLLM       | LiteLLM proxy API key                                                                                    |
+| `FAL_KEY`                        | fal.ai        | fal.ai API key                                                                                           |
 
 See [`.env.example`](https://github.com/revenium/revenium-node-sdk/blob/HEAD/.env.example) for the complete list with all optional configuration.
+
+### Outage buffering
+
+A usage record that cannot reach Revenium is kept in memory instead of being lost. This happens when the metering call fails with `408`, `429`, `500`, `502`, `503` or `504` after its retries, on a network error after its retries, on the first 10-second timeout, which is never retried in-line, and while the metering circuit breaker is open after an outage.
+
+- Buffered records are retried every 30 seconds, oldest first, keeping their original `Idempotency-Key`. A replay answered with `409` and a `Retry-After`, because Revenium is still processing the record's first attempt, waits for that delay and is retried, up to three times; a record still answered with `409` after that is discarded so the records behind it are not held back.
+- The buffer holds up to 20,000 records by default, about 11 minutes of a service sending 30 records per second. When it is full, the oldest record is discarded and a `Metering buffer full, evicting oldest event` warning is logged; an outage longer than that still loses the oldest usage.
+- Records older than 24 hours are discarded on the next flush.
+- A full buffer of 20,000 records takes about 28 MB of heap with typical chat records (about 1.4 KB each), and about 76 MB when each record carries around 2.4 KB of metadata.
+- With prompt capture on (`capturePrompts` or `REVENIUM_CAPTURE_PROMPTS`), each record also holds the system prompt, the input messages and the response, each up to `maxPromptSize` characters (50,000 by default), at about 1 byte per character, or 2 when the text has characters such as CJK or emoji. A record can then reach about 150 KB, so a full buffer of 20,000 can take about 3 GB of heap, more than a typical container has. When prompt capture is on, set `bufferMaxSize` to the memory you can spare divided by about `3 × maxPromptSize` bytes; for example, 2,000 records keep the buffer under about 300 MB at the default `maxPromptSize`.
+
+Change the limit with `bufferMaxSize` in `Initialize()` or `Configure()` (`configure()` for Anthropic, Google and LiteLLM):
+
+```typescript
+import { Initialize } from "@revenium/middleware/openai";
+
+Initialize({ reveniumApiKey: process.env.REVENIUM_METERING_API_KEY, bufferMaxSize: 50_000 });
+```
+
+The buffer is shared by the whole process and reads `bufferMaxSize` once, when the buffer is first used: the first buffered record, or the first call to `getBufferStats()` or `flushMeteringBuffer()`. A value set after that is ignored until the process restarts.
+
+Call `flushMeteringBuffer()` to try to send the buffered records immediately, and `getBufferStats()` to read the buffer depth and the `totalFlushed`, `totalDropped`, `totalEvicted` and `totalExpired` counters. Both are exported from the package root and from every provider subpath.
+
+`flushMeteringBuffer()` is best effort. It resolves at once, sending nothing, when a flush is already running, and it stops at the first record that fails with a retryable error or a `429`, leaving that record and the rest buffered for the next flush. Records are sent one at a time, so draining a full buffer of 20,000 takes about 20,000 round trips to Revenium, roughly 17 minutes at 50 ms each. Before a planned shutdown, check `getBufferStats().size` after the call to see how many records are still held in memory.
 
 ### Metering several Revenium organizations from one process
 
@@ -722,8 +945,9 @@ Process-wide, and therefore following the last `Initialize()`/`Configure()` call
 
 - **Anthropic** — the SDK is instrumented by patching the shared `Messages` prototype, so one key per process.
 - **Google GenAI and Google Vertex AI**, and the **LiteLLM** proxy.
-- **Cost controls / enforcement** — rules are polled under the process configuration, and those rules decide every call, including calls made through a per-organization client.
+- **Cost controls / enforcement** — rules are polled under the process configuration, and those rules decide every call, including calls made through a per-organization client. A `BLOCK` directive on a metering reply is kept per Revenium API key, so it only refuses calls made under the key the record was metered with.
 - **Jobs and outcomes API** — outcomes are reported under the process configuration.
+- **Outage buffer** — one buffer holds the records of every client, sized by the process configuration, so a `bufferMaxSize` passed to a per-organization client is ignored.
 - **Tool metering** — `meterTool()` and `reportToolCall()` are not bound to a client. They report under the configuration of the call they run inside, and under the process configuration when there is none.
 
 ## Troubleshooting

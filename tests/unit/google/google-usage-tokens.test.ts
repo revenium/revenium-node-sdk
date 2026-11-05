@@ -1,29 +1,19 @@
-import { createReveniumConfig } from "../../helpers/fixtures";
+import {
+  createReveniumConfig,
+  createSseResponse,
+  drain,
+  installRoutingFetch,
+  stubGoogleAuth,
+} from "../../helpers/fixtures";
 
 jest.mock("../../../src/_core/metering/api-client", () => ({
   sendToRevenium: jest.fn().mockResolvedValue(undefined),
 }));
 
+stubGoogleAuth();
+
+const originalFetch = global.fetch;
 let mockStreamChunks: unknown[] = [];
-
-jest.mock("@google/genai", () => ({
-  GoogleGenAI: jest.fn().mockImplementation(() => ({
-    models: {
-      generateContentStream: () =>
-        Promise.resolve({
-          [Symbol.asyncIterator]: async function* () {
-            for (const chunk of mockStreamChunks) {
-              yield chunk;
-            }
-          },
-        }),
-    },
-  })),
-}));
-
-jest.mock("google-auth-library", () => ({
-  GoogleAuth: jest.fn().mockImplementation(() => ({})),
-}));
 
 let setConfig: typeof import("../../../src/_core/config/manager").setConfig;
 let resetConfig: typeof import("../../../src/_core/config/manager").resetConfig;
@@ -77,8 +67,9 @@ describe("trackGoogleUsageAsync token metering", () => {
     const manager = await import("../../../src/_core/config/manager");
     const apiClient = await import("../../../src/_core/metering/api-client");
     const utils = await import("../../../src/google/utils");
-    const service = await import("../../../src/google/genai/service");
-    const vertex = await import("../../../src/google/vertex/service");
+    const service = await import("../../../src/google/genai/index");
+    const vertex = await import("../../../src/google/vertex/index");
+    installRoutingFetch(() => createSseResponse(mockStreamChunks));
 
     VertexAIService = vertex.VertexAIService;
     setConfig = manager.setConfig;
@@ -92,6 +83,7 @@ describe("trackGoogleUsageAsync token metering", () => {
   });
 
   afterEach(() => {
+    global.fetch = originalFetch;
     resetConfig();
     jest.restoreAllMocks();
   });
@@ -111,6 +103,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         reasoningTokenCount: 731,
         totalTokenCount: 1256,
       }),
+      undefined,
     );
   });
 
@@ -126,6 +119,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         outputTokenCount: 40,
         reasoningTokenCount: undefined,
       }),
+      undefined,
     );
   });
 
@@ -142,6 +136,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         outputTokenCount: 40,
         reasoningTokenCount: 0,
       }),
+      undefined,
     );
   });
 
@@ -162,6 +157,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         outputTokenCount: 1243,
         reasoningTokenCount: 731,
       }),
+      undefined,
     );
   });
 
@@ -174,6 +170,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         outputTokenCount: 0,
         totalTokenCount: 0,
       }),
+      undefined,
     );
   });
 
@@ -198,9 +195,7 @@ describe("trackGoogleUsageAsync token metering", () => {
     ];
 
     const streaming = await new GoogleGenAIService("gemini-2.5-pro").createStreaming(["hi"]);
-    for await (const _chunk of streaming.stream) {
-      void _chunk;
-    }
+    await drain(streaming.stream);
     await flushPromises();
 
     expect(sendToRevenium).toHaveBeenCalledWith(
@@ -210,6 +205,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         totalTokenCount: 1256,
         isStreamed: true,
       }),
+      expect.anything(),
     );
   });
 
@@ -230,9 +226,7 @@ describe("trackGoogleUsageAsync token metering", () => {
     ];
 
     const streaming = await new GoogleGenAIService("gemini-2.5-pro").createStreaming(["hi"]);
-    for await (const _chunk of streaming.stream) {
-      void _chunk;
-    }
+    await drain(streaming.stream);
     await flushPromises();
 
     expect(sendToRevenium).toHaveBeenCalledWith(
@@ -243,6 +237,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         cacheReadTokenCount: 8,
         totalTokenCount: 1256,
       }),
+      expect.anything(),
     );
   });
 
@@ -270,9 +265,7 @@ describe("trackGoogleUsageAsync token metering", () => {
     ];
 
     const streaming = await new GoogleGenAIService("gemini-2.5-pro").createStreaming(["hi"]);
-    for await (const _chunk of streaming.stream) {
-      void _chunk;
-    }
+    await drain(streaming.stream);
     await flushPromises();
 
     expect(sendToRevenium).toHaveBeenCalledWith(
@@ -283,6 +276,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         cacheReadTokenCount: 8,
         totalTokenCount: 1256,
       }),
+      expect.anything(),
     );
   });
 
@@ -310,9 +304,7 @@ describe("trackGoogleUsageAsync token metering", () => {
     ];
 
     const streaming = await new GoogleGenAIService("gemini-2.5-pro").createStreaming(["hi"]);
-    for await (const _chunk of streaming.stream) {
-      void _chunk;
-    }
+    await drain(streaming.stream);
     await flushPromises();
 
     expect(sendToRevenium).toHaveBeenCalledWith(
@@ -322,6 +314,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         cacheReadTokenCount: 8,
         totalTokenCount: 1256,
       }),
+      expect.anything(),
     );
   });
 
@@ -345,10 +338,9 @@ describe("trackGoogleUsageAsync token metering", () => {
       },
     ];
 
-    const streaming = await new VertexAIService("gemini-2.5-pro").createStreaming(["hi"]);
-    for await (const _chunk of streaming.stream) {
-      void _chunk;
-    }
+    const service = new VertexAIService("gemini-2.5-pro", "test-project");
+    const streaming = await service.createStreaming(["hi"]);
+    await drain(streaming.stream);
     await flushPromises();
 
     expect(sendToRevenium).toHaveBeenCalledWith(
@@ -359,6 +351,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         totalTokenCount: 1256,
         isStreamed: true,
       }),
+      expect.anything(),
     );
   });
 
@@ -372,6 +365,7 @@ describe("trackGoogleUsageAsync token metering", () => {
     expect(resolveInputTokens).not.toHaveBeenCalled();
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokenCount: 7, totalTokenCount: 9 }),
+      undefined,
     );
   });
 
@@ -380,6 +374,7 @@ describe("trackGoogleUsageAsync token metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokenCount: 5, totalTokenCount: 5, outputTokenCount: 0 }),
+      undefined,
     );
   });
 
@@ -388,6 +383,7 @@ describe("trackGoogleUsageAsync token metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokenCount: null, totalTokenCount: null }),
+      undefined,
     );
   });
 
@@ -401,6 +397,7 @@ describe("trackGoogleUsageAsync token metering", () => {
     expect(resolveInputTokens).not.toHaveBeenCalled();
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokenCount: 11, totalTokenCount: 11 }),
+      undefined,
     );
   });
 
@@ -409,6 +406,7 @@ describe("trackGoogleUsageAsync token metering", () => {
 
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokenCount: null, totalTokenCount: null }),
+      undefined,
     );
   });
 
@@ -433,6 +431,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         subscriber: expect.objectContaining({ id: "sub-1", email: "a@example.com" }),
         environment: "sweep",
       }),
+      undefined,
     );
   });
 
@@ -469,6 +468,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         skillName: "lead-qualification",
         skillSource: "projectSettings",
       }),
+      undefined,
     );
   });
 
@@ -490,6 +490,7 @@ describe("trackGoogleUsageAsync token metering", () => {
         organizationName: "org-legacy",
         productName: "prod-legacy",
       }),
+      undefined,
     );
   });
 

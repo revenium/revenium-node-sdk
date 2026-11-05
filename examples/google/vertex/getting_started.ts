@@ -4,9 +4,10 @@
  * This is the simplest example to verify your setup is working.
  * Required environment variables:
  * - GOOGLE_CLOUD_PROJECT
- * - GOOGLE_CLOUD_LOCATION
- * - GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON)
  * - REVENIUM_METERING_API_KEY
+ * Optional:
+ * - GOOGLE_CLOUD_LOCATION (defaults to us-central1)
+ * - GOOGLE_APPLICATION_CREDENTIALS (path to service account JSON; Application Default Credentials are used when unset)
  */
 
 import 'dotenv/config';

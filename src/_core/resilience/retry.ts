@@ -1,4 +1,4 @@
-import { RETRY_CONFIG, RETRYABLE_STATUSES } from "../constants.js";
+import { HTTP_TOO_MANY_REQUESTS, RETRY_CONFIG, RETRYABLE_STATUSES } from "../constants.js";
 
 export class HttpError extends Error {
   constructor(
@@ -31,12 +31,24 @@ export function isRetryableStatus(status: number): boolean {
   return RETRYABLE_STATUSES.has(status);
 }
 
+export function isRequestRejection(status: number): boolean {
+  if (status < 400 || status >= 500) return false;
+  return status === HTTP_TOO_MANY_REQUESTS || !isRetryableStatus(status);
+}
+
+export function withJitter(delayMs: number): number {
+  return delayMs * (1 + Math.random() * RETRY_CONFIG.JITTER_FACTOR);
+}
+
+function retryAfterDelayMs(seconds: number): number {
+  return withJitter(Math.min(seconds, RETRY_CONFIG.MAX_RETRY_AFTER_SECONDS) * 1000);
+}
+
 function isRetryableError(error: unknown): boolean {
   if (error instanceof HttpError) {
     return isRetryableStatus(error.status);
   }
   if (error instanceof TypeError) return true;
-  if (error instanceof Error && error.name === "AbortError") return true;
   return false;
 }
 
@@ -62,17 +74,10 @@ export async function withRetry<T>(
       if (attempt === maxRetries) break;
       if (!isRetryableError(error)) break;
 
-      let delay: number;
-      if (error instanceof HttpError && error.retryAfterSeconds !== undefined) {
-        delay = Math.min(
-          error.retryAfterSeconds * 1000,
-          RETRY_CONFIG.MAX_RETRY_AFTER_SECONDS * 1000,
-        );
-      } else {
-        delay = Math.min(baseDelay * Math.pow(2, attempt), RETRY_CONFIG.MAX_DELAY);
-        const jitter = Math.random() * RETRY_CONFIG.JITTER_FACTOR * delay;
-        delay = delay + jitter;
-      }
+      const delay =
+        error instanceof HttpError && error.retryAfterSeconds !== undefined
+          ? retryAfterDelayMs(error.retryAfterSeconds)
+          : withJitter(Math.min(baseDelay * Math.pow(2, attempt), RETRY_CONFIG.MAX_DELAY));
 
       await new Promise((resolve) => setTimeout(resolve, delay));
     }

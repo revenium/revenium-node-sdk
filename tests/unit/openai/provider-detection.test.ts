@@ -78,10 +78,16 @@ describe("hasAzureConfig", () => {
 });
 
 describe("validateAzureConfig", () => {
-  it("valid when endpoint and apiKey present", () => {
+  beforeEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    delete process.env.OPENAI_API_VERSION;
+  });
+
+  it("valid when endpoint, apiKey and apiVersion present", () => {
     const result = validateAzureConfig({
       endpoint: "https://my.openai.azure.com",
       apiKey: "my-key",
+      apiVersion: "2024-02-15-preview",
     });
     expect(result.isValid).toBe(true);
     expect(result.missingFields).toHaveLength(0);
@@ -95,18 +101,29 @@ describe("validateAzureConfig", () => {
     expect(result.missingFields).toContain("endpoint");
   });
 
-  it("warns when no apiVersion", () => {
+  it("invalid when apiVersion missing and OPENAI_API_VERSION unset", () => {
     const result = validateAzureConfig({
       endpoint: "https://my.openai.azure.com",
       apiKey: "my-key",
     });
-    expect(result.warnings.length).toBeGreaterThan(0);
+    expect(result.isValid).toBe(false);
+    expect(result.missingFields).toEqual(["apiVersion"]);
+  });
+
+  it("valid when apiVersion missing but OPENAI_API_VERSION set", () => {
+    process.env.OPENAI_API_VERSION = "2024-02-15-preview";
+    const result = validateAzureConfig({
+      endpoint: "https://my.openai.azure.com",
+      apiKey: "my-key",
+    });
+    expect(result.isValid).toBe(true);
   });
 
   it("warns when endpoint does not contain azure", () => {
     const result = validateAzureConfig({
       endpoint: "https://custom.example.com",
       apiKey: "my-key",
+      apiVersion: "2024-02-15-preview",
     });
     expect(result.warnings).toEqual(expect.arrayContaining([expect.stringContaining("azure")]));
   });

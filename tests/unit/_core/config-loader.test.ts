@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
+import { mkdirSync } from "fs";
 import { join } from "path";
 import { loadConfigFromEnv, resetEnvFilesLoaded } from "../../../src/_core/config/loader";
 import { defaultLogger, setLogger } from "../../../src/_core/config/manager";
 import { ENV_VARS, DEFAULT_REVENIUM_BASE_URL } from "../../../src/_core/constants";
+import { runInWorkingDir } from "../../helpers/fixtures";
 
 const ORIGINAL_ENV = process.env;
 
@@ -13,33 +13,6 @@ const ENV_FILE_KEYS = [
   ENV_VARS.REVENIUM_BASE_URL,
   ENV_VARS.CAPTURE_PROMPTS,
 ];
-
-function runInWorkingDir(
-  files: Record<string, Record<string, string>>,
-  run: (workingDir: string) => void,
-): void {
-  const root = mkdtempSync(join(tmpdir(), "revenium-env-"));
-  const workingDir = join(root, "app");
-  mkdirSync(workingDir);
-  const originalCwd = process.cwd();
-
-  for (const [relativePath, values] of Object.entries(files)) {
-    writeFileSync(
-      join(root, relativePath),
-      Object.entries(values)
-        .map(([key, value]) => `${key}=${value}\n`)
-        .join(""),
-    );
-  }
-
-  try {
-    process.chdir(workingDir);
-    run(workingDir);
-  } finally {
-    process.chdir(originalCwd);
-    rmSync(root, { recursive: true, force: true });
-  }
-}
 
 beforeEach(() => {
   jest.resetModules();

@@ -1,7 +1,10 @@
 import { randomUUID } from "crypto";
 import { getLogger } from "../_core/config/manager.js";
 import { sendToRevenium } from "../_core/metering/api-client.js";
-import { buildMetadataFields } from "../_core/metadata/metadata-builder.js";
+import {
+  buildMetadataFields,
+  resolvePromptContextFields,
+} from "../_core/metadata/metadata-builder.js";
 import {
   getEnvironment,
   getRegion,
@@ -25,10 +28,16 @@ import {
 import { printUsageSummary } from "../_core/prompt/summary-printer.js";
 import type { ReveniumPayload } from "../_core/types/index.js";
 import {
+  buildEnforcementCriteria,
+  type EnforcementCriteria,
+} from "../_core/enforcement/evaluator.js";
+import {
+  DURATION_KEYS,
   readStatedDurationSeconds,
   resolveTranscriptDurationSeconds,
   resolveVideoDurationSeconds,
 } from "./duration.js";
+import { detectMediaType } from "./media-type-detector.js";
 import type {
   FalTrackingData,
   FalUsageMetadata,
@@ -43,10 +52,39 @@ const PROVIDER = "fal_ai";
 const MODEL_SOURCE = "FAL_AI";
 const DIMENSIONS_PATTERN = /^\d+x\d+$/;
 const UNKNOWN_RESOLUTION = "unknown";
+const BILLED_INPUT_KEYS = [
+  "model",
+  "num_images",
+  "image_size",
+  "aspect_ratio",
+  "resolution",
+  "text",
+  "prompt",
+  "input",
+  ...DURATION_KEYS,
+] as const;
+
+export type FalResultCall = Omit<FalTrackingData, "operationType" | "duration" | "result"> & {
+  result: unknown;
+};
 
 function extractModelName(endpointId: string, input?: Record<string, unknown>): string {
   if (typeof input?.model === "string" && input.model) return input.model;
   return endpointId;
+}
+
+export function buildFalEnforcementScope(
+  endpointId: string,
+  input: Record<string, unknown> | undefined,
+  metadata: FalUsageMetadata | undefined,
+): EnforcementCriteria {
+  return buildEnforcementCriteria(metadata, extractModelName(endpointId, input), PROVIDER);
+}
+
+export function retainBilledInput(input: Record<string, unknown> = {}): Record<string, unknown> {
+  return Object.fromEntries(
+    BILLED_INPUT_KEYS.filter((key) => input[key] !== undefined).map((key) => [key, input[key]]),
+  );
 }
 
 function buildCommonFields(
@@ -245,6 +283,7 @@ function buildChatTrackingPayload(data: FalTrackingData): ReveniumPayload {
 
   return {
     ...buildCommonFields(data, data.usageMetadata),
+    ...resolvePromptContextFields(data.usageMetadata),
     inputTokenCount: usage?.prompt_tokens ?? null,
     outputTokenCount: usage?.completion_tokens ?? null,
     totalTokenCount: usage?.total_tokens ?? null,
@@ -274,7 +313,7 @@ export async function sendFalMetrics(data: FalTrackingData): Promise<boolean> {
   let success = true;
 
   try {
-    await sendToRevenium(payload);
+    await sendToRevenium(payload, data.enforcementScope);
   } catch (error) {
     success = false;
     logger.warn("Fal tracking failed", {
@@ -292,14 +331,25 @@ export function trackFalUsageAsync(data: FalTrackingData): void {
 
   sendFalMetrics(data)
     .then((success) => {
-      if (success) {
-        logger.debug("Fal tracking completed", { endpointId: data.endpointId });
-      }
+      if (!success) return data.onDeliveryFailure?.();
+      data.onDelivered?.();
+      logger.debug("Fal tracking completed", { endpointId: data.endpointId });
     })
     .catch((error) => {
       logger.warn("Fal tracking failed completely", {
         error: error instanceof Error ? error.message : String(error),
         endpointId: data.endpointId,
       });
+      data.onDeliveryFailure?.();
     });
+}
+
+export function trackFalResult({ result, ...call }: FalResultCall): void {
+  trackFalUsageAsync({
+    ...call,
+    operationType: detectMediaType(call.endpointId, result),
+    duration: Date.now() - call.startTime,
+    input: call.input || {},
+    result: (result as Record<string, unknown>) || {},
+  });
 }

@@ -67,11 +67,13 @@ describe("ResponsesInterface cache token metering", () => {
         totalTokenCount: 150,
         cacheReadTokenCount: 55,
       }),
+      expect.anything(),
     );
     expect(sendToRevenium).toHaveBeenCalledWith(
       expect.objectContaining({
         cacheCreationTokenCount: undefined,
       }),
+      expect.anything(),
     );
   });
 
@@ -115,6 +117,7 @@ describe("ResponsesInterface cache token metering", () => {
         transactionId: "resp-stream-001",
         cacheReadTokenCount: 55,
       }),
+      expect.anything(),
     );
   });
 });
